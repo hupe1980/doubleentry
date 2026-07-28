@@ -1,0 +1,674 @@
+//! Period seals.
+//!
+//! Sealing a period commits to two things at once: **which entries** it contains
+//! and **what they add up to**. Both are Merkle roots, so a third party holding
+//! nothing but a seal can later be shown that a specific entry belonged to the
+//! period, or that a specific closing balance was the one reported — without
+//! being given the period's contents.
+//!
+//! Seals chain: each carries the hash of its predecessor. Removing or reordering
+//! a sealed period breaks every seal after it.
+//!
+//! What a seal detects is *alteration*, not *access*. Preventing writes is the
+//! storage layer's job; making a write recognisable afterwards is this one's.
+
+use crate::balance::{Balance, BalanceKey, TrialBalance};
+use crate::canonical::{Canonical, CanonicalWriter};
+use crate::hash::{Hash, tag, tagged};
+use crate::merkle::{MerkleLog, TreeHead};
+use crate::period::{LedgerId, PeriodId};
+
+/// What a period turned out to contain.
+///
+/// Grouped rather than passed as three loose numbers: `first_index` and
+/// `last_index` are both `Option<u64>` and `entry_count` is a bare `u64`, so as
+/// positional arguments nothing but discipline keeps them in order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PeriodCoverage {
+    /// Log index of the first entry the period covers, if it covers any.
+    ///
+    /// Entries are appended in recording order, not booking-date order, so a
+    /// period's entries need not be contiguous. This is the smallest index
+    /// belonging to the period, not a claim that everything above it does.
+    pub first_index: Option<u64>,
+    /// Log index of the last entry the period covers, if it covers any.
+    pub last_index: Option<u64>,
+    /// How many entries the period actually contains.
+    ///
+    /// Carried rather than derived from the index span, which may enclose
+    /// entries belonging to other periods.
+    pub entry_count: u64,
+}
+
+impl PeriodCoverage {
+    /// A period that covers nothing.
+    pub const EMPTY: Self = Self {
+        first_index: None,
+        last_index: None,
+        entry_count: 0,
+    };
+
+    /// Coverage of a contiguous run of entries.
+    #[must_use]
+    pub fn spanning(first: u64, last: u64, entry_count: u64) -> Self {
+        Self {
+            first_index: Some(first),
+            last_index: Some(last),
+            entry_count,
+        }
+    }
+}
+
+/// A commitment to the closing state of one accounting period.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct Seal {
+    /// The ledger whose books this seal covers.
+    ///
+    /// Named inside the hash, not alongside it. Two ledgers can hold
+    /// structurally identical entries — the same amounts, accounts and dates —
+    /// and would then produce identical tree heads and identical trial balance
+    /// roots. Without the ledger in the preimage their seals would be
+    /// byte-identical, and a seal handed to an auditor would not say whose
+    /// books it attests to. With it, a seal is evidence about one entity or it
+    /// does not verify at all.
+    pub ledger: LedgerId,
+    /// The period being sealed.
+    pub period: PeriodId,
+    /// Log index of the first entry the period covers, if it covers any.
+    ///
+    /// Entries are appended in recording order, not booking-date order, so a
+    /// period's entries need not be contiguous. This is the smallest index
+    /// belonging to the period, not a claim that everything above it does.
+    pub first_index: Option<u64>,
+    /// Log index of the last entry the period covers, if it covers any.
+    pub last_index: Option<u64>,
+    /// How many entries the period actually contains.
+    ///
+    /// Stored rather than derived from the index span, which may enclose
+    /// entries belonging to other periods.
+    pub entry_count: u64,
+    /// The journal's tree head at the moment of sealing.
+    pub tree_head: TreeHead,
+    /// Merkle root over the period's closing trial balance.
+    pub trial_balance_root: Hash,
+    /// Hash of the preceding seal, or `None` for the first.
+    pub prev_seal: Option<Hash>,
+    /// Hash over every other field.
+    pub seal_hash: Hash,
+}
+
+impl Seal {
+    /// Builds a seal, computing both roots and the chaining hash.
+    #[must_use]
+    pub fn build<const P: u8>(
+        ledger: LedgerId,
+        period: PeriodId,
+        coverage: PeriodCoverage,
+        tree_head: TreeHead,
+        trial_balance: &TrialBalance<P>,
+        prev_seal: Option<Hash>,
+    ) -> Self {
+        let trial_balance_root = trial_balance_root(trial_balance);
+        let mut seal = Self {
+            ledger,
+            period,
+            first_index: coverage.first_index,
+            last_index: coverage.last_index,
+            entry_count: coverage.entry_count,
+            tree_head,
+            trial_balance_root,
+            prev_seal,
+            seal_hash: Hash::from_bytes([0u8; 32]),
+        };
+        seal.seal_hash = seal.compute_hash();
+        seal
+    }
+
+    /// Recomputes the hash over every field except `seal_hash` itself.
+    #[must_use]
+    pub fn compute_hash(&self) -> Hash {
+        let mut w = CanonicalWriter::new();
+        self.encode(&mut w);
+        tagged(tag::SEAL_V1, &w.finish())
+    }
+
+    /// True when `seal_hash` matches the seal's own contents.
+    #[must_use]
+    pub fn is_self_consistent(&self) -> bool {
+        self.compute_hash() == self.seal_hash
+    }
+
+    /// The span of log indices the period's entries fall within.
+    #[must_use]
+    pub fn index_span(&self) -> Option<(u64, u64)> {
+        match (self.first_index, self.last_index) {
+            (Some(first), Some(last)) if last >= first => Some((first, last)),
+            _ => None,
+        }
+    }
+}
+
+impl Canonical for Seal {
+    /// Encodes every field except `seal_hash`, which is derived from this.
+    fn encode(&self, w: &mut CanonicalWriter) {
+        self.ledger.encode(w);
+        self.period.encode(w);
+        w.option(self.first_index.as_ref(), |w, v| {
+            w.u64(*v);
+        });
+        w.option(self.last_index.as_ref(), |w, v| {
+            w.u64(*v);
+        });
+        w.u64(self.entry_count);
+        w.u64(self.tree_head.size);
+        w.fixed(self.tree_head.root.as_bytes());
+        w.fixed(self.trial_balance_root.as_bytes());
+        w.option(self.prev_seal.as_ref(), |w, v| {
+            w.fixed(v.as_bytes());
+        });
+    }
+}
+
+/// Merkle root over a trial balance.
+///
+/// Each `(account, currency, layer) → (debits, credits)` row becomes one leaf,
+/// in the trial balance's own deterministic order, so the root is a pure
+/// function of the balances.
+#[must_use]
+pub fn trial_balance_root<const P: u8>(tb: &TrialBalance<P>) -> Hash {
+    let leaves: Vec<Hash> = tb
+        .iter()
+        .map(|(key, balance)| balance_leaf(key, balance, P))
+        .collect();
+    MerkleLog::from_leaves(leaves).root()
+}
+
+fn balance_leaf<const P: u8>(key: &BalanceKey, balance: &Balance<P>, scale: u8) -> Hash {
+    let mut w = CanonicalWriter::new();
+    w.u32(key.account.index());
+    w.fixed(key.currency.as_bytes());
+    w.u8(key.layer.discriminant());
+    w.u8(scale);
+    w.i64(balance.debits.to_minor());
+    w.i64(balance.credits.to_minor());
+    tagged(tag::TRIAL_BALANCE_V1, &w.finish())
+}
+
+/// Failure verifying a chain of seals.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum SealChainError {
+    /// A seal's stored hash did not match its contents.
+    #[error("seal for period {period} does not match its own contents")]
+    Tampered {
+        /// The offending period.
+        period: PeriodId,
+    },
+    /// A seal did not reference its predecessor.
+    #[error("seal for period {period} does not chain to its predecessor")]
+    BrokenChain {
+        /// The offending period.
+        period: PeriodId,
+    },
+    /// A seal named a different ledger than the chain it was offered to.
+    #[error("seal for period {period} belongs to ledger {found}, not {expected}")]
+    ForeignLedger {
+        /// The offending period.
+        period: PeriodId,
+        /// The ledger the chain covers.
+        expected: LedgerId,
+        /// The ledger the seal names.
+        found: LedgerId,
+    },
+    /// The first seal claimed a predecessor, or a later one claimed none.
+    #[error("seal for period {period} has an unexpected predecessor reference")]
+    MisplacedGenesis {
+        /// The offending period.
+        period: PeriodId,
+    },
+    /// Tree heads did not grow monotonically.
+    #[error("seal for period {period} does not extend the previous tree")]
+    NonMonotonic {
+        /// The offending period.
+        period: PeriodId,
+    },
+}
+
+/// An ordered chain of period seals.
+#[derive(Debug, Clone, Default)]
+pub struct SealChain {
+    seals: Vec<Seal>,
+}
+
+impl SealChain {
+    /// Creates an empty chain.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The hash of the most recent seal.
+    #[must_use]
+    pub fn head(&self) -> Option<Hash> {
+        self.seals.last().map(|s| s.seal_hash)
+    }
+
+    /// The most recent seal.
+    #[must_use]
+    pub fn last(&self) -> Option<&Seal> {
+        self.seals.last()
+    }
+
+    /// Appends a seal, checking that it chains to the current head.
+    pub fn push(&mut self, seal: Seal) -> Result<(), SealChainError> {
+        if !seal.is_self_consistent() {
+            return Err(SealChainError::Tampered {
+                period: seal.period,
+            });
+        }
+        if let Some(prev) = self.seals.last()
+            && prev.ledger != seal.ledger
+        {
+            return Err(SealChainError::ForeignLedger {
+                period: seal.period,
+                expected: prev.ledger.clone(),
+                found: seal.ledger,
+            });
+        }
+        match (self.seals.last(), seal.prev_seal) {
+            (None, None) => {}
+            (Some(prev), Some(reference)) => {
+                if prev.seal_hash != reference {
+                    return Err(SealChainError::BrokenChain {
+                        period: seal.period,
+                    });
+                }
+                if seal.tree_head.size < prev.tree_head.size {
+                    return Err(SealChainError::NonMonotonic {
+                        period: seal.period,
+                    });
+                }
+            }
+            _ => {
+                return Err(SealChainError::MisplacedGenesis {
+                    period: seal.period,
+                });
+            }
+        }
+        self.seals.push(seal);
+        Ok(())
+    }
+
+    /// Verifies every seal and every link.
+    pub fn verify(&self) -> Result<(), SealChainError> {
+        let mut previous: Option<&Seal> = None;
+        for seal in &self.seals {
+            if !seal.is_self_consistent() {
+                return Err(SealChainError::Tampered {
+                    period: seal.period.clone(),
+                });
+            }
+            if let Some(prev) = previous
+                && prev.ledger != seal.ledger
+            {
+                return Err(SealChainError::ForeignLedger {
+                    period: seal.period.clone(),
+                    expected: prev.ledger.clone(),
+                    found: seal.ledger.clone(),
+                });
+            }
+            match (previous, seal.prev_seal) {
+                (None, None) => {}
+                (Some(prev), Some(reference)) => {
+                    if prev.seal_hash != reference {
+                        return Err(SealChainError::BrokenChain {
+                            period: seal.period.clone(),
+                        });
+                    }
+                    if seal.tree_head.size < prev.tree_head.size {
+                        return Err(SealChainError::NonMonotonic {
+                            period: seal.period.clone(),
+                        });
+                    }
+                }
+                _ => {
+                    return Err(SealChainError::MisplacedGenesis {
+                        period: seal.period.clone(),
+                    });
+                }
+            }
+            previous = Some(seal);
+        }
+        Ok(())
+    }
+
+    /// The seals, oldest first.
+    #[must_use]
+    pub fn seals(&self) -> &[Seal] {
+        &self.seals
+    }
+
+    /// Number of seals.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.seals.len()
+    }
+
+    /// True when nothing has been sealed.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.seals.is_empty()
+    }
+
+    /// The seal covering a period, if it has been sealed.
+    #[must_use]
+    pub fn get(&self, period: &PeriodId) -> Option<&Seal> {
+        self.seals.iter().find(|s| s.period == *period)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::account::AccountId;
+    use crate::money::{Amount, Currency};
+    use crate::posting::{Direction, Layer};
+
+    type Eur = Amount<2>;
+
+    fn lid() -> LedgerId {
+        LedgerId::new("test-ledger").expect("valid")
+    }
+
+    fn pid(s: &str) -> PeriodId {
+        PeriodId::new(s).expect("valid")
+    }
+
+    fn head(size: u64, byte: u8) -> TreeHead {
+        TreeHead {
+            size,
+            root: Hash::from_bytes([byte; 32]),
+        }
+    }
+
+    fn tb(entries: &[(u32, i64, i64)]) -> TrialBalance<2> {
+        let mut tb = TrialBalance::<2>::new();
+        for (account, debit, credit) in entries {
+            let key = BalanceKey {
+                account: AccountId::from_index(*account),
+                currency: Currency::EUR,
+                layer: Layer::Settled,
+            };
+            let mut balance = Balance::<2>::ZERO;
+            balance
+                .add(Direction::Debit, Eur::from_minor(*debit))
+                .expect("ok");
+            balance
+                .add(Direction::Credit, Eur::from_minor(*credit))
+                .expect("ok");
+            tb.set(key, balance);
+        }
+        tb
+    }
+
+    #[test]
+    fn a_seal_hashes_its_own_contents() {
+        let seal = Seal::build(
+            lid(),
+            pid("2026-03"),
+            PeriodCoverage::spanning(0, 9, 10),
+            head(10, 1),
+            &tb(&[(0, 100, 0)]),
+            None,
+        );
+        assert!(seal.is_self_consistent());
+        assert_eq!(seal.entry_count, 10);
+    }
+
+    #[test]
+    fn editing_any_field_invalidates_the_seal() {
+        let original = Seal::build(
+            lid(),
+            pid("2026-03"),
+            PeriodCoverage::spanning(0, 9, 10),
+            head(10, 1),
+            &tb(&[(0, 100, 0)]),
+            None,
+        );
+
+        let mut altered = original.clone();
+        altered.last_index = Some(8);
+        assert!(!altered.is_self_consistent());
+
+        let mut retargeted = original.clone();
+        retargeted.tree_head = head(11, 1);
+        assert!(!retargeted.is_self_consistent());
+
+        let mut restated = original;
+        restated.trial_balance_root = Hash::from_bytes([9u8; 32]);
+        assert!(!restated.is_self_consistent());
+    }
+
+    #[test]
+    fn the_trial_balance_root_reflects_the_balances() {
+        let a = Seal::build(
+            lid(),
+            pid("p"),
+            PeriodCoverage::spanning(0, 1, 0),
+            head(2, 1),
+            &tb(&[(0, 100, 0)]),
+            None,
+        );
+        let b = Seal::build(
+            lid(),
+            pid("p"),
+            PeriodCoverage::spanning(0, 1, 0),
+            head(2, 1),
+            &tb(&[(0, 101, 0)]),
+            None,
+        );
+        assert_ne!(a.trial_balance_root, b.trial_balance_root);
+    }
+
+    #[test]
+    fn gross_totals_are_covered_not_just_the_net() {
+        // Both net to zero; a root over nets alone could not tell them apart.
+        let quiet = Seal::build(
+            lid(),
+            pid("p"),
+            PeriodCoverage::EMPTY,
+            head(0, 1),
+            &tb(&[(0, 0, 0)]),
+            None,
+        );
+        let busy = Seal::build(
+            lid(),
+            pid("p"),
+            PeriodCoverage::EMPTY,
+            head(0, 1),
+            &tb(&[(0, 500, 500)]),
+            None,
+        );
+        assert_ne!(quiet.trial_balance_root, busy.trial_balance_root);
+    }
+
+    #[test]
+    fn seals_chain_and_verify() {
+        let mut chain = SealChain::new();
+        let first = Seal::build(
+            lid(),
+            pid("2026-01"),
+            PeriodCoverage::spanning(0, 4, 0),
+            head(5, 1),
+            &tb(&[(0, 100, 0)]),
+            None,
+        );
+        chain.push(first.clone()).expect("genesis");
+
+        let second = Seal::build(
+            lid(),
+            pid("2026-02"),
+            PeriodCoverage::spanning(5, 9, 5),
+            head(10, 2),
+            &tb(&[(0, 200, 0)]),
+            Some(first.seal_hash),
+        );
+        chain.push(second).expect("chains");
+
+        assert_eq!(chain.len(), 2);
+        assert!(chain.verify().is_ok());
+        assert_eq!(
+            chain.get(&pid("2026-01")).map(|s| s.period.clone()),
+            Some(pid("2026-01"))
+        );
+    }
+
+    #[test]
+    fn a_seal_that_does_not_reference_the_head_is_refused() {
+        let mut chain = SealChain::new();
+        let first = Seal::build(
+            lid(),
+            pid("a"),
+            PeriodCoverage::spanning(0, 0, 1),
+            head(1, 1),
+            &tb(&[]),
+            None,
+        );
+        chain.push(first).expect("genesis");
+
+        let orphan = Seal::build(
+            lid(),
+            pid("b"),
+            PeriodCoverage::spanning(1, 1, 1),
+            head(2, 2),
+            &tb(&[]),
+            Some(Hash::from_bytes([7u8; 32])),
+        );
+        assert!(matches!(
+            chain.push(orphan),
+            Err(SealChainError::BrokenChain { .. })
+        ));
+    }
+
+    #[test]
+    fn only_the_first_seal_may_omit_a_predecessor() {
+        let mut chain = SealChain::new();
+        chain
+            .push(Seal::build(
+                lid(),
+                pid("a"),
+                PeriodCoverage::EMPTY,
+                head(1, 1),
+                &tb(&[]),
+                None,
+            ))
+            .expect("genesis");
+
+        let second_genesis = Seal::build(
+            lid(),
+            pid("b"),
+            PeriodCoverage::EMPTY,
+            head(2, 2),
+            &tb(&[]),
+            None,
+        );
+        assert!(matches!(
+            chain.push(second_genesis),
+            Err(SealChainError::MisplacedGenesis { .. })
+        ));
+    }
+
+    #[test]
+    fn a_first_seal_may_not_claim_a_predecessor() {
+        let mut chain = SealChain::new();
+        let bogus = Seal::build(
+            lid(),
+            pid("a"),
+            PeriodCoverage::EMPTY,
+            head(1, 1),
+            &tb(&[]),
+            Some(Hash::from_bytes([3u8; 32])),
+        );
+        assert!(matches!(
+            chain.push(bogus),
+            Err(SealChainError::MisplacedGenesis { .. })
+        ));
+    }
+
+    #[test]
+    fn the_tree_may_not_shrink_between_seals() {
+        let mut chain = SealChain::new();
+        let first = Seal::build(
+            lid(),
+            pid("a"),
+            PeriodCoverage::spanning(0, 9, 10),
+            head(10, 1),
+            &tb(&[]),
+            None,
+        );
+        chain.push(first.clone()).expect("genesis");
+
+        let shrunk = Seal::build(
+            lid(),
+            pid("b"),
+            PeriodCoverage::spanning(0, 4, 0),
+            head(5, 2),
+            &tb(&[]),
+            Some(first.seal_hash),
+        );
+        assert!(matches!(
+            chain.push(shrunk),
+            Err(SealChainError::NonMonotonic { .. })
+        ));
+    }
+
+    #[test]
+    fn tampering_with_a_sealed_period_is_detected_by_the_chain() {
+        let mut chain = SealChain::new();
+        let first = Seal::build(
+            lid(),
+            pid("a"),
+            PeriodCoverage::spanning(0, 4, 0),
+            head(5, 1),
+            &tb(&[(0, 100, 0)]),
+            None,
+        );
+        chain.push(first.clone()).expect("genesis");
+        chain
+            .push(Seal::build(
+                lid(),
+                pid("b"),
+                PeriodCoverage::spanning(5, 9, 5),
+                head(10, 2),
+                &tb(&[(0, 200, 0)]),
+                Some(first.seal_hash),
+            ))
+            .expect("chains");
+        assert!(chain.verify().is_ok());
+
+        // Restate the first period after the fact.
+        let mut tampered = chain;
+        if let Some(seal) = tampered.seals.first_mut() {
+            seal.trial_balance_root = Hash::from_bytes([0xffu8; 32]);
+        }
+        assert!(matches!(
+            tampered.verify(),
+            Err(SealChainError::Tampered { .. })
+        ));
+    }
+
+    #[test]
+    fn an_empty_period_seals_with_no_entries() {
+        let seal = Seal::build(
+            lid(),
+            pid("quiet"),
+            PeriodCoverage::EMPTY,
+            head(0, 1),
+            &tb(&[]),
+            None,
+        );
+        assert_eq!(seal.entry_count, 0);
+        assert!(seal.is_self_consistent());
+    }
+}

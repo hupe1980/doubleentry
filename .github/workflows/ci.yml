@@ -1,0 +1,176 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # `rust-toolchain.toml` pins the MSRV. RUSTUP_TOOLCHAIN takes precedence over
+  # that file, so each job below selects its own toolchain explicitly.
+  RUSTUP_TOOLCHAIN: stable
+  # Every feature except `postgres`, which needs a Docker daemon and so runs in
+  # a Linux-only job of its own.
+  PORTABLE_FEATURES: serde,sqlite,iceberg
+
+jobs:
+  fmt:
+    name: 🎨 rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: 📎 clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # The lint floor is set in Cargo.toml: arithmetic_side_effects,
+      # indexing_slicing, unwrap_used, expect_used and panic are all `deny` for
+      # the library. A ledger that can panic mid-append is a ledger that can
+      # tear a batch in half.
+      - name: clippy (default features)
+        run: cargo clippy --all-targets -- -D warnings
+      - name: clippy (all features)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+  purity:
+    name: 🧊 purity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The engine promises equal inputs give equal bytes: no clock, no I/O, no
+      # async, no unsafe. Storage backends are exempt by construction — talking
+      # to a database is their whole job — so the check covers the core only.
+      # Cheap to verify, easy to regress, and a regression silently breaks
+      # reproducible hashing rather than failing a test.
+      - name: no ambient state in the engine
+        run: |
+          hits="$(grep -rn --include='*.rs' -E \
+            'now_utc|SystemTime::now|Instant::now|std::(fs|env|net|process)|\basync\b|\bunsafe\b' \
+            src/ \
+            | grep -v '^src/storage' \
+            | grep -vE ':[[:space:]]*(///|//!|//)' || true)"
+          if [ -n "$hits" ]; then
+            echo "::error::ambient state, async or unsafe reached the engine"
+            echo "$hits"
+            exit 1
+          fi
+          echo "pure: no clock, no I/O, no async, no unsafe"
+
+  test:
+    name: 🧪 test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: test (default features)
+        run: cargo test --all-targets
+      - name: test (portable features)
+        run: cargo test --features "$PORTABLE_FEATURES" --all-targets
+        shell: bash
+      - name: doctests (portable features)
+        run: cargo test --features "$PORTABLE_FEATURES" --doc
+        shell: bash
+
+  postgres:
+    name: 🐘 postgres (testcontainers)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # testcontainers starts and disposes of its own PostgreSQL, so no
+      # `services:` block: the tests own their fixture, and the same command
+      # runs unchanged on a developer's machine.
+      - name: test (postgres)
+        run: cargo test --features postgres --test postgres
+      # The conformance suite is the contract every backend must satisfy. Both
+      # sequencing modes run it, because deferred sequencing is a different
+      # implementation of the same promise.
+      - name: conformance across every backend
+        run: cargo test --all-features conforms
+
+  features:
+    name: 🎛️ feature matrix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Each feature must stand alone: a backend that only compiles when
+      # another backend is also enabled is a leaked dependency.
+      - run: cargo build --no-default-features
+      - run: cargo build --no-default-features --features serde
+      - run: cargo build --no-default-features --features sqlite
+      - run: cargo build --no-default-features --features postgres
+      - run: cargo build --no-default-features --features iceberg
+      - run: cargo build --all-features
+
+  msrv:
+    name: 🦀 MSRV 1.94
+    runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: "1.94"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94"
+      - uses: Swatinem/rust-cache@v2
+      # Keep in sync with `rust-version` in Cargo.toml, rust-toolchain.toml and
+      # the badge in README.md.
+      - run: cargo check --all-features --all-targets
+
+  docs:
+    name: 📚 rustdoc
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --no-deps --all-features
+
+  package:
+    name: 📦 package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # `schema/*.sql` is `include_str!`d by the backends, so a packaging list
+      # that misses it fails to compile for everyone but us. Catch it before a
+      # release tag is cut, not after.
+      - run: cargo publish --dry-run --all-features
+
+  audit:
+    name: 🛡️ audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

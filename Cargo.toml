@@ -1,0 +1,97 @@
+[package]
+name        = "doubleentry"
+version     = "0.1.0"
+edition     = "2024"
+rust-version = "1.94"
+authors     = ["hupe1980"]
+description = """\
+An immutable, tamper-evident double-entry bookkeeping engine. Balanced-by-construction \
+entries, exact integer money, deterministic identity, and an append-only Merkle log with \
+inclusion and consistency proofs. Zero I/O. No async. No chart of accounts.\
+"""
+keywords    = ["accounting", "ledger", "double-entry", "bookkeeping", "merkle"]
+categories  = ["finance", "data-structures", "cryptography"]
+license     = "MIT OR Apache-2.0"
+repository  = "https://github.com/hupe1980/doubleentry"
+readme      = "README.md"
+
+# An allowlist, not a denylist. `.gitignore` does not govern what `cargo
+# package` ships — untracked files are included regardless — so anything not
+# named here stays out by default: design notes, scratch files, the toolchain
+# pin. `schema/*.sql` is not optional; the backends `include_str!` it.
+include = [
+    "src/**/*.rs",
+    "schema/*.sql",
+    "tests/*.rs",
+    "README.md",
+    "LICENSE-APACHE",
+    "LICENSE-MIT",
+]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+default = []
+## Enable serde `Serialize` / `Deserialize` on all public types.
+##
+## Serde is a transport concern only. The canonical encoding used for hashing is
+## independent of it and is never routed through serde.
+serde = ["dep:serde", "time/serde", "uuid/serde"]
+
+## A PostgreSQL-backed `LedgerStore`, on sqlx.
+##
+## The reference DDL is `schema/postgres.sql`; the backend applies it itself via
+## `PostgresStore::migrate`.
+postgres = ["dep:sqlx", "sqlx/postgres"]
+
+## A SQLite-backed `LedgerStore`, on sqlx.
+##
+## The reference DDL is `schema/sqlite.sql`; the backend applies it itself via
+## `SqliteStore::migrate`.
+sqlite = ["dep:sqlx", "sqlx/sqlite"]
+
+## An Apache Iceberg cold tier: compacts sealed periods into Parquet.
+##
+## Pulls in Arrow, Parquet and object storage, so it is off by default.
+iceberg = ["dep:iceberg", "dep:arrow-array", "dep:arrow-schema", "dep:parquet"]
+
+[dependencies]
+blake3   = "1"
+smallvec = "1"
+thiserror = "2"
+time     = { version = "0.3", features = ["std", "macros"] }
+uuid     = { version = "1", features = ["v7"] }
+
+serde    = { version = "1", features = ["derive"], optional = true }
+sqlx     = { version = "0.8", default-features = false, features = [
+    "runtime-tokio-rustls", "time", "uuid", "macros",
+], optional = true }
+
+# Cold tier. Arrow and Parquet must match what `iceberg` itself resolves.
+iceberg      = { version = "0.10", optional = true }
+arrow-array  = { version = "58", optional = true }
+arrow-schema = { version = "58", optional = true }
+parquet      = { version = "58", optional = true }
+
+[dev-dependencies]
+proptest   = "1"
+serde_json = "1"
+tokio      = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+testcontainers = "0.27"
+testcontainers-modules = { version = "0.15", features = ["postgres"] }
+tempfile   = "3"
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_code  = "forbid"
+
+[lints.clippy]
+# Money arithmetic must be total. Every arithmetic path in this crate goes through
+# a checked operation that surfaces overflow as a typed error.
+arithmetic_side_effects = "deny"
+indexing_slicing        = "deny"
+unwrap_used             = "deny"
+expect_used             = "deny"
+panic                   = "deny"

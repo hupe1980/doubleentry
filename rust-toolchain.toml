@@ -1,0 +1,18 @@
+[toolchain]
+# Pin to the declared MSRV so every developer and CI lane compiles on exactly
+# the same toolchain. Bumping the MSRV requires updating this value, the
+# `rust-version` key in Cargo.toml, the `msrv` CI job in
+# .github/workflows/ci.yml, the `msrv` variable in the justfile, and the MSRV
+# badge in README.md.
+#
+# Floor contributors:
+#   - edition 2024 requires rustc >= 1.85
+#   - `let_chains` stabilised in 1.88 (used across the crate)
+#   - the `iceberg` feature sets the real floor at 1.94, and `rust-version` is
+#     a package property that cannot vary by feature, so it applies to everyone
+#
+# CI jobs pass RUSTUP_TOOLCHAIN, which overrides this file, and one of them
+# verifies the pinned version actually builds — treat 1.94 as the supported
+# floor, not an upper bound on what a contributor may have installed.
+channel    = "1.94"
+components = ["rustfmt", "clippy"]

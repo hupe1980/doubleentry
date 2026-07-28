@@ -65,8 +65,13 @@ time     = { version = "0.3", features = ["std", "macros"] }
 uuid     = { version = "1", features = ["v7"] }
 
 serde    = { version = "1", features = ["derive"], optional = true }
+# No `macros`: every query in this crate is built at runtime with `sqlx::query`,
+# and the feature exists only to enable the compile-time `query!` family. It
+# pulls in `sqlx-macros-core`, which depends on *every* sqlx driver including
+# MySQL, which depends on `rsa` — a crate carrying an unfixed timing-sidechannel
+# advisory (RUSTSEC-2023-0071) that this crate can never reach.
 sqlx     = { version = "0.8", default-features = false, features = [
-    "runtime-tokio-rustls", "time", "uuid", "macros",
+    "runtime-tokio-rustls", "time", "uuid",
 ], optional = true }
 
 # Cold tier. Arrow and Parquet must match what `iceberg` itself resolves.

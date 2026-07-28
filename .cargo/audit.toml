@@ -1,0 +1,40 @@
+# cargo-audit configuration.
+#
+# `cargo audit` scans Cargo.lock, and Cargo.lock is feature-independent by
+# design: it records every optional dependency of every crate in the graph so
+# that toggling a feature cannot change the lockfile. An advisory listed here is
+# therefore not necessarily reachable — the check below states, per entry, why
+# it is not, and how that was verified.
+#
+# Every entry is a claim that expires. Re-check on each dependency bump with:
+#   cargo tree --all-features -i <crate>
+# If it prints a path instead of "nothing to print", the crate is back in the
+# build graph and the entry must be removed rather than renewed.
+
+[advisories]
+ignore = [
+    # rsa — Marvin attack, timing sidechannel key recovery. Medium (5.9), no
+    # fixed release available upstream.
+    #
+    # Reaches the lockfile through sqlx -> sqlx-mysql -> rsa. This crate never
+    # enables the MySQL driver: sqlx is taken with `default-features = false`
+    # and only `runtime-tokio-rustls`, `time` and `uuid`. The `macros` feature
+    # was dropped for exactly this reason — it pulls in sqlx-macros-core, which
+    # depends on every driver unconditionally in order to type-check `query!`
+    # at compile time, and this crate builds all of its SQL at runtime.
+    #
+    # Verified: `cargo tree --all-features -i rsa` prints nothing, and no
+    # librsa artifact is produced by `cargo build --all-features`.
+    "RUSTSEC-2023-0071",
+
+    # paste — unmaintained, no advisory of an actual defect.
+    #
+    # A proc-macro pulled in by parquet, and through it by iceberg. It is
+    # reachable, but only with the `iceberg` feature, and only at compile time:
+    # paste expands to tokens and contributes no runtime code. There is no
+    # replacement to move to until the arrow/parquet stack drops it, which is
+    # not something this crate can force.
+    #
+    # Revisit when parquet releases a version without it.
+    "RUSTSEC-2024-0436",
+]

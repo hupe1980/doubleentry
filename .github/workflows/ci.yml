@@ -11,6 +11,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -26,7 +29,7 @@ jobs:
     name: 🎨 rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -36,7 +39,7 @@ jobs:
     name: 📎 clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -54,7 +57,7 @@ jobs:
     name: 🧊 purity
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       # The engine promises equal inputs give equal bytes: no clock, no I/O, no
       # async, no unsafe. Storage backends are exempt by construction — talking
       # to a database is their whole job — so the check covers the core only.
@@ -82,7 +85,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: test (default features)
@@ -98,7 +101,7 @@ jobs:
     name: 🐘 postgres (testcontainers)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # testcontainers starts and disposes of its own PostgreSQL, so no
@@ -116,7 +119,7 @@ jobs:
     name: 🎛️ feature matrix
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # Each feature must stand alone: a backend that only compiles when
@@ -134,7 +137,7 @@ jobs:
     env:
       RUSTUP_TOOLCHAIN: "1.94"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.94"
@@ -149,7 +152,7 @@ jobs:
     env:
       RUSTDOCFLAGS: -D warnings
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo doc --no-deps --all-features
@@ -158,7 +161,7 @@ jobs:
     name: 📦 package
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # `schema/*.sql` is `include_str!`d by the backends, so a packaging list
@@ -170,7 +173,12 @@ jobs:
     name: 🛡️ audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/checkout@v5
+      - uses: taiki-e/install-action@cargo-audit
+      # Run the tool directly rather than through an action that reports via
+      # the check-runs API: that call needs `checks: write`, which a token on a
+      # pull request from a fork never has, so the job would fail on exactly
+      # the contributions most worth auditing. This also makes CI and
+      # `just audit` the same command, and `.cargo/audit.toml` — where every
+      # ignored advisory is justified — governs both.
+      - run: cargo audit

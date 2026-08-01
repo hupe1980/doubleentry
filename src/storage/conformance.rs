@@ -433,6 +433,14 @@ pub async fn check_kind_survives_a_round_trip<const P: u8, S: LedgerStore<P>>(
         // A hash mismatch here is exactly the "kind not persisted" failure.
         return CheckResult::fail(NAME, format!("append failed: {e}"));
     }
+    // The statement half of this check reads the log, which a deferred backend
+    // does not place the entry into until the sequencer runs. Without this the
+    // check would silently only ever hold for inline sequencing.
+    match sequence_until_placed(store, id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return CheckResult::fail(NAME, "the kinded entry was never sequenced"),
+        Err(e) => return CheckResult::fail(NAME, e),
+    }
     match store.get(id).await {
         Ok(Some(r)) => {
             let got = r.entry.kind().map(|k| k.as_str().to_owned());

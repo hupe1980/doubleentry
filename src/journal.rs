@@ -470,6 +470,7 @@ impl<const P: u8> Journal<P> {
                     direction: posting.direction,
                     amount: posting.amount,
                     running,
+                    kind: entry.kind().cloned(),
                 });
             }
         }

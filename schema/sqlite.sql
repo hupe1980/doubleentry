@@ -92,6 +92,9 @@ CREATE TABLE IF NOT EXISTS entries (
     booking_date            TEXT    NOT NULL,
     value_date              TEXT    NOT NULL,
     description             TEXT    NOT NULL DEFAULT '',
+    -- Caller-defined entry kind (a Label). Opaque to the engine, part of the
+    -- content hash, and carried on statement lines.
+    kind                    TEXT,
 
     provenance_actor        TEXT,
     provenance_source       TEXT,

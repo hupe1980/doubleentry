@@ -33,7 +33,7 @@ use crate::account::{Account, AccountId, AccountKind, AccountPath, AccountRecord
 use crate::balance::{Balance, BalanceKey, TrialBalance};
 use crate::checkpoint::Checkpoint;
 use crate::clearing::{Clearing, ClearingId, OpenItem, PostingRef};
-use crate::dimensions::{ActivityId, CostObjectId, Dimensions, PartyId, SegmentId};
+use crate::dimensions::{ActivityId, CostObjectId, Dimensions, Label, PartyId, SegmentId};
 use crate::entry::{
     Balanced, Description, DocumentRef, Draft, Entry, EntryId, IdempotencyKey, IntegrityError,
     Provenance,
@@ -44,7 +44,7 @@ use crate::merkle::{
     ConsistencyProof, InclusionProof, MerkleAccumulator, MerkleLog, ProofError, TreeHead,
 };
 use crate::money::{Amount, Currency, MoneyError};
-use crate::period::{LedgerId, PeriodCalendar, PeriodId, PeriodState};
+use crate::period::{LedgerId, Period, PeriodCalendar, PeriodId, PeriodState};
 use crate::posting::{Direction, Layer, Posting};
 use crate::seal::{PeriodCoverage, Seal, SealChain};
 use crate::storage::{Cursor, EntryBatch, LedgerStore, Page, StatementPage, StoredEntry};
@@ -394,6 +394,35 @@ impl<const P: u8> PostgresStore<P> {
         Ok(())
     }
 
+    /// Every defined period, with its persisted state — to reconstruct a
+    /// [`PeriodCalendar`] on start-up so sealed periods keep rejecting postings.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error the database raises, or a malformed row.
+    pub async fn periods(&self) -> Result<Vec<Period>, PostgresError> {
+        let rows = sqlx::query(
+            "SELECT period_id, starts_on, ends_on, state FROM periods ORDER BY starts_on",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let id: String = row.try_get("period_id")?;
+            let starts_on: Date = row.try_get("starts_on")?;
+            let ends_on: Date = row.try_get("ends_on")?;
+            let state: String = row.try_get("state")?;
+            let id = PeriodId::new(id).map_err(|e| PostgresError::malformed(e.to_string()))?;
+            let mut period = Period::new(id, starts_on, ends_on)
+                .map_err(|e| PostgresError::malformed(e.to_string()))?;
+            period.state = period_state_from(&state).ok_or_else(|| {
+                PostgresError::malformed(format!("unknown period state {state:?}"))
+            })?;
+            out.push(period);
+        }
+        Ok(out)
+    }
+
     /// Every content hash in log order, which is the Merkle log's leaf sequence.
     async fn leaves(&self) -> Result<Vec<Hash>, PostgresError> {
         let rows = sqlx::query(
@@ -526,8 +555,9 @@ impl<const P: u8> PostgresStore<P> {
             "INSERT INTO entries ( \
                 log_index, entry_id, idempotency_key, content_hash, booking_date, value_date, \
                 description, provenance_actor, provenance_source, provenance_correlation, \
-                document_id, document_content_hash, reverses, original_booking_date, tree_root \
-             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) \
+                document_id, document_content_hash, reverses, original_booking_date, tree_root, \
+                kind \
+             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) \
              ON CONFLICT (idempotency_key) DO NOTHING \
              RETURNING entry_id",
         )
@@ -551,6 +581,7 @@ impl<const P: u8> PostgresStore<P> {
         .bind(entry.reverses().map(|r| *r.as_uuid()))
         .bind(entry.original_booking_date())
         .bind(projected_root.map(|r| r.as_bytes().to_vec()))
+        .bind(entry.kind().map(|k| k.as_str()))
         .fetch_optional(&mut **tx)
         .await?;
 
@@ -696,7 +727,7 @@ impl<const P: u8> PostgresStore<P> {
 /// Columns selected whenever a whole entry is loaded.
 const ENTRY_COLUMNS: &str = "entry_id, log_index, idempotency_key, content_hash, booking_date, \
      value_date, description, provenance_actor, provenance_source, provenance_correlation, \
-     document_id, document_content_hash, reverses, original_booking_date";
+     document_id, document_content_hash, reverses, original_booking_date, kind";
 
 fn through_bound(through: Option<LogIndex>) -> i64 {
     through.map_or(i64::MAX, |i| i64::try_from(i.get()).unwrap_or(i64::MAX))
@@ -721,6 +752,15 @@ fn period_state_str(state: PeriodState) -> &'static str {
         PeriodState::Open => "open",
         PeriodState::Closing => "closing",
         PeriodState::Sealed => "sealed",
+    }
+}
+
+fn period_state_from(s: &str) -> Option<PeriodState> {
+    match s {
+        "open" => Some(PeriodState::Open),
+        "closing" => Some(PeriodState::Closing),
+        "sealed" => Some(PeriodState::Sealed),
+        _ => None,
     }
 }
 
@@ -818,6 +858,11 @@ fn build_stored_entry<const P: u8>(
         Description::new(description).map_err(|e| PostgresError::malformed(e.to_string()))?,
     )
     .with_provenance(provenance);
+
+    if let Some(kind) = row.try_get::<Option<String>, _>("kind")? {
+        draft =
+            draft.with_kind(Label::new(kind).map_err(|e| PostgresError::malformed(e.to_string()))?);
+    }
 
     // The hash is independently optional: an entry may name a document without
     // committing to its contents. Requiring both would silently drop the
@@ -1487,7 +1532,7 @@ impl<const P: u8> LedgerStore<P> for PostgresStore<P> {
             .await?;
 
         let rows = sqlx::query(
-            "SELECT e.log_index, e.entry_id, e.booking_date, p.posting_index, \
+            "SELECT e.log_index, e.entry_id, e.booking_date, e.kind, p.posting_index, \
                     p.direction, p.amount_minor \
              FROM postings p JOIN entries e ON e.entry_id = p.entry_id \
              WHERE p.account_index = $1 AND p.currency = $2 AND p.layer = $3 \
@@ -1515,6 +1560,9 @@ impl<const P: u8> LedgerStore<P> for PostgresStore<P> {
             } else {
                 Direction::Credit
             };
+            let kind = row
+                .try_get::<Option<String>, _>("kind")?
+                .and_then(|s| Label::new(s).ok());
             running.add(direction, amount)?;
             lines.push(crate::storage::StatementLine {
                 index: LogIndex::new(u64::try_from(log_index).unwrap_or(0)),
@@ -1526,6 +1574,7 @@ impl<const P: u8> LedgerStore<P> for PostgresStore<P> {
                 direction,
                 amount,
                 running,
+                kind,
             });
         }
 

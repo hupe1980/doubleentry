@@ -31,7 +31,7 @@ use crate::account::{Account, AccountId, AccountKind, AccountPath, AccountRecord
 use crate::balance::{Balance, BalanceKey, TrialBalance};
 use crate::checkpoint::Checkpoint;
 use crate::clearing::{Clearing, ClearingError, ClearingId, OpenItem, PostingRef};
-use crate::dimensions::{ActivityId, CostObjectId, Dimensions, PartyId, SegmentId};
+use crate::dimensions::{ActivityId, CostObjectId, Dimensions, Label, PartyId, SegmentId};
 use crate::entry::{
     Balanced, Description, DocumentRef, Draft, Entry, EntryId, IdempotencyKey, IntegrityError,
     Provenance,
@@ -341,8 +341,9 @@ impl<const P: u8> SqliteStore<P> {
             "INSERT INTO entries ( \
                 log_index, entry_id, idempotency_key, content_hash, booking_date, value_date, \
                 description, provenance_actor, provenance_source, provenance_correlation, \
-                document_id, document_content_hash, reverses, original_booking_date, tree_root \
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15) \
+                document_id, document_content_hash, reverses, original_booking_date, tree_root, \
+                kind \
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16) \
              ON CONFLICT (idempotency_key) DO NOTHING \
              RETURNING log_index",
         )
@@ -366,6 +367,7 @@ impl<const P: u8> SqliteStore<P> {
         .bind(entry.reverses().map(uuid_bytes))
         .bind(entry.original_booking_date())
         .bind(projected_root.as_bytes().as_slice())
+        .bind(entry.kind().map(|k| k.as_str()))
         .fetch_optional(&mut **tx)
         .await?;
 
@@ -644,6 +646,11 @@ fn build_stored_entry<const P: u8>(
     )
     .with_provenance(provenance);
 
+    if let Some(kind) = row.try_get::<Option<String>, _>("kind")? {
+        draft =
+            draft.with_kind(Label::new(kind).map_err(|e| SqliteError::malformed(e.to_string()))?);
+    }
+
     // The hash is independently optional: an entry may name a document without
     // committing to its contents. Requiring both would silently drop the
     // reference on read and change the entry's content hash.
@@ -675,7 +682,7 @@ fn build_stored_entry<const P: u8>(
 
 const ENTRY_COLUMNS: &str = "entry_id, log_index, idempotency_key, content_hash, booking_date, \
      value_date, description, provenance_actor, provenance_source, provenance_correlation, \
-     document_id, document_content_hash, reverses, original_booking_date";
+     document_id, document_content_hash, reverses, original_booking_date, kind";
 
 async fn load_postings_tx<const P: u8>(
     tx: &mut Transaction<'_, Sqlite>,
@@ -1247,7 +1254,7 @@ impl<const P: u8> LedgerStore<P> for SqliteStore<P> {
             .await?;
 
         let rows = sqlx::query(
-            "SELECT e.log_index, e.entry_id, e.booking_date, p.posting_index, \
+            "SELECT e.log_index, e.entry_id, e.booking_date, e.kind, p.posting_index, \
                     p.direction, p.amount_minor \
              FROM postings p JOIN entries e ON e.entry_id = p.entry_id \
              WHERE p.account_index = ?1 AND p.currency = ?2 AND p.layer = ?3 \
@@ -1275,6 +1282,9 @@ impl<const P: u8> LedgerStore<P> for SqliteStore<P> {
             } else {
                 Direction::Credit
             };
+            let kind = row
+                .try_get::<Option<String>, _>("kind")?
+                .and_then(|s| Label::new(s).ok());
             running.add(direction, amount)?;
             lines.push(crate::storage::StatementLine {
                 index: LogIndex::new(u64::try_from(log_index).unwrap_or(0)),
@@ -1283,6 +1293,7 @@ impl<const P: u8> LedgerStore<P> for SqliteStore<P> {
                 direction,
                 amount,
                 running,
+                kind,
             });
         }
 

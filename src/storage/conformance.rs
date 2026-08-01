@@ -369,6 +369,25 @@ impl Fixture {
         .seal(&self.ctx())
         .ok()
     }
+
+    /// An entry carrying a caller-defined `kind` label.
+    fn entry_with_kind<const P: u8>(
+        &self,
+        key: &[u8],
+        minor: i64,
+        kind: &str,
+    ) -> Option<Entry<Balanced, P>> {
+        Entry::<Draft, P>::new(
+            EntryId::generate(),
+            IdempotencyKey::new(key.to_vec()).ok()?,
+            date!(2026 - 03 - 15),
+        )
+        .debit(self.left, Amount::<P>::from_minor(minor), Currency::EUR)
+        .credit(self.right, Amount::<P>::from_minor(minor), Currency::EUR)
+        .with_kind(crate::dimensions::Label::new(kind).ok()?)
+        .seal(&self.ctx())
+        .ok()
+    }
 }
 
 /// Runs every conformance check against an **empty** store.
@@ -390,7 +409,64 @@ pub async fn check_all<const P: u8, S: LedgerStore<P>>(store: &S) -> Report {
     checks.push(check_clearing_rules(store).await);
     checks.push(check_open_items_track_residuals(store).await);
     checks.push(check_account_bindings_survive_a_restart(store).await);
+    checks.push(check_kind_survives_a_round_trip(store).await);
     Report { checks }
+}
+
+/// An entry's `kind` label survives a store round-trip.
+///
+/// `kind` is part of the content hash, so a backend that fails to persist and
+/// rehydrate it makes every kinded entry unreadable — [`get`](LedgerStore::get)
+/// rehydrates through `adopt_verified`, which recomputes the hash and rejects a
+/// mismatch. The check also asserts the statement line carries the kind, so a
+/// caller can group by document type without a second lookup.
+pub async fn check_kind_survives_a_round_trip<const P: u8, S: LedgerStore<P>>(
+    store: &S,
+) -> CheckResult {
+    const NAME: &str = "entry kind survives a round-trip";
+    let f = Fixture::new();
+    let Some(entry) = f.entry_with_kind::<P>(b"kinded", 5150, "INVOICE") else {
+        return CheckResult::fail(NAME, "fixture entry failed to seal");
+    };
+    let id = entry.id();
+    if let Err(e) = store.append(&EntryBatch::single(entry)).await {
+        // A hash mismatch here is exactly the "kind not persisted" failure.
+        return CheckResult::fail(NAME, format!("append failed: {e}"));
+    }
+    match store.get(id).await {
+        Ok(Some(r)) => {
+            let got = r.entry.kind().map(|k| k.as_str().to_owned());
+            if got.as_deref() != Some("INVOICE") {
+                return CheckResult::fail(
+                    NAME,
+                    format!("kind did not round-trip: expected Some(\"INVOICE\"), got {got:?}"),
+                );
+            }
+        }
+        Ok(None) => return CheckResult::fail(NAME, "a kinded entry was not found"),
+        Err(e) => return CheckResult::fail(NAME, format!("get failed (hash mismatch?): {e}")),
+    }
+
+    // And the statement line exposes it.
+    let key = BalanceKey {
+        account: f.left,
+        currency: Currency::EUR,
+        layer: Layer::Settled,
+    };
+    match store.statement(key, Cursor::start()).await {
+        Ok(page) => {
+            let seen = page
+                .lines
+                .iter()
+                .any(|l| l.kind.as_ref().map(|k| k.as_str()) == Some("INVOICE"));
+            if seen {
+                CheckResult::pass(NAME)
+            } else {
+                CheckResult::fail(NAME, "statement line did not carry the entry kind")
+            }
+        }
+        Err(e) => CheckResult::fail(NAME, format!("statement failed: {e}")),
+    }
 }
 
 /// Account handles read back exactly as they were written.
@@ -1156,7 +1232,7 @@ mod tests {
     fn the_memory_store_conforms() {
         let report = block_on(check_all(&MemoryStore::<2>::new(test_ledger())));
         report.assert_passed();
-        assert_eq!(report.checks.len(), 13);
+        assert_eq!(report.checks.len(), 14);
     }
 
     #[test]

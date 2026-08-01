@@ -119,6 +119,10 @@ CREATE TABLE IF NOT EXISTS entries (
     value_date          DATE        NOT NULL,
     description         TEXT        NOT NULL DEFAULT '',
 
+    -- Caller-defined entry kind (a Label, e.g. an invoice/payment type). Opaque to
+    -- the engine, part of the content hash, and carried on statement lines.
+    kind                TEXT,
+
     provenance_actor        TEXT,
     provenance_source       TEXT,
     provenance_correlation  TEXT,

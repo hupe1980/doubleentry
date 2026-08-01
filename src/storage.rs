@@ -410,7 +410,7 @@ pub trait LedgerStore<const P: u8>: Send + Sync {
 }
 
 /// One line of an account statement.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatementLine<const P: u8> {
     /// Where the entry sits in the log.
     pub index: LogIndex,
@@ -424,6 +424,10 @@ pub struct StatementLine<const P: u8> {
     pub amount: crate::money::Amount<P>,
     /// The account's balance after this line.
     pub running: Balance<P>,
+    /// The owning entry's caller-defined kind, if any (e.g. an invoice or payment
+    /// type). Lets a statement group or filter by document type without a second
+    /// lookup per line. Opaque to the engine.
+    pub kind: Option<crate::dimensions::Label>,
 }
 
 /// A page of statement lines.
@@ -789,6 +793,7 @@ impl<const P: u8> LedgerStore<P> for MemoryStore<P> {
                     direction: l.direction,
                     amount: l.amount,
                     running: l.running,
+                    kind: l.kind.clone(),
                 })
                 .collect();
             let next = lines

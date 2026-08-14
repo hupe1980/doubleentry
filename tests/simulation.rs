@@ -22,6 +22,7 @@
     clippy::arithmetic_side_effects
 )]
 
+use doubleentry::account::BalanceLimit;
 use doubleentry::clearing::{Clearing, ClearingId};
 use doubleentry::entry::Draft;
 use doubleentry::period::{LedgerId, Period, PeriodId, PeriodState};
@@ -60,6 +61,10 @@ enum Op {
     ResetClearing { which: usize },
     /// Close and seal the current period.
     SealPeriod,
+    /// Fund the limited account, or try to draw against it.
+    MoveLimited { amount: i64, into: bool },
+    /// Impose or lift the limited account's balance limit.
+    SetLimit { on: bool },
 }
 
 fn op_strategy() -> impl Strategy<Value = Op> {
@@ -71,12 +76,17 @@ fn op_strategy() -> impl Strategy<Value = Op> {
             .prop_map(|(debit, credit, amount)| Op::Clear { debit, credit, amount }),
         1 => (0usize..16).prop_map(|which| Op::ResetClearing { which }),
         1 => Just(Op::SealPeriod),
+        4 => (1i64..1_000_000, any::<bool>())
+            .prop_map(|(amount, into)| Op::MoveLimited { amount, into }),
+        1 => any::<bool>().prop_map(|on| Op::SetLimit { on }),
     ]
 }
 
 struct World {
     left: AccountId,
     right: AccountId,
+    /// An account the sequence may constrain and then try to overdraw.
+    limited: AccountId,
     journal: Journal<2>,
     /// Plain appends, with the key and amount that reproduce each. Only these
     /// are replayable: a reversal is not rebuildable from a key and an amount.
@@ -102,9 +112,14 @@ impl World {
             .accounts_mut()
             .register_path("Sim:Right", date!(2000 - 01 - 01))
             .expect("registers");
+        let limited = journal
+            .accounts_mut()
+            .register_path("Sim:Limited", date!(2000 - 01 - 01))
+            .expect("registers");
         Self {
             left,
             right,
+            limited,
             journal,
             recorded: Vec::new(),
             all_ids: Vec::new(),
@@ -117,6 +132,14 @@ impl World {
     fn key(&mut self) -> Vec<u8> {
         self.next_key += 1;
         format!("sim-{}", self.next_key).into_bytes()
+    }
+
+    fn limited_key(&self) -> BalanceKey {
+        BalanceKey {
+            account: self.limited,
+            currency: Currency::EUR,
+            layer: Layer::Settled,
+        }
     }
 
     fn build(&self, key: &[u8], amount: i64) -> Option<Entry<Draft, 2>> {
@@ -182,11 +205,15 @@ impl World {
                 let reversal_id = draft.id();
                 match self.journal.record(draft) {
                     Ok(_) => self.all_ids.push(reversal_id),
-                    // The only legitimate refusals are the correction rules and
-                    // a booking date whose period has since been sealed.
+                    // The legitimate refusals are the correction rules, a
+                    // booking date whose period has since been sealed, and a
+                    // balance limit: reversing a funding entry withdraws money
+                    // the account may since have committed, and a limit is a
+                    // rule about the resulting balance, not about intent.
                     Err(
                         JournalError::AlreadyReversed { .. }
                         | JournalError::ReversalOfReversal { .. }
+                        | JournalError::LimitBreached { .. }
                         | JournalError::Invalid(_),
                     ) => {}
                     Err(e) => panic!("unexpected reversal failure: {e}"),
@@ -245,6 +272,68 @@ impl World {
                 let id = self.clearings[*which % self.clearings.len()];
                 // Already-reset is the only legitimate refusal.
                 let _ = self.journal.reset_clearing(id, date!(2026 - 07 - 01));
+            }
+
+            Op::MoveLimited { amount, into } => {
+                let key = self.key();
+                let Ok(k) = IdempotencyKey::new(key) else {
+                    return;
+                };
+                let amount = Eur::from_minor(*amount);
+                let draft = Entry::<Draft, 2>::new(EntryId::generate(), k, date!(2026 - 06 - 15));
+                let draft = if *into {
+                    draft.debit(self.limited, amount, Currency::EUR).credit(
+                        self.right,
+                        amount,
+                        Currency::EUR,
+                    )
+                } else {
+                    draft.credit(self.limited, amount, Currency::EUR).debit(
+                        self.right,
+                        amount,
+                        Currency::EUR,
+                    )
+                };
+                let id = draft.id();
+                let limit = self.journal.accounts().limit_of(self.limited);
+                match self.journal.record(draft) {
+                    Ok(_) => {
+                        self.all_ids.push(id);
+                        // The rule the engine actually promises: an entry that
+                        // is *accepted* leaves the account satisfying whatever
+                        // limit was in force when it was accepted. Asserting it
+                        // here rather than after every step is what makes it
+                        // exact — a limit imposed later on an account already
+                        // past it is legal and does not retroactively falsify
+                        // anything that was booked before.
+                        let balance = self
+                            .journal
+                            .balance(&self.limited_key(), None)
+                            .expect("no overflow");
+                        assert!(
+                            limit.permits(&balance),
+                            "an accepted entry breached a {limit} limit: {balance:?}"
+                        );
+                    }
+                    // The limit and a sealed period are the only refusals a
+                    // freshly built, balanced entry can legitimately draw.
+                    Err(JournalError::LimitBreached { .. } | JournalError::Invalid(_)) => {}
+                    Err(e) => panic!("unexpected failure moving the limited account: {e}"),
+                }
+            }
+
+            Op::SetLimit { on } => {
+                let limit = if *on {
+                    BalanceLimit::NoCreditBalance
+                } else {
+                    BalanceLimit::Unlimited
+                };
+                // Imposing a limit is master data and always succeeds, even on
+                // an account already past it: it governs the next booking only.
+                self.journal
+                    .accounts_mut()
+                    .set_limit(self.limited, limit)
+                    .expect("the account is registered");
             }
 
             Op::SealPeriod => {
@@ -316,6 +405,30 @@ impl World {
                 proof.verify(&entry.content_hash(), &head.root),
                 "entry {i} became unprovable"
             );
+        }
+
+        // A checkpoint taken now must still verify now, and one taken over the
+        // empty prefix must verify however far the log has grown.
+        for account in [self.left, self.limited] {
+            let key = BalanceKey {
+                account,
+                currency: Currency::EUR,
+                layer: Layer::Settled,
+            };
+            let checkpoint = self.journal.checkpoint(&key).expect("no overflow");
+            assert_eq!(checkpoint.size(), self.journal.len() as u64);
+            self.journal
+                .verify_checkpoint(&checkpoint)
+                .expect("a checkpoint taken from the journal must re-derive");
+
+            let empty = doubleentry::Checkpoint::<2>::new(
+                key,
+                doubleentry::Balance::ZERO,
+                self.journal.head_at(0).expect("size zero is in range"),
+            );
+            self.journal
+                .verify_checkpoint(&empty)
+                .expect("an empty-prefix checkpoint must stay valid");
         }
 
         // Residuals are bounded by the postings they belong to.

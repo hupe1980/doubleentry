@@ -527,6 +527,79 @@ async fn concurrent_replays_of_one_key_append_once() {
 }
 
 #[tokio::test]
+async fn concurrent_draws_cannot_together_breach_a_balance_limit() {
+    // The failure a balance limit exists to prevent, and the one a naive
+    // implementation still allows: two withdrawals that each fit the balance
+    // read separately, and together do not. Checking before the write reads a
+    // pre-image both racers see; the row lock inside the write is what makes
+    // the invariant hold rather than usually hold.
+    let h = Harness::start().await;
+
+    let mut limited = h.accounts.clone();
+    limited
+        .set_limit(h.left, doubleentry::account::BalanceLimit::NoCreditBalance)
+        .expect("registered");
+    for record in limited.records() {
+        h.store
+            .register_account(&record)
+            .await
+            .expect("master data updates");
+    }
+
+    // Fund it with exactly 10.00 …
+    h.store
+        .append(&EntryBatch::single(h.entry(b"limit-funding", 1_000)))
+        .await
+        .expect("appends");
+
+    // … then race eight withdrawals of 4.00. At most two can be accepted.
+    let draw = |key: &[u8]| {
+        Entry::<Draft, 2>::new(
+            EntryId::generate(),
+            IdempotencyKey::new(key.to_vec()).expect("valid"),
+            date!(2026 - 03 - 16),
+        )
+        .credit(h.left, Eur::from_minor(400), Currency::EUR)
+        .debit(h.right, Eur::from_minor(400), Currency::EUR)
+        .seal(&SealContext {
+            accounts: &limited,
+            calendar: &h.calendar,
+            policy: &h.policy,
+        })
+        .expect("balances")
+    };
+
+    let mut tasks = Vec::new();
+    for i in 0..8u8 {
+        let store = h.store.clone();
+        let entry = draw(format!("draw-{i}").as_bytes());
+        tasks.push(tokio::spawn(async move {
+            store.append(&EntryBatch::single(entry)).await
+        }));
+    }
+
+    let mut accepted = 0;
+    for task in tasks {
+        match task.await.expect("task completes") {
+            Ok(_) => accepted += 1,
+            Err(PostgresError::LimitBreached { .. }) => {}
+            Err(e) => panic!("unexpected failure: {e}"),
+        }
+    }
+
+    assert_eq!(accepted, 2, "10.00 funds exactly two withdrawals of 4.00");
+    let net = h
+        .store
+        .balance(h.key(), None)
+        .await
+        .expect("reads")
+        .signed_net()
+        .expect("no overflow");
+    assert_eq!(net, Eur::from_minor(200));
+    assert!(!net.is_negative(), "the limit must hold under concurrency");
+}
+
+#[tokio::test]
 async fn a_conflicting_key_is_refused_without_writing() {
     let h = Harness::start().await;
     h.store
@@ -631,11 +704,7 @@ async fn balances_and_trial_balances_agree_with_the_log() {
     assert_eq!(totals.debits, Eur::from_minor(500));
 
     // As-of reads reconstruct an earlier state.
-    let earlier = h
-        .store
-        .balance(h.key(), Some(doubleentry::LogIndex::new(1)))
-        .await
-        .expect("reads");
+    let earlier = h.store.balance(h.key(), Some(2)).await.expect("reads");
     assert_eq!(earlier.debits, Eur::from_minor(200));
 }
 
@@ -740,10 +809,8 @@ async fn sealing_a_period_excludes_later_entries() {
     assert_eq!(stored[0].seal_hash, seal.seal_hash);
     assert_eq!(stored[1].seal_hash, second.seal_hash);
 
-    let mut chain = doubleentry::SealChain::new();
-    for s in stored {
-        chain.push(s).expect("chains in the order it was read");
-    }
+    let chain = doubleentry::SealChain::from_seals(h.store.ledger().clone(), stored)
+        .expect("chains in the order it was read");
     chain.verify().expect("the reloaded chain verifies");
 
     assert!(seal.is_self_consistent());

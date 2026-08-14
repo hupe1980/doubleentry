@@ -51,8 +51,18 @@ CREATE TABLE IF NOT EXISTS accounts (
     kind            TEXT,
     opened_on       DATE        NOT NULL,
     closed_on       DATE,
+    -- 'unlimited' | 'no_credit' | 'no_debit'. A rule about what may be booked
+    -- next, like the open window: 'no_credit' forbids the net going credit (an
+    -- asset that cannot be overdrawn), 'no_debit' forbids it going debit (a
+    -- liability that cannot be drawn beyond what was funded). Enforced inside
+    -- the append, because the check is against the balance the entry would
+    -- leave behind.
+    balance_limit   TEXT        NOT NULL DEFAULT 'unlimited',
 
     CONSTRAINT accounts_window CHECK (closed_on IS NULL OR closed_on >= opened_on),
+    CONSTRAINT accounts_balance_limit CHECK (
+        balance_limit IN ('unlimited', 'no_credit', 'no_debit')
+    ),
     CONSTRAINT accounts_kind CHECK (
         kind IS NULL
         OR kind IN ('asset', 'liability', 'equity', 'income', 'expense')
@@ -421,17 +431,19 @@ WHERE p.amount_minor - COALESCE(applied.total, 0) > 0;
 
 -- ── checkpoints ─────────────────────────────────────────────────────────────
 --
--- A recorded balance at a known log position, so a read does not fold the whole
--- journal. Derived state, and safe only because it can be re-derived: it carries
--- the position and the tree head it was taken against, so a checkpoint cannot be
--- silently reused against a history that changed.
+-- A recorded balance over a known prefix of the log, so a read does not fold the
+-- whole journal. Derived state, and safe only because it can be re-derived.
+--
+-- The prefix is `tree_size`: the head both names how much of the log the balance
+-- covers and pins which history it covers, so a checkpoint cannot be silently
+-- reused against a log that changed. There is deliberately no second position
+-- column — two columns that must agree are two columns that can disagree.
 
 CREATE TABLE IF NOT EXISTS checkpoints (
     account_index   INTEGER     NOT NULL,
     currency        CHAR(3)     NOT NULL,
     layer           TEXT        NOT NULL,
 
-    through_index   BIGINT,
     debits_minor    BIGINT      NOT NULL,
     credits_minor   BIGINT      NOT NULL,
 

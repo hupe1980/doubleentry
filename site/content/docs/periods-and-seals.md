@@ -1,7 +1,7 @@
 +++
 title = "Periods and seals"
 description = "Closing a period, chaining its seal, and proving one closing balance to an auditor without disclosing the rest of the books."
-weight = 10
+weight = 11
 +++
 
 ## The period lifecycle

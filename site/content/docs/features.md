@@ -1,7 +1,7 @@
 +++
 title = "Features and serialisation"
 description = "The crate's cargo features, and the rule every validated type follows on the way in from the wire."
-weight = 15
+weight = 16
 +++
 
 ## Cargo features

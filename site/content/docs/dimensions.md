@@ -1,7 +1,7 @@
 +++
 title = "Dimensions"
 description = "Reporting axes carried on every posting, orthogonal to the account path — and why the crate ships none of them."
-weight = 11
+weight = 12
 +++
 
 ## Axes, not deeper paths

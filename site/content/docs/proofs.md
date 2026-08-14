@@ -1,7 +1,7 @@
 +++
 title = "Proofs"
 description = "The append-only Merkle log behind RFC 6962-style inclusion and consistency proofs, and why a hash chain cannot do the same job."
-weight = 5
+weight = 6
 +++
 
 ## The log

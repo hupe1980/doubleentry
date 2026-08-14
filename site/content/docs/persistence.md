@@ -1,7 +1,7 @@
 +++
 title = "Persistence"
 description = "The LedgerStore contract, the executable conformance suite that defines it, and the SQLite and PostgreSQL backends."
-weight = 13
+weight = 14
 +++
 
 ## The contract
@@ -23,11 +23,18 @@ A backend must guarantee all of the following:
 5. **Stable reads.** A record read twice returns the same bytes and the same
    content hash — every field, including `kind` and each posting's dimensions,
    because those are covered by that hash.
-6. **Master data survives a restart.** An account comes back at the handle it was
-   issued; a period comes back in the state it was left in.
-7. **Seals chain.** `seals()` returns them in chain order, and what comes back
-   reproduces a chain that verifies.
-8. **Seals bind their account handles.** A seal's `accounts_root` is the
+6. **Master data survives a restart, and can change.** An account comes back at
+   the handle it was issued; a period comes back in the state it was left in.
+   Re-registering a handle updates its classification, open window and balance
+   limit, and refuses a different path — a store that could only ever *insert*
+   could not close an account, and a rebound handle would repoint history.
+7. **Balance limits are enforced in the write path.** A checked-then-written
+   limit races: two appends that each fit the balance they read can together
+   breach it. See [Accounts](@/docs/accounts.md#balance-limits).
+8. **Seals chain.** `seals()` returns them in chain order, and what comes back
+   reproduces a chain that verifies — against the store's *own* ledger, so the
+   first seal is checked as strictly as the last.
+9. **Seals bind their account handles.** A seal's `accounts_root` is the
    commitment over the bindings the store itself holds.
 
 ## Why a conformance suite ships with the library {#conformance}
@@ -49,8 +56,8 @@ let report = conformance::block_on(conformance::check_all(&store));
 report.assert_passed();
 ```
 
-Nineteen checks, each building its own accounts and entries, so a backend needs
-to provide nothing but an empty store.
+Twenty checks, each building its own accounts and entries, so a backend needs to
+provide nothing but an empty store.
 
 ## Backends
 

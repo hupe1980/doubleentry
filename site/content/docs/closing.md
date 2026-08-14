@@ -1,7 +1,7 @@
 +++
 title = "Closing entries"
 description = "Flattening income and expense into equity at year end, as ordinary postings that still go through validation."
-weight = 12
+weight = 13
 +++
 
 ## What closing does

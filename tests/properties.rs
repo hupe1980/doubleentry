@@ -422,10 +422,9 @@ proptest! {
         let full = build(amounts.len());
         for take in 1..=amounts.len() {
             let prefix = build(take);
-            let through = doubleentry::LogIndex::from((take - 1) as u64);
 
             let from_prefix: TrialBalance<2> = prefix.trial_balance(None).expect("ok");
-            let from_full: TrialBalance<2> = full.trial_balance(Some(through)).expect("ok");
+            let from_full: TrialBalance<2> = full.trial_balance(Some(take as u64)).expect("ok");
             prop_assert_eq!(from_prefix, from_full);
         }
     }

@@ -1,7 +1,7 @@
 +++
 title = "Cold tier"
 description = "Compacting sealed periods into Apache Iceberg so the operational database stays small and the archive stays verifiable."
-weight = 14
+weight = 15
 +++
 
 ## Why archive at all

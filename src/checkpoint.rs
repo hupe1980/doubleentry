@@ -6,54 +6,64 @@
 //! A [`Checkpoint`] is an optimisation. A balance is defined as a fold over the
 //! journal, which is correct and linear in history; a checkpoint records the
 //! fold up to a point so later reads start from there. Because that trades a
-//! definition for a cache, a checkpoint carries the log position *and* the tree
-//! head it was taken against — so it cannot be quietly reused against a history
-//! that has changed, and the journal can always re-derive it.
+//! definition for a cache, a checkpoint carries the tree head it was taken
+//! against, which does double duty: it *names* the prefix the balance covers and
+//! *pins* the history that prefix belongs to. So a checkpoint cannot be quietly
+//! reused against a log that has changed, and the journal can always re-derive
+//! it.
 //!
 //! A [`BalanceAssertion`] is the opposite: a claim from *outside* the ledger — a
 //! bank statement, a counterparty confirmation, an ERP export — checked against
 //! the fold. It catches the divergence that reconciliation exists to find, and
 //! it is the cheapest such mechanism there is.
 
+use time::Date;
+
 use crate::balance::{Balance, BalanceKey};
 use crate::merkle::TreeHead;
 use crate::money::{Amount, MoneyError};
 use crate::posting::Direction;
 
-/// A recorded balance at a known point in the log.
+/// A recorded balance over a known prefix of the log.
+///
+/// The prefix is the tree head's [`size`](TreeHead::size) — there is no separate
+/// position field, because two fields that must agree are two fields that can
+/// disagree. A checkpoint says: *after these `size` entries, whose Merkle root
+/// was this, the account held this balance.*
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Checkpoint<const P: u8> {
     /// What the balance is for.
     pub key: BalanceKey,
-    /// The last log index folded in, or `None` for a checkpoint over an empty
-    /// prefix.
-    pub through_index: Option<u64>,
-    /// The balance at that point.
+    /// The balance after the first [`Self::size`] entries.
     pub balance: Balance<P>,
     /// The tree head the checkpoint was taken against.
     ///
-    /// Pins the checkpoint to one specific history. A checkpoint whose head no
-    /// longer matches the log it is being used with is stale by construction,
-    /// not by convention.
+    /// Pins the checkpoint to one specific history *and* names the prefix it
+    /// covers. A checkpoint whose head no longer matches the log it is being
+    /// used with is stale by construction, not by convention.
     pub tree_head: TreeHead,
 }
 
 impl<const P: u8> Checkpoint<P> {
-    /// Creates a checkpoint.
+    /// Creates a checkpoint over the prefix `tree_head` commits to.
     #[must_use]
-    pub fn new(
-        key: BalanceKey,
-        through_index: Option<u64>,
-        balance: Balance<P>,
-        tree_head: TreeHead,
-    ) -> Self {
+    pub fn new(key: BalanceKey, balance: Balance<P>, tree_head: TreeHead) -> Self {
         Self {
             key,
-            through_index,
             balance,
             tree_head,
         }
+    }
+
+    /// Number of entries folded into the balance.
+    ///
+    /// Zero for a checkpoint taken over an empty log, which is a perfectly
+    /// ordinary checkpoint: it says the account had not moved yet, and it stays
+    /// true however far the log grows afterwards.
+    #[must_use]
+    pub const fn size(&self) -> u64 {
+        self.tree_head.size
     }
 
     /// True when this checkpoint was taken against `head`.
@@ -70,11 +80,11 @@ pub enum CheckpointError {
     /// The recorded balance disagrees with a fold over the journal.
     #[error("checkpoint balance does not match the journal")]
     BalanceMismatch,
-    /// The checkpoint refers to a log position the journal does not have.
-    #[error("checkpoint refers to log index {index}, beyond the journal")]
-    IndexOutOfRange {
-        /// The index claimed.
-        index: u64,
+    /// The checkpoint covers more entries than the journal holds.
+    #[error("checkpoint covers {size} entries, beyond the journal")]
+    SizeOutOfRange {
+        /// The prefix size claimed.
+        size: u64,
     },
     /// The checkpoint was taken against a different history.
     #[error("checkpoint tree head does not match the journal at that size")]
@@ -84,7 +94,34 @@ pub enum CheckpointError {
     Money(#[from] MoneyError),
 }
 
-/// A claim that an account holds a particular balance at a point in the log.
+/// Which state of the books an assertion is evaluated against.
+///
+/// The two are genuinely different questions, and picking the wrong one is the
+/// classic reconciliation mistake. A log position is exact and reproducible but
+/// only meaningful inside this system. A date is what every external source
+/// speaks — a bank statement says "as at 31 March", not "after 4,812 entries" —
+/// and it folds by *booking date* regardless of when an entry was recorded, so a
+/// backdated entry lands where it economically belongs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum AssertAt {
+    /// Everything recorded so far.
+    Now,
+    /// The first `size` entries in log order.
+    ///
+    /// Zero asserts against an empty ledger.
+    Prefix {
+        /// Number of entries folded in.
+        size: u64,
+    },
+    /// Every entry booked on or before `date`, whenever it was recorded.
+    OnDate {
+        /// The last booking date folded in, inclusive.
+        date: Date,
+    },
+}
+
+/// A claim that an account holds a particular balance at a point in the books.
 ///
 /// The expected value is a **signed net**, debit positive, because that is the
 /// form an external source reports: a statement says what the balance is, not
@@ -94,19 +131,19 @@ pub enum CheckpointError {
 pub struct BalanceAssertion<const P: u8> {
     /// What is being asserted about.
     pub key: BalanceKey,
-    /// The log position to evaluate at, or `None` for the current state.
-    pub at: Option<u64>,
+    /// Which state of the books to evaluate against.
+    pub at: AssertAt,
     /// The expected signed net, debit positive.
     pub expected: Amount<P>,
 }
 
 impl<const P: u8> BalanceAssertion<P> {
-    /// Asserts a signed net, debit positive.
+    /// Asserts a signed net, debit positive, against the current state.
     #[must_use]
     pub fn net(key: BalanceKey, expected: Amount<P>) -> Self {
         Self {
             key,
-            at: None,
+            at: AssertAt::Now,
             expected,
         }
     }
@@ -124,10 +161,19 @@ impl<const P: u8> BalanceAssertion<P> {
         Ok(Self::net(key, expected))
     }
 
-    /// Evaluates the assertion at a specific log position.
+    /// Evaluates the assertion over the first `size` entries.
     #[must_use]
-    pub fn at_index(mut self, index: u64) -> Self {
-        self.at = Some(index);
+    pub fn over_prefix(mut self, size: u64) -> Self {
+        self.at = AssertAt::Prefix { size };
+        self
+    }
+
+    /// Evaluates the assertion over everything booked on or before `date`.
+    ///
+    /// This is the form to reconcile against an external statement.
+    #[must_use]
+    pub fn on_date(mut self, date: Date) -> Self {
+        self.at = AssertAt::OnDate { date };
         self
     }
 
@@ -277,12 +323,31 @@ mod tests {
 
     #[test]
     fn a_checkpoint_knows_which_history_it_belongs_to() {
-        let cp = Checkpoint::new(key(), Some(9), balance(100, 0), head(10, 1));
+        let cp = Checkpoint::new(key(), balance(100, 0), head(10, 1));
+        assert_eq!(
+            cp.size(),
+            10,
+            "the head names the prefix; nothing else does"
+        );
         assert!(cp.matches_head(&head(10, 1)));
         // Same size, different contents: a rewritten history.
         assert!(!cp.matches_head(&head(10, 2)));
         // Same contents, different size: the log has grown.
         assert!(!cp.matches_head(&head(11, 1)));
+    }
+
+    #[test]
+    fn an_assertion_carries_the_point_it_is_about() {
+        use time::macros::date;
+        let a = BalanceAssertion::net(key(), Eur::from_minor(100));
+        assert_eq!(a.at, AssertAt::Now);
+        assert_eq!(a.over_prefix(0).at, AssertAt::Prefix { size: 0 });
+        assert_eq!(
+            a.on_date(date!(2026 - 03 - 31)).at,
+            AssertAt::OnDate {
+                date: date!(2026 - 03 - 31)
+            }
+        );
     }
 
     #[test]

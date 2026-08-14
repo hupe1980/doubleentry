@@ -13,6 +13,11 @@
 //! - **Exact.** Money is a scaled integer with a compile-time precision. Every
 //!   arithmetic operation that can overflow returns a `Result`. There is no
 //!   floating point and nothing panics on a hostile input.
+//! - **Bounded, where you say so.** An account can be forbidden from crossing
+//!   zero — a cash box that cannot be overdrawn, a wallet that cannot be drawn
+//!   beyond what was funded. The limit is checked against the balance an entry
+//!   would leave behind, and the SQL backends check it inside the write, so two
+//!   concurrent draws cannot together breach it.
 //! - **Deterministic.** The engine reads no clock and no random number generator.
 //!   Identical inputs produce identical bytes, hashes, and orderings, which is
 //!   what makes replay and reproducible testing possible.
@@ -44,7 +49,7 @@
 //! | Module | Purpose |
 //! |---|---|
 //! | [`money`] | `Amount<P>` and `Currency` — exact scaled-integer arithmetic |
-//! | [`account`] | The account tree and what may be posted to |
+//! | [`account`] | The account tree, what may be posted to, and balance limits |
 //! | [`dimensions`] | `Label`, and the caller-named axes a posting is sliced by |
 //! | [`posting`] | `Direction`, `Layer`, and the atomic movement |
 //! | [`entry`] | The type-state entry and its validation |
@@ -110,11 +115,11 @@ pub mod storage;
 
 pub use account::{
     Account, AccountBindingProof, AccountError, AccountId, AccountKind, AccountPath, AccountRecord,
-    AccountRegistry, account_binding_leaf,
+    AccountRegistry, BalanceLimit, account_binding_leaf,
 };
 pub use balance::{Balance, BalanceKey, TrialBalance};
 pub use canonical::{Canonical, CanonicalWriter};
-pub use checkpoint::{AssertionOutcome, BalanceAssertion, Checkpoint, CheckpointError};
+pub use checkpoint::{AssertAt, AssertionOutcome, BalanceAssertion, Checkpoint, CheckpointError};
 pub use clearing::{
     ClearedItem, Clearing, ClearingError, ClearingEvent, ClearingId, ClearingRegister, OpenItem,
     PostingLookup, PostingRef,

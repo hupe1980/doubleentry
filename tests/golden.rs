@@ -17,7 +17,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
-use doubleentry::account::AccountRegistry;
+use doubleentry::account::{AccountId, AccountRegistry};
 use doubleentry::balance::TrialBalance;
 use doubleentry::canonical::Canonical;
 use doubleentry::entry::{Draft, LedgerPolicy, SealContext};
@@ -184,9 +184,47 @@ fn the_reference_seal_hash_is_unchanged() {
     // issued, so it is pinned separately from the entry encoding.
     assert_eq!(
         reference_seal().seal_hash.to_hex(),
-        "dab0b142a3a3ee1347c1e7e292dcccfe57d73a8cf649596026f2eb9da4e9bdbb",
+        "ab58bc1acffe46e432bf8959af14aaa64281622a67d41a7d8ce53a534b8207d9",
         "the seal hash changed; see this file's module docs"
     );
+}
+
+/// The registry the reference seal's balances hang off.
+fn reference_registry() -> AccountRegistry {
+    let mut accounts = AccountRegistry::new();
+    accounts
+        .register_path("Assets:Cash", date!(2020 - 01 - 01))
+        .expect("registers");
+    accounts
+        .register_path("Income:Sales", date!(2020 - 01 - 01))
+        .expect("registers");
+    accounts
+}
+
+#[test]
+fn the_account_binding_commitment_is_unchanged() {
+    // Pinned separately from the seal hash it feeds. A change to the account
+    // encoding — a field added, reordered, or dropped — moves every seal ever
+    // issued, and the seal vector alone would not say which half moved.
+    assert_eq!(
+        reference_registry().commitment().to_hex(),
+        "65ca7c50e7235ac82ea3eef1acd66e1d90abe8dc2527617bfe81e234a1416a5a",
+        "the account binding commitment changed; see this file\'s module docs"
+    );
+}
+
+#[test]
+fn a_balance_limit_moves_the_binding_commitment() {
+    // The limit is inside the leaf, so an account whose limit was relaxed after
+    // the fact cannot pass for the one a seal named.
+    let mut relaxed = reference_registry();
+    relaxed
+        .set_limit(
+            AccountId::from_index(0),
+            doubleentry::account::BalanceLimit::NoCreditBalance,
+        )
+        .expect("registered");
+    assert_ne!(relaxed.commitment(), reference_registry().commitment());
 }
 
 #[test]
@@ -256,6 +294,10 @@ fn emit_vectors() {
     println!("ENCODING={hex}");
     println!("ENTRY_HASH={}", e.content_hash().to_hex());
     println!("SEAL_HASH={}", reference_seal().seal_hash.to_hex());
+    println!(
+        "ACCOUNTS_ROOT={}",
+        reference_registry().commitment().to_hex()
+    );
     println!("EMPTY_ROOT={}", empty_root().to_hex());
     println!("LEAF_ZERO={}", leaf_hash(&leaf(0)).to_hex());
     for size in [1u64, 2, 3, 4, 5, 8] {

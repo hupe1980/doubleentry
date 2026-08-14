@@ -1,7 +1,7 @@
 +++
 title = "Open items and clearing"
 description = "Matching receivables against payments, partial application, residual tracking, and resetting a clearing that matched the wrong items."
-weight = 8
+weight = 9
 +++
 
 ## The problem

@@ -1,7 +1,7 @@
 +++
 title = "Design boundaries and testing"
 description = "What the crate deliberately is not, the two structural rules it does enforce, and how its invariants are verified."
-weight = 16
+weight = 17
 +++
 
 ## What it is not
@@ -29,6 +29,12 @@ Two structural rules, because no downstream layer can repair either:
 - **Only leaves are postable.** Posting to both a node and its descendants makes
   every rollup double-count, and no reporting layer can undo it afterwards.
 - **Postings fall inside the account's open window.**
+
+And one rule you opt into per account, for the same reason — an overdrawn cash
+account is not something a report can repair either:
+
+- **A [balance limit](@/docs/accounts.md#balance-limits)**, when set, is checked
+  against the balance an entry would leave behind, per currency and per layer.
 
 Everything else that is enforced follows from double-entry itself: entries
 balance per currency, amounts are positive magnitudes with an explicit side, and
@@ -68,9 +74,11 @@ always balances and always flattens; canonical encoding is a pure function of th
 value; and a journal of balanced entries always folds to a balanced trial balance.
 
 **Simulation.** Long, randomly generated sequences of appends, replays,
-reversals, clearings, resets and seals, with *every* invariant re-checked after
-each step. Sequences are generated from a seed, so a failure reproduces exactly —
-which is what the deterministic kernel is for.
+reversals, clearings, resets, seals, and imposing and lifting balance limits,
+with *every* invariant re-checked after each step — including that an entry the
+engine accepted leaves every limit in force satisfied, and that a checkpoint
+taken at any point still re-derives. Sequences are generated from a seed, so a
+failure reproduces exactly, which is what the deterministic kernel is for.
 
 **Golden vectors.** Committed hashes for the canonical encoding, the seal
 preimage and the Merkle log. Nothing in the compiler stops a field being
@@ -85,7 +93,7 @@ to be a system of record.
 times as many entries must not take sixteen times as long. Quadratic behaviour in
 a ledger fails no test — it just makes the books slower the longer they are kept.
 
-**Conformance.** The storage contract, executable — nineteen checks, run against
+**Conformance.** The storage contract, executable — twenty checks, run against
 the in-memory, SQLite and PostgreSQL backends, and against PostgreSQL twice, once
 per sequencing mode. See [Persistence](@/docs/persistence.md#conformance).
 

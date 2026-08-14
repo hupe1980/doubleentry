@@ -1,7 +1,7 @@
 +++
 title = "Entries and validation"
 description = "The type-state entry, what balanced-by-construction claims, and the ledger-wide policy that decides which bookings are legal."
-weight = 2
+weight = 3
 +++
 
 ## Balanced by construction
@@ -57,6 +57,13 @@ The checks a `seal` runs:
 | Debits equal credits, **per currency** | A cross-currency entry balances each currency independently |
 | Booking date's period accepts postings | A sealed period has been committed to |
 | Policy: currency, required dimensions, value-date drift | Ledger-wide rules you opted into |
+
+Two further rules are checked when the entry is **recorded** rather than sealed,
+because both are questions about the books rather than about the entry: the
+[correction rules](@/docs/corrections.md), and any
+[balance limit](@/docs/accounts.md#balance-limits) on an account it touches. The
+same entry is legal or not depending on what has already been recorded, so no
+amount of inspecting it in isolation can answer them.
 
 ## Per-currency balance
 
@@ -148,9 +155,29 @@ interpreted. No vocabulary ships with this crate.
 ## Pending and settled
 
 A posting sits in one of two layers. `Layer::Settled` means the amount has moved;
-`Layer::Pending` means it is reserved but has not. A pending posting is later
-resolved by a further entry that either settles or releases it — both ordinary
-appends, so nothing is ever mutated.
+`Layer::Pending` means it is reserved but has not.
 
-Balances, statements and clearings are all keyed on the layer, so a reservation
-and a settled movement never net against each other.
+What the engine guarantees is **separation**: balances, statements, clearings and
+[balance limits](@/docs/accounts.md#balance-limits) are all keyed on the layer,
+so a reservation and a settled movement are totalled apart and never net against
+each other. Reporting a reservation as though the money had moved is exactly the
+error the layer exists to prevent.
+
+What the engine does *not* do is model a reservation's lifecycle. It ships no
+`post`/`void` operation, no expiry, and no link from a settling entry back to the
+hold it discharges. Resolving a reservation is an ordinary append — reverse the
+pending entry to release it, and book the settled entry when the money moves —
+and the pieces you need to keep that honest are already here:
+
+- **At-most-once release.** An entry can be reversed at most once, and a reversal
+  cannot itself be reversed, so a hold cannot be released twice.
+- **Residuals.** [Clearing](@/docs/open-items.md) works within the pending layer,
+  so a partially consumed hold reports its remainder like any other open item.
+- **Reservation totals.** `trial_balance` and `balance` both key on the layer, so
+  "how much is currently held" is a read, not a computation.
+
+That boundary is deliberate. Expiry needs a clock, and this engine reads none;
+and a `post`/`void` vocabulary would have to choose whether a partial settlement
+releases the remainder — a policy question with different right answers in
+payments, in trading and in inventory. Both belong to the layer above, and both
+are straightforward to build on the guarantees above.

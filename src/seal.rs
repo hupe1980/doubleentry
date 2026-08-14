@@ -504,6 +504,16 @@ pub enum SealChainError {
         /// The ledger the seal names.
         found: LedgerId,
     },
+    /// Two seals in the chain claim the same period.
+    ///
+    /// A period is sealed once. A second seal for it would give two different
+    /// commitments to one period's closing balances, and nothing in the chain
+    /// says which of them the books mean.
+    #[error("period {period} is sealed more than once in this chain")]
+    DuplicatePeriod {
+        /// The repeated period.
+        period: PeriodId,
+    },
     /// The first seal claimed a predecessor, or a later one claimed none.
     #[error("seal for period {period} has an unexpected predecessor reference")]
     MisplacedGenesis {
@@ -518,17 +528,52 @@ pub enum SealChainError {
     },
 }
 
-/// An ordered chain of period seals.
-#[derive(Debug, Clone, Default)]
+/// An ordered chain of period seals covering one ledger.
+///
+/// The chain names the ledger it covers, so the **first** seal is checked as
+/// strictly as every later one. Without that, a chain of length one would accept
+/// a seal from any books at all, and the ledger identity folded into the seal
+/// hash — the whole reason it is in the preimage — would only start being
+/// enforced from the second period onward.
+#[derive(Debug, Clone)]
 pub struct SealChain {
+    ledger: LedgerId,
     seals: Vec<Seal>,
 }
 
 impl SealChain {
-    /// Creates an empty chain.
+    /// Creates an empty chain for one ledger.
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(ledger: LedgerId) -> Self {
+        Self {
+            ledger,
+            seals: Vec::new(),
+        }
+    }
+
+    /// Rebuilds a chain from stored seals, checking every link.
+    ///
+    /// What a backend uses on the way out: seals read back from a table are
+    /// rows, not evidence, until the chain has accepted them.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first [`SealChainError`] that does not hold.
+    pub fn from_seals(
+        ledger: LedgerId,
+        seals: impl IntoIterator<Item = Seal>,
+    ) -> Result<Self, SealChainError> {
+        let mut chain = Self::new(ledger);
+        for seal in seals {
+            chain.push(seal)?;
+        }
+        Ok(chain)
+    }
+
+    /// The ledger this chain covers.
+    #[must_use]
+    pub fn ledger(&self) -> &LedgerId {
+        &self.ledger
     }
 
     /// The hash of the most recent seal.
@@ -543,26 +588,31 @@ impl SealChain {
         self.seals.last()
     }
 
-    /// Every rule that relates a seal to the one before it.
+    /// Every rule a seal must satisfy to belong at the end of `preceding`.
     ///
     /// Shared by [`SealChain::push`] and [`SealChain::verify`] so that appending
     /// and re-checking cannot drift apart — a chain that accepted a link it
     /// would later reject, or the reverse, would be worse than either rule alone.
-    fn check_link(previous: Option<&Seal>, seal: &Seal) -> Result<(), SealChainError> {
+    fn check_link(
+        ledger: &LedgerId,
+        preceding: &[Seal],
+        seal: &Seal,
+    ) -> Result<(), SealChainError> {
         let period = || seal.period.clone();
         if !seal.is_self_consistent() {
             return Err(SealChainError::Tampered { period: period() });
         }
-        if let Some(prev) = previous
-            && prev.ledger != seal.ledger
-        {
+        if seal.ledger != *ledger {
             return Err(SealChainError::ForeignLedger {
                 period: period(),
-                expected: prev.ledger.clone(),
+                expected: ledger.clone(),
                 found: seal.ledger.clone(),
             });
         }
-        match (previous, seal.prev_seal) {
+        if preceding.iter().any(|s| s.period == seal.period) {
+            return Err(SealChainError::DuplicatePeriod { period: period() });
+        }
+        match (preceding.last(), seal.prev_seal) {
             (None, None) => Ok(()),
             (Some(prev), Some(reference)) => {
                 if prev.seal_hash != reference {
@@ -578,18 +628,25 @@ impl SealChain {
     }
 
     /// Appends a seal, checking that it chains to the current head.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`SealChainError`] the seal violates, having appended nothing.
     pub fn push(&mut self, seal: Seal) -> Result<(), SealChainError> {
-        Self::check_link(self.seals.last(), &seal)?;
+        Self::check_link(&self.ledger, &self.seals, &seal)?;
         self.seals.push(seal);
         Ok(())
     }
 
     /// Verifies every seal and every link.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first [`SealChainError`] that does not hold.
     pub fn verify(&self) -> Result<(), SealChainError> {
-        let mut previous: Option<&Seal> = None;
-        for seal in &self.seals {
-            Self::check_link(previous, seal)?;
-            previous = Some(seal);
+        for (position, seal) in self.seals.iter().enumerate() {
+            let preceding = self.seals.get(..position).unwrap_or_default();
+            Self::check_link(&self.ledger, preceding, seal)?;
         }
         Ok(())
     }
@@ -771,7 +828,7 @@ mod tests {
 
     #[test]
     fn seals_chain_and_verify() {
-        let mut chain = SealChain::new();
+        let mut chain = SealChain::new(lid());
         let first = Seal::build(
             lid(),
             pid("2026-01"),
@@ -803,8 +860,95 @@ mod tests {
     }
 
     #[test]
+    fn a_chain_refuses_a_foreign_seal_even_as_its_first() {
+        // The ledger is in the seal preimage precisely so a seal says whose
+        // books it attests to. A chain that only compared a seal against its
+        // predecessor would not start enforcing that until the second period —
+        // so the very first seal of a foreign ledger would be accepted.
+        let mut chain = SealChain::new(lid());
+        let foreign = Seal::build(
+            LedgerId::new("someone-else").expect("valid"),
+            pid("2026-01"),
+            PeriodCoverage::EMPTY,
+            head(1, 1),
+            &tb(&[]),
+            accounts_root(),
+            None,
+        );
+        assert!(matches!(
+            chain.push(foreign),
+            Err(SealChainError::ForeignLedger { .. })
+        ));
+        assert!(chain.is_empty(), "a refused seal appends nothing");
+        assert_eq!(chain.ledger(), &lid());
+    }
+
+    #[test]
+    fn one_period_may_not_be_sealed_twice_in_a_chain() {
+        // Two commitments to one period's closing balances, with nothing in the
+        // chain saying which the books mean.
+        let first = Seal::build(
+            lid(),
+            pid("2026-01"),
+            PeriodCoverage::spanning(0, 4, 5),
+            head(5, 1),
+            &tb(&[(0, 100, 0)]),
+            accounts_root(),
+            None,
+        );
+        let restated = Seal::build(
+            lid(),
+            pid("2026-01"),
+            PeriodCoverage::spanning(0, 4, 5),
+            head(5, 1),
+            &tb(&[(0, 999, 0)]),
+            accounts_root(),
+            Some(first.seal_hash),
+        );
+
+        let mut chain = SealChain::new(lid());
+        chain.push(first).expect("genesis");
+        assert!(matches!(
+            chain.push(restated),
+            Err(SealChainError::DuplicatePeriod { .. })
+        ));
+    }
+
+    #[test]
+    fn from_seals_rebuilds_and_re_checks_a_stored_chain() {
+        let first = Seal::build(
+            lid(),
+            pid("2026-01"),
+            PeriodCoverage::EMPTY,
+            head(1, 1),
+            &tb(&[]),
+            accounts_root(),
+            None,
+        );
+        let second = Seal::build(
+            lid(),
+            pid("2026-02"),
+            PeriodCoverage::EMPTY,
+            head(2, 2),
+            &tb(&[]),
+            accounts_root(),
+            Some(first.seal_hash),
+        );
+
+        let chain = SealChain::from_seals(lid(), [first.clone(), second.clone()]).expect("chains");
+        assert_eq!(chain.len(), 2);
+        assert!(chain.verify().is_ok());
+
+        // Out of order is not a chain, and neither is the wrong ledger.
+        assert!(SealChain::from_seals(lid(), [second, first.clone()]).is_err());
+        assert!(
+            SealChain::from_seals(LedgerId::new("elsewhere").expect("valid"), [first]).is_err()
+        );
+    }
+
+    #[test]
     fn a_seal_that_does_not_reference_the_head_is_refused() {
-        let mut chain = SealChain::new();
+        let mut chain = SealChain::new(lid());
         let first = Seal::build(
             lid(),
             pid("a"),
@@ -833,7 +977,7 @@ mod tests {
 
     #[test]
     fn only_the_first_seal_may_omit_a_predecessor() {
-        let mut chain = SealChain::new();
+        let mut chain = SealChain::new(lid());
         chain
             .push(Seal::build(
                 lid(),
@@ -863,7 +1007,7 @@ mod tests {
 
     #[test]
     fn a_first_seal_may_not_claim_a_predecessor() {
-        let mut chain = SealChain::new();
+        let mut chain = SealChain::new(lid());
         let bogus = Seal::build(
             lid(),
             pid("a"),
@@ -881,7 +1025,7 @@ mod tests {
 
     #[test]
     fn the_tree_may_not_shrink_between_seals() {
-        let mut chain = SealChain::new();
+        let mut chain = SealChain::new(lid());
         let first = Seal::build(
             lid(),
             pid("a"),
@@ -910,7 +1054,7 @@ mod tests {
 
     #[test]
     fn tampering_with_a_sealed_period_is_detected_by_the_chain() {
-        let mut chain = SealChain::new();
+        let mut chain = SealChain::new(lid());
         let first = Seal::build(
             lid(),
             pid("a"),

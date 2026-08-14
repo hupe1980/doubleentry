@@ -1,7 +1,7 @@
 +++
 title = "Corrections"
 description = "Reversals as the only correction mechanism, the rules the engine enforces on them, and how a sealed period is corrected."
-weight = 7
+weight = 8
 +++
 
 ## Postings are immutable

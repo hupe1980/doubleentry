@@ -42,17 +42,27 @@ CREATE TABLE IF NOT EXISTS ledger_meta (
 
 -- ── accounts ────────────────────────────────────────────────────────────────
 
+-- `balance_limit` is a rule about what may be booked next, like the open window:
+-- 'no_credit' forbids the net going credit (an asset that cannot be overdrawn),
+-- 'no_debit' forbids it going debit (a liability that cannot be drawn beyond
+-- what was funded). The backend enforces it inside the append, because the check
+-- is against the balance the entry would leave behind.
+
 CREATE TABLE IF NOT EXISTS accounts (
     account_index   INTEGER NOT NULL,
     path            TEXT    NOT NULL,
     kind            TEXT,
     opened_on       TEXT    NOT NULL,
     closed_on       TEXT,
+    balance_limit   TEXT    NOT NULL DEFAULT 'unlimited',
 
     CONSTRAINT accounts_window CHECK (closed_on IS NULL OR closed_on >= opened_on),
     CONSTRAINT accounts_kind CHECK (
         kind IS NULL
         OR kind IN ('asset', 'liability', 'equity', 'income', 'expense')
+    ),
+    CONSTRAINT accounts_balance_limit CHECK (
+        balance_limit IN ('unlimited', 'no_credit', 'no_debit')
     ),
     PRIMARY KEY (account_index),
     UNIQUE (path)
@@ -314,7 +324,6 @@ CREATE TABLE IF NOT EXISTS checkpoints (
     currency        TEXT    NOT NULL,
     layer           TEXT    NOT NULL,
 
-    through_index   INTEGER,
     debits_minor    INTEGER NOT NULL,
     credits_minor   INTEGER NOT NULL,
 

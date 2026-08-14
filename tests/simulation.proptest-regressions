@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 2798b54650dbbde41ab736ba643ba586d10ed87e7eb808d2bf5269da98ee743c # shrinks to ops = [Append { amount: 1 }, Append { amount: 1 }, Append { amount: 1 }, Append { amount: 1 }, Reverse { which: 3 }, Replay { which: 4 }, Append { amount: 1 }, Append { amount: 1 }, Append { amount: 4438 }, Append { amount: 803973 }, Append { amount: 223653 }, Replay { which: 16 }]
+cc 2533eb85240355dbd3129eada84719294b7028ba264f7ec7aeddd34c31f146a8 # shrinks to ops = [MoveLimited { amount: 1, into: false }, MoveLimited { amount: 1, into: false }, SetLimit { on: true }, Append { amount: 1 }, Append { amount: 1 }, Reverse { which: 20 }]

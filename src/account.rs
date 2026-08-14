@@ -13,11 +13,19 @@
 //!   double-count, and no reporting layer can repair it afterwards.
 //! - **Postings fall inside the account's open window.** An account has an
 //!   opening date and an optional closing date.
+//!
+//! A third is offered rather than imposed. A [`BalanceLimit`] forbids an
+//! account's net from crossing zero in one direction — a cash box that cannot be
+//! overdrawn, a wallet that cannot be drawn beyond what was funded. It is off by
+//! default, because most accounts legitimately sit on either side; where it is
+//! set it is checked when an entry is recorded, against the balance that entry
+//! would leave behind.
 
 use std::collections::BTreeMap;
 
 use time::Date;
 
+use crate::balance::Balance;
 use crate::canonical::{Canonical, CanonicalWriter};
 use crate::hash::{Hash, tag, tagged};
 use crate::merkle::{InclusionProof, MerkleLog};
@@ -298,6 +306,79 @@ impl AccountKind {
     }
 }
 
+/// Which side an account's net balance is allowed to fall on.
+///
+/// Unconstrained by default. Set it where the books would be wrong rather than
+/// merely surprising if the balance crossed zero — a cash account that cannot be
+/// overdrawn, a customer prepayment that cannot go into debit, a control account
+/// that must never carry the wrong sign.
+///
+/// The limit is checked when an entry is recorded, against the balance the entry
+/// would leave behind, **per currency and per layer independently**. It is a
+/// rule about what may be written next, exactly like an account's open window:
+/// it never invalidates what is already recorded, and an entry that breaches it
+/// is refused whole rather than partly applied.
+///
+/// Gross totals are irrelevant to it — only the net crosses zero — so an account
+/// with heavy offsetting turnover is unaffected as long as the net stays on the
+/// permitted side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum BalanceLimit {
+    /// The balance may fall on either side. The default.
+    #[default]
+    Unlimited,
+    /// Credits may never exceed debits: the net stays on the debit side or zero.
+    ///
+    /// The rule for an asset that cannot go negative — a cash box, a bank
+    /// account without an overdraft facility, an inventory quantity.
+    NoCreditBalance,
+    /// Debits may never exceed credits: the net stays on the credit side or zero.
+    ///
+    /// The rule for a liability that cannot be drawn beyond what was funded — a
+    /// customer wallet, a prepayment, a reserve.
+    NoDebitBalance,
+}
+
+impl BalanceLimit {
+    /// True when `balance` satisfies this limit.
+    ///
+    /// An overflow computing the net counts as a breach: an account whose totals
+    /// cannot be netted is not one this limit can vouch for.
+    #[must_use]
+    pub fn permits<const P: u8>(self, balance: &Balance<P>) -> bool {
+        match self {
+            Self::Unlimited => true,
+            Self::NoCreditBalance => balance.debits >= balance.credits,
+            Self::NoDebitBalance => balance.credits >= balance.debits,
+        }
+    }
+
+    /// True for [`BalanceLimit::Unlimited`].
+    #[must_use]
+    pub const fn is_unlimited(self) -> bool {
+        matches!(self, Self::Unlimited)
+    }
+
+    const fn discriminant(self) -> u8 {
+        match self {
+            Self::Unlimited => 0,
+            Self::NoCreditBalance => 1,
+            Self::NoDebitBalance => 2,
+        }
+    }
+}
+
+impl std::fmt::Display for BalanceLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Unlimited => "unlimited",
+            Self::NoCreditBalance => "no credit balance",
+            Self::NoDebitBalance => "no debit balance",
+        })
+    }
+}
+
 /// A handle to a registered account.
 ///
 /// Handles are dense and assigned in registration order, which makes them cheap
@@ -343,10 +424,13 @@ pub struct Account {
     pub opened_on: Date,
     /// Last date on which the account may be posted to, if it has closed.
     pub closed_on: Option<Date>,
+    /// Which side the account's net balance may fall on.
+    pub limit: BalanceLimit,
 }
 
 impl Account {
-    /// Creates an account open from `opened_on` with no closing date.
+    /// Creates an account open from `opened_on`, with no closing date and no
+    /// balance limit.
     #[must_use]
     pub fn new(path: AccountPath, opened_on: Date) -> Self {
         Self {
@@ -354,6 +438,7 @@ impl Account {
             kind: None,
             opened_on,
             closed_on: None,
+            limit: BalanceLimit::Unlimited,
         }
     }
 
@@ -368,6 +453,13 @@ impl Account {
     #[must_use]
     pub fn closing_on(mut self, date: Date) -> Self {
         self.closed_on = Some(date);
+        self
+    }
+
+    /// Constrains which side the account's net balance may fall on.
+    #[must_use]
+    pub fn limited_to(mut self, limit: BalanceLimit) -> Self {
+        self.limit = limit;
         self
     }
 
@@ -386,6 +478,10 @@ impl Canonical for Account {
         });
         encode_date(w, self.opened_on);
         w.option(self.closed_on.as_ref(), |w, d| encode_date(w, *d));
+        // Encoded unconditionally rather than as an option: the limit is part of
+        // what the account *is*, so a registry that quietly relaxed one must
+        // produce a different binding commitment.
+        w.u8(self.limit.discriminant());
     }
 }
 
@@ -640,6 +736,34 @@ impl AccountRegistry {
         Ok(())
     }
 
+    /// Sets which side an account's net balance may fall on.
+    ///
+    /// Master data, like closing: it governs what may be booked next and never
+    /// what was booked already. Tightening a limit on an account that already
+    /// breaches it is therefore permitted, and nothing recorded is invalidated.
+    ///
+    /// What it does mean is that the account is then frozen against any further
+    /// movement the wrong way, *including a partial repair*: the rule is that
+    /// the balance an accepted entry leaves behind satisfies the limit, and a
+    /// half-repaired balance does not. One entry that brings it back over the
+    /// line is accepted; two that each get halfway are not. Lift the limit if
+    /// that is what you need, so the exception is a deliberate act on the
+    /// record rather than a rule that quietly bends.
+    pub fn set_limit(&mut self, id: AccountId, limit: BalanceLimit) -> Result<(), AccountError> {
+        let Some(account) = self.accounts.get_mut(id.index() as usize) else {
+            return Err(AccountError::UnknownAccount { id });
+        };
+        account.limit = limit;
+        Ok(())
+    }
+
+    /// The limit on an account, or [`BalanceLimit::Unlimited`] if it is not
+    /// registered.
+    #[must_use]
+    pub fn limit_of(&self, id: AccountId) -> BalanceLimit {
+        self.get(id).map_or(BalanceLimit::Unlimited, |a| a.limit)
+    }
+
     /// Every account with its handle, in handle order.
     ///
     /// The index cast cannot saturate: [`AccountRegistry::register`] refuses to
@@ -658,28 +782,48 @@ impl AccountRegistry {
 
     /// Restores one stored binding, at the handle it was issued.
     ///
-    /// For a backend rehydrating a registry one record at a time. Unlike
+    /// For a backend rehydrating a registry one record at a time, and for
+    /// pushing a master-data change back to one. Unlike
     /// [`AccountRegistry::register`], which issues the next free handle, this
     /// insists the record land where it says it belongs — a binding restored at
     /// a different position would repoint every posting row that names it.
     ///
-    /// Restoring a record that is already present, unchanged, is a no-op, so a
-    /// backend may replay its whole account table on start-up.
+    /// At a handle already held, the **path is immutable** and everything else
+    /// is master data: the classification, the open window and the balance limit
+    /// are taken from the record. That is what makes closing an account or
+    /// tightening a limit durable, and it is safe for the same reason those are
+    /// mutable in the first place — they govern what may be booked next, never
+    /// what was booked already. Restoring an unchanged record is therefore a
+    /// no-op, so a backend may replay its whole account table on start-up.
     ///
     /// # Errors
     ///
-    /// Returns [`AccountError::NotDense`] when the handle is not the next one,
-    /// and [`AccountError::AlreadyRegistered`] when it is already held by a
-    /// different account.
+    /// Returns [`AccountError::NotDense`] when the handle is neither held nor
+    /// the next one, and [`AccountError::AlreadyRegistered`] when the handle is
+    /// held by a *different path* — which would repoint history.
     pub fn restore(&mut self, record: AccountRecord) -> Result<(), AccountError> {
         let next = u32::try_from(self.accounts.len()).unwrap_or(u32::MAX);
         if let Some(existing) = self.get(record.id) {
-            if *existing == record.account {
-                return Ok(());
+            if existing.path != record.account.path {
+                return Err(AccountError::AlreadyRegistered {
+                    path: existing.path.clone(),
+                });
             }
-            return Err(AccountError::AlreadyRegistered {
-                path: existing.path.clone(),
-            });
+            if let Some(closed) = record.account.closed_on
+                && closed < record.account.opened_on
+            {
+                return Err(AccountError::ClosedBeforeOpened {
+                    path: record.account.path,
+                    opened: record.account.opened_on,
+                    closed,
+                });
+            }
+            // The path is unchanged, so the index, the child counts and every
+            // handle stay exactly as they were; only the mutable fields move.
+            if let Some(slot) = self.accounts.get_mut(record.id.index() as usize) {
+                *slot = record.account;
+            }
+            return Ok(());
         }
         if record.id.index() != next {
             return Err(AccountError::NotDense {
@@ -1011,6 +1155,117 @@ mod tests {
         reopened.record.account.closed_on = None;
         reopened.record.account.opened_on = date!(2020 - 01 - 01);
         assert!(!reopened.verify(&root));
+    }
+
+    #[test]
+    fn a_limit_constrains_the_net_and_ignores_the_gross() {
+        use crate::money::Amount;
+        use crate::posting::Direction;
+
+        let mut heavy = Balance::<2>::ZERO;
+        heavy
+            .add(Direction::Debit, Amount::<2>::from_minor(1_000))
+            .expect("ok");
+        heavy
+            .add(Direction::Credit, Amount::<2>::from_minor(1_000))
+            .expect("ok");
+
+        // Turnover in both directions, net zero: every limit tolerates it.
+        for limit in [
+            BalanceLimit::Unlimited,
+            BalanceLimit::NoCreditBalance,
+            BalanceLimit::NoDebitBalance,
+        ] {
+            assert!(limit.permits(&heavy), "{limit} should permit a zero net");
+        }
+
+        let mut overdrawn = Balance::<2>::ZERO;
+        overdrawn
+            .add(Direction::Credit, Amount::<2>::from_minor(1))
+            .expect("ok");
+        assert!(BalanceLimit::Unlimited.permits(&overdrawn));
+        assert!(!BalanceLimit::NoCreditBalance.permits(&overdrawn));
+        assert!(BalanceLimit::NoDebitBalance.permits(&overdrawn));
+    }
+
+    #[test]
+    fn a_limit_is_part_of_what_the_account_is() {
+        // The limit is inside the binding commitment, so relaxing one after the
+        // fact cannot pass unnoticed by a seal that named the account.
+        let mut r = reg();
+        let id = r
+            .register_path("Assets:Cash", date!(2026 - 01 - 01))
+            .expect("registers");
+        let before = r.commitment();
+        r.set_limit(id, BalanceLimit::NoCreditBalance)
+            .expect("registered");
+        assert_eq!(r.limit_of(id), BalanceLimit::NoCreditBalance);
+        assert_ne!(r.commitment(), before);
+
+        assert!(matches!(
+            r.set_limit(AccountId::from_index(9), BalanceLimit::Unlimited),
+            Err(AccountError::UnknownAccount { .. })
+        ));
+        assert_eq!(
+            r.limit_of(AccountId::from_index(9)),
+            BalanceLimit::Unlimited
+        );
+    }
+
+    #[test]
+    fn restoring_a_binding_updates_its_master_data_but_never_its_path() {
+        // The write direction of a restart. A store that could only ever insert
+        // could not close an account or tighten a limit — the registry's own
+        // mutators would have nowhere to go the moment a ledger became durable.
+        let mut r = reg();
+        let id = r
+            .register_path("Assets:Cash", date!(2026 - 01 - 01))
+            .expect("registers");
+
+        let mut record = AccountRecord {
+            id,
+            account: Account::new(
+                AccountPath::parse("Assets:Cash").expect("valid"),
+                date!(2026 - 01 - 01),
+            ),
+        };
+        // Restoring it unchanged is a no-op, so a backend may replay its table.
+        r.restore(record.clone()).expect("unchanged");
+        assert_eq!(r.len(), 1);
+
+        record.account = record
+            .account
+            .clone()
+            .with_kind(AccountKind::Asset)
+            .closing_on(date!(2026 - 12 - 31))
+            .limited_to(BalanceLimit::NoCreditBalance);
+        r.restore(record.clone()).expect("master data moves");
+        let stored = r.get(id).expect("registered");
+        assert_eq!(stored.kind, Some(AccountKind::Asset));
+        assert_eq!(stored.closed_on, Some(date!(2026 - 12 - 31)));
+        assert_eq!(stored.limit, BalanceLimit::NoCreditBalance);
+        assert_eq!(r.len(), 1, "an update must not issue a second handle");
+
+        // The path is not master data: rebinding a handle would repoint every
+        // posting row and every sealed balance that names it.
+        let mut rebound = record.clone();
+        rebound.account.path = AccountPath::parse("Assets:Slush").expect("valid");
+        assert!(matches!(
+            r.restore(rebound),
+            Err(AccountError::AlreadyRegistered { .. })
+        ));
+        assert_eq!(
+            r.get(id).expect("registered").path.to_string(),
+            "Assets:Cash"
+        );
+
+        // An update is still refused if it would invert the open window.
+        let mut inverted = record;
+        inverted.account.closed_on = Some(date!(2020 - 01 - 01));
+        assert!(matches!(
+            r.restore(inverted),
+            Err(AccountError::ClosedBeforeOpened { .. })
+        ));
     }
 
     #[test]

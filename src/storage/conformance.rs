@@ -27,7 +27,9 @@ use std::task::{Context, Poll, Wake, Waker};
 
 use time::macros::date;
 
-use crate::account::{Account, AccountKind, AccountPath, AccountRegistry};
+use crate::account::{
+    Account, AccountKind, AccountPath, AccountRecord, AccountRegistry, BalanceLimit,
+};
 use crate::balance::BalanceKey;
 use crate::clearing::{Clearing, PostingRef};
 use crate::entry::{Draft, Entry, EntryId, IdempotencyKey, LedgerPolicy, SealContext};
@@ -445,6 +447,7 @@ pub async fn check_all<const P: u8, S: LedgerStore<P>>(store: &S) -> Report {
     checks.push(check_clearing_rules(store).await);
     checks.push(check_open_items_track_residuals(store).await);
     checks.push(check_account_bindings_survive_a_restart(store).await);
+    checks.push(check_balance_limits_are_enforced(store).await);
     checks.push(check_kind_survives_a_round_trip(store).await);
     checks.push(check_dimensions_survive_a_round_trip(store).await);
     checks.push(check_balances_agree_across_readers(store).await);
@@ -647,8 +650,7 @@ pub async fn check_checkpoints_round_trip<const P: u8, S: LedgerStore<P>>(
         (Ok(head), Ok(balance)) => (head, balance),
         (Err(e), _) | (_, Err(e)) => return CheckResult::fail(NAME, format!("read failed: {e}")),
     };
-    let through = head.size.checked_sub(1);
-    let checkpoint = crate::checkpoint::Checkpoint::new(key, through, balance, head);
+    let checkpoint = crate::checkpoint::Checkpoint::new(key, balance, head);
 
     if let Err(e) = store.save_checkpoint(&checkpoint).await {
         return CheckResult::fail(NAME, format!("save_checkpoint failed: {e}"));
@@ -804,15 +806,14 @@ pub async fn check_period_lifecycle_and_seals<const P: u8, S: LedgerStore<P>>(
             if !stored.iter().any(|s| s.seal_hash == seal.seal_hash) {
                 return CheckResult::fail(NAME, "the seal was not read back");
             }
-            let mut chain = crate::seal::SealChain::new();
-            for s in stored {
-                if let Err(e) = chain.push(s) {
-                    return CheckResult::fail(NAME, format!("seals do not chain in order: {e}"));
-                }
-            }
-            match chain.verify() {
-                Ok(()) => CheckResult::pass(NAME),
-                Err(e) => CheckResult::fail(NAME, format!("the seal chain does not verify: {e}")),
+            match crate::seal::SealChain::from_seals(store.ledger().clone(), stored) {
+                Ok(chain) => match chain.verify() {
+                    Ok(()) => CheckResult::pass(NAME),
+                    Err(e) => {
+                        CheckResult::fail(NAME, format!("the seal chain does not verify: {e}"))
+                    }
+                },
+                Err(e) => CheckResult::fail(NAME, format!("seals do not chain in order: {e}")),
             }
         }
         Err(e) => CheckResult::fail(NAME, format!("seals failed: {e}")),
@@ -968,6 +969,148 @@ pub async fn check_account_bindings_survive_a_restart<const P: u8, S: LedgerStor
     };
     if rebuilt.commitment() != registry.commitment() {
         return CheckResult::fail(NAME, "rebuilt registry does not match the original");
+    }
+
+    CheckResult::pass(NAME)
+}
+
+/// A balance limit is enforced by the store, and master data can be updated.
+///
+/// Two guarantees that only make sense together. A limit is worth nothing if a
+/// store cannot record a change to it, and a store that could only ever *insert*
+/// an account could not close one either — [`AccountRegistry`] treats the
+/// classification, the open window and the limit as mutable master data, so a
+/// backend that ignores a re-registration silently diverges from the engine the
+/// first time an account is closed.
+///
+/// The limit itself has to be enforced in the write path rather than checked by
+/// the caller beforehand: a read-then-write races, and two concurrent appends
+/// that each stay within the limit can together breach it.
+pub async fn check_balance_limits_are_enforced<const P: u8, S: LedgerStore<P>>(
+    store: &S,
+) -> CheckResult {
+    const NAME: &str = "balance limits are enforced";
+    let f = Fixture::new();
+
+    // A fresh account, so the check owns its balance outright.
+    let existing = match store.accounts().await {
+        Ok(records) => records,
+        Err(e) => return CheckResult::fail(NAME, format!("accounts failed: {e}")),
+    };
+    let mut registry = match AccountRegistry::from_records(existing) {
+        Ok(r) => r,
+        Err(e) => return CheckResult::fail(NAME, format!("stored bindings are unusable: {e}")),
+    };
+    let path = match AccountPath::parse("Conformance:Limited") {
+        Ok(p) => p,
+        Err(e) => return CheckResult::fail(NAME, format!("bad fixture path: {e}")),
+    };
+    let limited = match registry.register(Account::new(path, date!(2000 - 01 - 01))) {
+        Ok(id) => id,
+        Err(e) => return CheckResult::fail(NAME, format!("fixture registration failed: {e}")),
+    };
+    for record in registry.records() {
+        if let Err(e) = store.register_account(&record).await {
+            return CheckResult::fail(NAME, format!("register_account failed: {e}"));
+        }
+    }
+
+    // Master data moves: the account is registered unconstrained, then limited.
+    if let Err(e) = registry.set_limit(limited, BalanceLimit::NoCreditBalance) {
+        return CheckResult::fail(NAME, format!("set_limit failed: {e}"));
+    }
+    let Some(record) = registry.records().into_iter().find(|r| r.id == limited) else {
+        return CheckResult::fail(NAME, "the limited account vanished from the registry");
+    };
+    if let Err(e) = store.register_account(&record).await {
+        return CheckResult::fail(NAME, format!("updating master data failed: {e}"));
+    }
+    match store.accounts().await {
+        Ok(stored) => match stored.iter().find(|r| r.id == limited) {
+            Some(found) if found.account.limit == BalanceLimit::NoCreditBalance => {}
+            Some(found) => {
+                return CheckResult::fail(
+                    NAME,
+                    format!(
+                        "the limit came back as {}, not no credit",
+                        found.account.limit
+                    ),
+                );
+            }
+            None => return CheckResult::fail(NAME, "the limited account was not stored"),
+        },
+        Err(e) => return CheckResult::fail(NAME, format!("accounts failed: {e}")),
+    }
+
+    let ctx = SealContext {
+        accounts: &registry,
+        calendar: &f.calendar,
+        policy: &f.policy,
+    };
+    let movement = |key: &[u8], minor: i64, into: bool| {
+        let draft = Entry::<Draft, P>::new(
+            EntryId::generate(),
+            IdempotencyKey::new(key.to_vec()).ok()?,
+            date!(2026 - 03 - 21),
+        );
+        let amount = Amount::<P>::from_minor(minor);
+        let draft = if into {
+            draft
+                .debit(limited, amount, Currency::EUR)
+                .credit(f.right, amount, Currency::EUR)
+        } else {
+            draft
+                .credit(limited, amount, Currency::EUR)
+                .debit(f.right, amount, Currency::EUR)
+        };
+        draft.seal(&ctx).ok()
+    };
+
+    let Some(funding) = movement(b"limit-funding", 1000, true) else {
+        return CheckResult::fail(NAME, "fixture entry failed to seal");
+    };
+    if let Err(e) = store.append(&EntryBatch::single(funding)).await {
+        return CheckResult::fail(NAME, format!("funding was refused: {e}"));
+    }
+
+    // Exactly to zero is on the permitted side.
+    let Some(drain) = movement(b"limit-drain", 1000, false) else {
+        return CheckResult::fail(NAME, "fixture entry failed to seal");
+    };
+    if let Err(e) = store.append(&EntryBatch::single(drain)).await {
+        return CheckResult::fail(NAME, format!("draining to exactly zero was refused: {e}"));
+    }
+
+    // One minor unit past it is not.
+    let Some(overdraw) = movement(b"limit-overdraw", 1, false) else {
+        return CheckResult::fail(NAME, "fixture entry failed to seal");
+    };
+    let before = store.len().await;
+    if store.append(&EntryBatch::single(overdraw)).await.is_ok() {
+        return CheckResult::fail(NAME, "an entry breaching a balance limit was accepted");
+    }
+    match (before, store.len().await) {
+        (Ok(before), Ok(after)) if before == after => {}
+        (Ok(before), Ok(after)) => {
+            return CheckResult::fail(
+                NAME,
+                format!("a refused entry still appended: {before} -> {after}"),
+            );
+        }
+        (Err(e), _) | (_, Err(e)) => return CheckResult::fail(NAME, format!("len failed: {e}")),
+    }
+
+    // Rebinding a handle to a different path is refused outright, because every
+    // posting row that names it would silently repoint.
+    let rebound = AccountRecord {
+        id: limited,
+        account: match AccountPath::parse("Conformance:Elsewhere") {
+            Ok(p) => Account::new(p, date!(2000 - 01 - 01)),
+            Err(e) => return CheckResult::fail(NAME, format!("bad fixture path: {e}")),
+        },
+    };
+    if store.register_account(&rebound).await.is_ok() {
+        return CheckResult::fail(NAME, "a handle was rebound to a different path");
     }
 
     CheckResult::pass(NAME)
@@ -1646,7 +1789,7 @@ mod tests {
     fn the_memory_store_conforms() {
         let report = block_on(check_all(&MemoryStore::<2>::new(test_ledger())));
         report.assert_passed();
-        assert_eq!(report.checks.len(), 19);
+        assert_eq!(report.checks.len(), 20);
     }
 
     #[test]

@@ -34,9 +34,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use time::Date;
 
-use crate::account::{AccountRecord, AccountRegistry};
+use crate::account::{AccountId, AccountRecord, AccountRegistry, BalanceLimit};
 use crate::balance::{Balance, BalanceKey, TrialBalance};
-use crate::checkpoint::{AssertionOutcome, BalanceAssertion, Checkpoint, CheckpointError};
+use crate::checkpoint::{
+    AssertAt, AssertionOutcome, BalanceAssertion, Checkpoint, CheckpointError,
+};
 use crate::clearing::{
     Clearing, ClearingError, ClearingId, ClearingRegister, OpenItem, PostingLookup, PostingRef,
 };
@@ -187,6 +189,29 @@ pub enum JournalError {
         id: EntryId,
     },
 
+    /// The entry would leave an account on a side its limit forbids.
+    ///
+    /// The net is reported in minor units at `scale`, so the variant stays
+    /// independent of the ledger's compile-time precision.
+    #[error(
+        "{account} in {currency} ({layer}) would net to {net_minor} at scale \
+         {scale}, which its {limit} limit forbids"
+    )]
+    LimitBreached {
+        /// The account whose limit would be breached.
+        account: AccountId,
+        /// The currency the limit was breached in.
+        currency: Currency,
+        /// The layer the limit was breached in.
+        layer: Layer,
+        /// The limit in force.
+        limit: BalanceLimit,
+        /// The signed net the entry would leave, debit positive, in minor units.
+        net_minor: i64,
+        /// Decimal places the minor units are expressed in.
+        scale: u8,
+    },
+
     /// Accumulating balances overflowed.
     #[error(transparent)]
     Money(#[from] MoneyError),
@@ -265,6 +290,7 @@ impl<const P: u8> Journal<P> {
     #[must_use]
     pub fn new(ledger: LedgerId) -> Self {
         Self {
+            seals: SealChain::new(ledger.clone()),
             ledger,
             accounts: AccountRegistry::new(),
             calendar: PeriodCalendar::new(),
@@ -276,7 +302,6 @@ impl<const P: u8> Journal<P> {
             reversed_by: BTreeMap::new(),
             balances: TrialBalance::new(),
             sites: BTreeMap::new(),
-            seals: SealChain::new(),
             clearings: ClearingRegister::new(),
         }
     }
@@ -472,6 +497,7 @@ impl<const P: u8> Journal<P> {
         for posting in entry.postings() {
             balances.apply(posting)?;
         }
+        self.check_limits(&entry, &balances)?;
 
         let index = LogIndex(self.log.append(content_hash));
         if let Some(original) = entry.reverses() {
@@ -565,7 +591,7 @@ impl<const P: u8> Journal<P> {
         for key in touched {
             let mut balance = Balance::ZERO;
             let mut overflowed = false;
-            for posting in self.postings_on_through(&key, None) {
+            for posting in self.postings_on_prefix(&key, None) {
                 if balance.add(posting.direction, posting.amount).is_err() {
                     overflowed = true;
                     break;
@@ -584,6 +610,49 @@ impl<const P: u8> Journal<P> {
                 }
             }
         }
+    }
+
+    /// Enforces every touched account's balance limit against the state the
+    /// entry would leave behind.
+    ///
+    /// Checked on the *resulting* balance rather than posting by posting: an
+    /// entry that dips an account below its limit and back within the same
+    /// booking is one movement, and refusing it would make the answer depend on
+    /// the order the caller happened to list its postings in.
+    ///
+    /// Deliberately here rather than in [`Entry::seal`]. Sealing asks whether an
+    /// entry is well formed against master data, which is a question about the
+    /// entry alone; a limit is a question about the *books*, and the same entry
+    /// is legal or not depending on what has already been recorded.
+    fn check_limits(
+        &self,
+        entry: &Entry<Balanced, P>,
+        after: &TrialBalance<P>,
+    ) -> Result<(), JournalError> {
+        // One check per distinct key the entry touches, not per posting.
+        let mut checked: BTreeSet<BalanceKey> = BTreeSet::new();
+        for posting in entry.postings() {
+            let key = key_of(posting);
+            if !checked.insert(key) {
+                continue;
+            }
+            let limit = self.accounts.limit_of(key.account);
+            if limit.is_unlimited() {
+                continue;
+            }
+            let balance = after.get_or_zero(&key);
+            if !limit.permits(&balance) {
+                return Err(JournalError::LimitBreached {
+                    account: key.account,
+                    currency: key.currency,
+                    layer: key.layer,
+                    limit,
+                    net_minor: balance.signed_net().map_or(0, |n| n.to_minor()),
+                    scale: P,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Enforces the correction rules against what is already recorded.
@@ -714,26 +783,28 @@ impl<const P: u8> Journal<P> {
 
     // ── balances ────────────────────────────────────────────────────────────
 
-    /// The trial balance, optionally as of a log position.
+    /// The trial balance, optionally over a prefix of the log.
     ///
-    /// Passing `through` restricts the fold to a prefix of the log, which is how
-    /// a historical view is reconstructed: not "the balance on a date" but "the
-    /// balance as the journal stood after `through` entries".
+    /// `size` is a **count of entries**, not an index: `Some(0)` is the empty
+    /// ledger, `Some(2)` is the journal as it stood after two entries, and
+    /// `None` is everything recorded so far. It is the same number a
+    /// [`TreeHead::size`] carries, so a balance and the root it belongs with are
+    /// always named the same way.
     ///
     /// # Errors
     ///
     /// Returns [`MoneyError::Overflow`] if accumulating overflows, which cannot
     /// happen for a prefix of a journal that accepted the entries in the first
     /// place.
-    pub fn trial_balance(&self, through: Option<LogIndex>) -> Result<TrialBalance<P>, MoneyError> {
-        let Some(limit) = through else {
+    pub fn trial_balance(&self, size: Option<u64>) -> Result<TrialBalance<P>, MoneyError> {
+        let Some(size) = size else {
             return Ok(self.balances.clone());
         };
-        if limit.get().saturating_add(1) >= self.entries.len() as u64 {
+        if size >= self.entries.len() as u64 {
             return Ok(self.balances.clone());
         }
         let mut tb = TrialBalance::new();
-        for entry in self.entries_through(limit) {
+        for entry in self.entries_prefix(size) {
             for posting in entry.postings() {
                 tb.apply(posting)?;
             }
@@ -741,7 +812,10 @@ impl<const P: u8> Journal<P> {
         Ok(tb)
     }
 
-    /// The balance of one account, currency, and layer.
+    /// The balance of one account, currency, and layer, optionally over a prefix
+    /// of the log.
+    ///
+    /// `size` counts entries, exactly as in [`Journal::trial_balance`].
     ///
     /// Reading the current balance is a lookup. Reading a historical one replays
     /// that key's postings, which is linear in how much has moved through the
@@ -750,17 +824,35 @@ impl<const P: u8> Journal<P> {
     /// # Errors
     ///
     /// Returns [`MoneyError::Overflow`] if accumulating overflows.
-    pub fn balance(
-        &self,
-        key: &BalanceKey,
-        through: Option<LogIndex>,
-    ) -> Result<Balance<P>, MoneyError> {
-        let Some(limit) = through else {
+    pub fn balance(&self, key: &BalanceKey, size: Option<u64>) -> Result<Balance<P>, MoneyError> {
+        let Some(size) = size else {
             return Ok(self.balances.get_or_zero(key));
         };
         let mut balance = Balance::ZERO;
-        for posting in self.postings_on_through(key, Some(limit)) {
+        for posting in self.postings_on_prefix(key, Some(size)) {
             balance.add(posting.direction, posting.amount)?;
+        }
+        Ok(balance)
+    }
+
+    /// The balance of one key over everything booked on or before `end`.
+    ///
+    /// Folds by **booking date**, so an entry recorded late still lands in the
+    /// period it economically belongs to. This is the form to reconcile against
+    /// an external statement, which is dated rather than positioned.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MoneyError::Overflow`] if accumulating overflows.
+    pub fn balance_on_date(&self, key: &BalanceKey, end: Date) -> Result<Balance<P>, MoneyError> {
+        let mut balance = Balance::ZERO;
+        for site in self.sites.get(key).into_iter().flatten() {
+            let Some((entry, posting)) = self.resolve(*site) else {
+                continue;
+            };
+            if entry.booking_date() <= end {
+                balance.add(posting.direction, posting.amount)?;
+            }
         }
         Ok(balance)
     }
@@ -882,21 +974,26 @@ impl<const P: u8> Journal<P> {
         Some((entry, posting))
     }
 
-    fn entries_through(&self, limit: LogIndex) -> impl Iterator<Item = &Entry<Balanced, P>> {
-        let count = usize::try_from(limit.get().saturating_add(1)).unwrap_or(usize::MAX);
-        self.entries.iter().take(count)
+    fn entries_prefix(&self, size: u64) -> impl Iterator<Item = &Entry<Balanced, P>> {
+        self.entries
+            .iter()
+            .take(usize::try_from(size).unwrap_or(usize::MAX))
     }
 
-    fn postings_on_through(
+    /// Postings on `key` within the first `size` entries, in log order.
+    ///
+    /// `sites` is maintained in log order, so the prefix is a `take_while`
+    /// rather than a scan.
+    fn postings_on_prefix(
         &self,
         key: &BalanceKey,
-        limit: Option<LogIndex>,
+        size: Option<u64>,
     ) -> impl Iterator<Item = &Posting<P>> {
         self.sites
             .get(key)
             .into_iter()
             .flatten()
-            .take_while(move |site| limit.is_none_or(|l| site.index <= l))
+            .take_while(move |site| size.is_none_or(|n| site.index.get() < n))
             .filter_map(|site| self.resolve(*site).map(|(_, posting)| posting))
     }
 
@@ -1040,46 +1137,44 @@ impl<const P: u8> Journal<P> {
 
     // ── checkpoints and assertions ──────────────────────────────────────────
 
-    /// Takes a checkpoint of one balance at the current log position.
+    /// Takes a checkpoint of one balance over the whole log so far.
+    ///
+    /// Taking one on an empty journal is meaningful and stays valid: it records
+    /// that the account had not moved after zero entries, which no later append
+    /// can falsify.
     ///
     /// # Errors
     ///
     /// Returns [`MoneyError::Overflow`] if reading the balance overflows.
     pub fn checkpoint(&self, key: &BalanceKey) -> Result<Checkpoint<P>, MoneyError> {
-        let through = self.entries.len().checked_sub(1).map(|i| i as u64);
-        Ok(Checkpoint::new(
-            *key,
-            through,
-            self.balance(key, through.map(LogIndex))?,
-            self.head(),
-        ))
+        Ok(Checkpoint::new(*key, self.balance(key, None)?, self.head()))
     }
 
     /// Re-derives a checkpoint from the journal and compares it.
     ///
     /// Checks the tree head as well as the balance: a checkpoint that matches
     /// numerically but was taken against a different history is stale, and
-    /// silently trusting it would carry a stale balance forward.
+    /// silently trusting it would carry a stale balance forward. The head is
+    /// also what names the prefix, so the balance is re-folded over exactly the
+    /// entries the checkpoint claims to cover — never over whatever the journal
+    /// happens to hold now.
     ///
     /// # Errors
     ///
     /// Returns [`CheckpointError`] naming which of the three checks failed.
     pub fn verify_checkpoint(&self, checkpoint: &Checkpoint<P>) -> Result<(), CheckpointError> {
-        if let Some(index) = checkpoint.through_index
-            && index >= self.len() as u64
-        {
-            return Err(CheckpointError::IndexOutOfRange { index });
+        let size = checkpoint.size();
+        if size > self.len() as u64 {
+            return Err(CheckpointError::SizeOutOfRange { size });
         }
-
-        let size = checkpoint.through_index.map_or(0, |i| i.saturating_add(1));
         let head = self
             .head_at(size)
-            .map_err(|_| CheckpointError::IndexOutOfRange { index: size })?;
+            .map_err(|_| CheckpointError::SizeOutOfRange { size })?;
         if head != checkpoint.tree_head {
             return Err(CheckpointError::HeadMismatch);
         }
 
-        let actual = self.balance(&checkpoint.key, checkpoint.through_index.map(LogIndex))?;
+        let actual = self.balance(&checkpoint.key, Some(size))?;
         if actual == checkpoint.balance {
             Ok(())
         } else {
@@ -1096,7 +1191,11 @@ impl<const P: u8> Journal<P> {
         &self,
         assertion: &BalanceAssertion<P>,
     ) -> Result<AssertionOutcome<P>, MoneyError> {
-        let actual = self.balance(&assertion.key, assertion.at.map(LogIndex))?;
+        let actual = match assertion.at {
+            AssertAt::Now => self.balance(&assertion.key, None)?,
+            AssertAt::Prefix { size } => self.balance(&assertion.key, Some(size))?,
+            AssertAt::OnDate { date } => self.balance_on_date(&assertion.key, date)?,
+        };
         assertion.check(&actual)
     }
 
@@ -1582,13 +1681,12 @@ mod tests {
         b.record(b"c", 300);
 
         let key = b.cash_key();
-        for (through, expected) in [(Some(0u64), 100i64), (Some(1), 300), (Some(2), 600)] {
+        // The prefix is a *count* of entries, so zero is the empty ledger.
+        for (size, expected) in [(0u64, 0i64), (1, 100), (2, 300), (3, 600)] {
             assert_eq!(
-                b.journal
-                    .balance(&key, through.map(LogIndex))
-                    .expect("ok")
-                    .debits,
-                Eur::from_minor(expected)
+                b.journal.balance(&key, Some(size)).expect("ok").debits,
+                Eur::from_minor(expected),
+                "balance over the first {size} entries"
             );
         }
         assert_eq!(
@@ -1596,9 +1694,16 @@ mod tests {
             Eur::from_minor(600)
         );
 
+        // A size past the end is the whole log rather than an error.
+        assert_eq!(
+            b.journal.balance(&key, Some(99)).expect("ok").debits,
+            Eur::from_minor(600)
+        );
+
         // And the whole trial balance agrees with the per-key answer.
-        let tb = b.journal.trial_balance(Some(LogIndex(1))).expect("ok");
+        let tb = b.journal.trial_balance(Some(2)).expect("ok");
         assert_eq!(tb.get_or_zero(&key).debits, Eur::from_minor(300));
+        assert!(b.journal.trial_balance(Some(0)).expect("ok").is_empty());
     }
 
     #[test]
@@ -1614,6 +1719,288 @@ mod tests {
     }
 
     // ── statements ──────────────────────────────────────────────────────────
+
+    // ── balance limits ──────────────────────────────────────────────────────
+
+    #[test]
+    fn an_account_can_be_forbidden_from_going_negative() {
+        let mut b = Books::new();
+        b.journal
+            .accounts_mut()
+            .set_limit(b.cash, BalanceLimit::NoCreditBalance)
+            .expect("registered");
+
+        // Funding it is fine.
+        b.record(b"funding", 1_000);
+
+        // Drawing more than it holds is not.
+        let overdraw = Entry::<Draft, 2>::new(
+            EntryId::generate(),
+            IdempotencyKey::new(b"overdraw".to_vec()).expect("valid"),
+            date!(2026 - 03 - 20),
+        )
+        .credit(b.cash, Eur::from_minor(1_001), Currency::EUR)
+        .debit(b.revenue, Eur::from_minor(1_001), Currency::EUR);
+
+        let err = b.journal.record(overdraw).expect_err("would overdraw");
+        assert!(matches!(
+            err,
+            JournalError::LimitBreached {
+                limit: BalanceLimit::NoCreditBalance,
+                net_minor: -1,
+                ..
+            }
+        ));
+
+        // Refused whole: nothing about the journal moved.
+        assert_eq!(b.journal.len(), 1);
+        assert_eq!(
+            b.journal.balance(&b.cash_key(), None).expect("ok").debits,
+            Eur::from_minor(1_000)
+        );
+        assert!(b.journal.verify_balances().expect("ok"));
+        assert!(b.journal.verify_log());
+    }
+
+    #[test]
+    fn a_limit_permits_the_entry_that_lands_exactly_on_zero() {
+        let mut b = Books::new();
+        b.journal
+            .accounts_mut()
+            .set_limit(b.cash, BalanceLimit::NoCreditBalance)
+            .expect("registered");
+        b.record(b"funding", 1_000);
+
+        let drain = Entry::<Draft, 2>::new(
+            EntryId::generate(),
+            IdempotencyKey::new(b"drain".to_vec()).expect("valid"),
+            date!(2026 - 03 - 20),
+        )
+        .credit(b.cash, Eur::from_minor(1_000), Currency::EUR)
+        .debit(b.revenue, Eur::from_minor(1_000), Currency::EUR);
+        b.journal.record(drain).expect("zero is on the right side");
+    }
+
+    #[test]
+    fn a_limit_is_judged_on_the_whole_entry_not_posting_by_posting() {
+        // An entry that dips the account below its limit and back within one
+        // booking is one movement. Judging it posting by posting would make the
+        // answer depend on the order the caller listed them in.
+        let mut b = Books::new();
+        b.journal
+            .accounts_mut()
+            .set_limit(b.cash, BalanceLimit::NoCreditBalance)
+            .expect("registered");
+
+        let round_trip = Entry::<Draft, 2>::new(
+            EntryId::generate(),
+            IdempotencyKey::new(b"round-trip".to_vec()).expect("valid"),
+            date!(2026 - 03 - 20),
+        )
+        .credit(b.cash, Eur::from_minor(500), Currency::EUR)
+        .debit(b.revenue, Eur::from_minor(500), Currency::EUR)
+        .debit(b.cash, Eur::from_minor(500), Currency::EUR)
+        .credit(b.revenue, Eur::from_minor(500), Currency::EUR);
+        b.journal.record(round_trip).expect("nets to zero");
+    }
+
+    #[test]
+    fn a_limit_binds_each_currency_and_layer_on_its_own() {
+        let mut b = Books::new();
+        b.journal
+            .accounts_mut()
+            .set_limit(b.cash, BalanceLimit::NoCreditBalance)
+            .expect("registered");
+        b.record(b"eur-funding", 1_000);
+
+        // A different currency is a different balance and starts at zero.
+        let usd = Entry::<Draft, 2>::new(
+            EntryId::generate(),
+            IdempotencyKey::new(b"usd".to_vec()).expect("valid"),
+            date!(2026 - 03 - 20),
+        )
+        .credit(b.cash, Eur::from_minor(1), Currency::USD)
+        .debit(b.revenue, Eur::from_minor(1), Currency::USD);
+        assert!(
+            matches!(
+                b.journal.record(usd),
+                Err(JournalError::LimitBreached {
+                    currency: Currency::USD,
+                    ..
+                })
+            ),
+            "the EUR funding must not cover a USD draw"
+        );
+
+        // As is a different layer.
+        let reserved = Entry::<Draft, 2>::new(
+            EntryId::generate(),
+            IdempotencyKey::new(b"reserved".to_vec()).expect("valid"),
+            date!(2026 - 03 - 20),
+        )
+        .post(Posting::credit(b.cash, Eur::from_minor(1), Currency::EUR).in_layer(Layer::Pending))
+        .post(
+            Posting::debit(b.revenue, Eur::from_minor(1), Currency::EUR).in_layer(Layer::Pending),
+        );
+        assert!(matches!(
+            b.journal.record(reserved),
+            Err(JournalError::LimitBreached {
+                layer: Layer::Pending,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_liability_can_be_forbidden_from_going_into_debit() {
+        let mut b = Books::new();
+        b.journal
+            .accounts_mut()
+            .set_limit(b.revenue, BalanceLimit::NoDebitBalance)
+            .expect("registered");
+        // The fixture credits revenue, so this stays within the limit.
+        b.record(b"sale", 1_000);
+
+        let clawback = Entry::<Draft, 2>::new(
+            EntryId::generate(),
+            IdempotencyKey::new(b"too-much".to_vec()).expect("valid"),
+            date!(2026 - 03 - 20),
+        )
+        .debit(b.revenue, Eur::from_minor(1_001), Currency::EUR)
+        .credit(b.cash, Eur::from_minor(1_001), Currency::EUR);
+        assert!(matches!(
+            b.journal.record(clawback),
+            Err(JournalError::LimitBreached {
+                limit: BalanceLimit::NoDebitBalance,
+                net_minor: 1,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn tightening_a_limit_does_not_invalidate_what_is_already_booked() {
+        // Master data governs the next booking, never the last one. An account
+        // already past a newly imposed limit keeps its balance and simply
+        // refuses to move further the wrong way.
+        let mut b = Books::new();
+        let overdrawn = Entry::<Draft, 2>::new(
+            EntryId::generate(),
+            IdempotencyKey::new(b"draw".to_vec()).expect("valid"),
+            date!(2026 - 03 - 15),
+        )
+        .credit(b.cash, Eur::from_minor(500), Currency::EUR)
+        .debit(b.revenue, Eur::from_minor(500), Currency::EUR);
+        b.journal.record(overdrawn).expect("records");
+
+        b.journal
+            .accounts_mut()
+            .set_limit(b.cash, BalanceLimit::NoCreditBalance)
+            .expect("registered");
+
+        // What is recorded stays recorded and stays readable.
+        assert_eq!(b.journal.len(), 1);
+        assert_eq!(
+            b.journal
+                .balance(&b.cash_key(), None)
+                .expect("ok")
+                .signed_net()
+                .expect("ok"),
+            Eur::from_minor(-500)
+        );
+
+        // Moving further the wrong way is refused …
+        let worse = Entry::<Draft, 2>::new(
+            EntryId::generate(),
+            IdempotencyKey::new(b"worse".to_vec()).expect("valid"),
+            date!(2026 - 03 - 16),
+        )
+        .credit(b.cash, Eur::from_minor(1), Currency::EUR)
+        .debit(b.revenue, Eur::from_minor(1), Currency::EUR);
+        assert!(matches!(
+            b.journal.record(worse),
+            Err(JournalError::LimitBreached { .. })
+        ));
+
+        // … while repairing it is not.
+        b.record(b"repair", 500);
+    }
+
+    #[test]
+    fn a_limit_can_refuse_a_reversal() {
+        // Worth pinning, because it is the one place a limit collides with the
+        // correction rules: reversing a funding entry withdraws money the
+        // account may since have committed. A limit constrains the *resulting
+        // balance*, so it cannot make an exception for a correction — and
+        // silently letting one through would be a limit that does not hold.
+        //
+        // The way out is the ordinary one: reverse whatever consumed the
+        // funding first, or lift the limit deliberately.
+        let mut b = Books::new();
+        let funding = b.sealed(b"funding", 1_000);
+        b.journal
+            .record_validated(funding.clone())
+            .expect("records");
+
+        let spend = Entry::<Draft, 2>::new(
+            EntryId::generate(),
+            IdempotencyKey::new(b"spend".to_vec()).expect("valid"),
+            date!(2026 - 03 - 16),
+        )
+        .credit(b.cash, Eur::from_minor(1_000), Currency::EUR)
+        .debit(b.revenue, Eur::from_minor(1_000), Currency::EUR);
+        b.journal.record(spend).expect("records");
+
+        b.journal
+            .accounts_mut()
+            .set_limit(b.cash, BalanceLimit::NoCreditBalance)
+            .expect("registered");
+
+        let undo = funding.reverse(
+            EntryId::generate(),
+            IdempotencyKey::new(b"undo".to_vec()).expect("valid"),
+            date!(2026 - 03 - 17),
+        );
+        assert!(matches!(
+            b.journal.record(undo),
+            Err(JournalError::LimitBreached { .. })
+        ));
+        assert_eq!(
+            b.journal.reversal_of(funding.id()),
+            None,
+            "a refused reversal must not mark the original as corrected"
+        );
+    }
+
+    #[test]
+    fn a_batch_that_breaches_a_limit_lands_in_full_or_not_at_all() {
+        let mut b = Books::new();
+        b.journal
+            .accounts_mut()
+            .set_limit(b.cash, BalanceLimit::NoCreditBalance)
+            .expect("registered");
+        let before = b.journal.head();
+
+        let fund = b.sealed(b"fund", 1_000);
+        let draw = Entry::<Draft, 2>::new(
+            EntryId::generate(),
+            IdempotencyKey::new(b"draw".to_vec()).expect("valid"),
+            date!(2026 - 03 - 15),
+        )
+        .credit(b.cash, Eur::from_minor(1_500), Currency::EUR)
+        .debit(b.revenue, Eur::from_minor(1_500), Currency::EUR)
+        .seal(&b.journal.context())
+        .expect("balances");
+
+        assert!(matches!(
+            b.journal.record_batch(vec![fund, draw]),
+            Err(JournalError::LimitBreached { .. })
+        ));
+        assert!(b.journal.is_empty(), "the funding entry must unwind too");
+        assert_eq!(b.journal.head(), before);
+        assert!(b.journal.verify_balances().expect("ok"));
+        assert!(b.journal.verify_log());
+    }
 
     #[test]
     fn a_statement_shows_movements_and_the_running_balance() {
@@ -1977,11 +2364,32 @@ mod tests {
         let mut b = Books::new();
         b.record(b"a", 100);
         let mut cp = b.journal.checkpoint(&b.cash_key()).expect("ok");
-        cp.through_index = Some(99);
+        cp.tree_head.size = 99;
         assert!(matches!(
             b.journal.verify_checkpoint(&cp),
-            Err(CheckpointError::IndexOutOfRange { index: 99 })
+            Err(CheckpointError::SizeOutOfRange { size: 99 })
         ));
+    }
+
+    #[test]
+    fn a_checkpoint_over_an_empty_log_stays_valid_forever() {
+        // The prefix is the tree head's size, so an empty-prefix checkpoint says
+        // "nothing had moved after zero entries" — which no later append can
+        // falsify. When the position was a separate `Option`, `None` meant
+        // "empty" here and "current" to the balance reader, and this checkpoint
+        // silently started failing the moment anything was recorded.
+        let mut b = Books::new();
+        let key = b.cash_key();
+        let cp = b.journal.checkpoint(&key).expect("ok");
+        assert_eq!(cp.size(), 0);
+        assert!(b.journal.verify_checkpoint(&cp).is_ok());
+
+        b.record(b"a", 100);
+        b.record(b"b", 250);
+        assert!(
+            b.journal.verify_checkpoint(&cp).is_ok(),
+            "an empty-prefix checkpoint must survive the log growing"
+        );
     }
 
     #[test]
@@ -2008,8 +2416,42 @@ mod tests {
         let mut b = Books::new();
         b.record(b"a", 100);
         b.record(b"b", 250);
-        let earlier = BalanceAssertion::net(b.cash_key(), Eur::from_minor(100)).at_index(0);
+        let key = b.cash_key();
+        let earlier = BalanceAssertion::net(key, Eur::from_minor(100)).over_prefix(1);
         assert!(b.journal.check_assertion(&earlier).expect("ok").held());
+        // The empty prefix is a legal target and asserts an untouched ledger.
+        let nothing = BalanceAssertion::net(key, Eur::ZERO).over_prefix(0);
+        assert!(b.journal.check_assertion(&nothing).expect("ok").held());
+    }
+
+    #[test]
+    fn an_assertion_can_target_a_date_the_way_a_statement_does() {
+        // What reconciliation actually needs: an external statement is dated,
+        // not positioned, and a backdated entry has to land in the period it
+        // economically belongs to rather than where it happened to be recorded.
+        let mut b = Books::new();
+        let march = b.draft_on(b"march", 100, date!(2026 - 03 - 15));
+        b.journal.record(march).expect("records");
+        let april = b.draft_on(b"april", 250, date!(2026 - 04 - 02));
+        b.journal.record(april).expect("records");
+        // Recorded last, booked first.
+        let backdated = b.draft_on(b"backdated", 40, date!(2026 - 03 - 01));
+        b.journal.record(backdated).expect("records");
+
+        let key = b.cash_key();
+        let closing =
+            BalanceAssertion::net(key, Eur::from_minor(140)).on_date(date!(2026 - 03 - 31));
+        assert!(
+            b.journal.check_assertion(&closing).expect("ok").held(),
+            "March closes at 1.40, backdated entry included"
+        );
+        assert_eq!(
+            b.journal
+                .balance_on_date(&key, date!(2026 - 04 - 30))
+                .expect("ok")
+                .debits,
+            Eur::from_minor(390)
+        );
     }
 
     #[test]

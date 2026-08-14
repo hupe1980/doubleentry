@@ -328,17 +328,24 @@ pub trait LedgerStore<const P: u8>: Send + Sync {
         async { self.len().await.map(|n| n == 0) }
     }
 
-    /// One account balance, optionally as of a log position.
+    /// One account balance, optionally over a prefix of the log.
+    ///
+    /// `size` is a **count of entries**, not an index: `Some(0)` is the empty
+    /// ledger and `None` is everything recorded so far. It is the same number a
+    /// [`TreeHead::size`] carries, so a balance and the root it belongs with are
+    /// always named the same way.
     fn balance(
         &self,
         key: BalanceKey,
-        through: Option<LogIndex>,
+        size: Option<u64>,
     ) -> impl Future<Output = Result<Balance<P>, Self::Error>> + Send;
 
-    /// The trial balance, optionally as of a log position.
+    /// The trial balance, optionally over a prefix of the log.
+    ///
+    /// `size` counts entries, exactly as in [`LedgerStore::balance`].
     fn trial_balance(
         &self,
-        through: Option<LogIndex>,
+        size: Option<u64>,
     ) -> impl Future<Output = Result<TrialBalance<P>, Self::Error>> + Send;
 
     /// Proves an entry is committed to by the current head.
@@ -428,7 +435,7 @@ pub trait LedgerStore<const P: u8>: Send + Sync {
         accounts: &[AccountId],
         currency: Currency,
         layer: Layer,
-        through: Option<LogIndex>,
+        size: Option<u64>,
     ) -> impl Future<Output = Result<BTreeMap<AccountId, Balance<P>>, Self::Error>> + Send;
 
     /// One account's movements, with the running balance after each.
@@ -525,7 +532,7 @@ pub trait DynLedgerStore<const P: u8>: Send + Sync {
     fn balance_boxed(
         &self,
         key: BalanceKey,
-        through: Option<LogIndex>,
+        size: Option<u64>,
     ) -> BoxFuture<'_, Result<Balance<P>, Self::Error>>;
 }
 
@@ -557,9 +564,9 @@ where
     fn balance_boxed(
         &self,
         key: BalanceKey,
-        through: Option<LogIndex>,
+        size: Option<u64>,
     ) -> BoxFuture<'_, Result<Balance<P>, Self::Error>> {
-        Box::pin(self.balance(key, through))
+        Box::pin(self.balance(key, size))
     }
 }
 
@@ -733,17 +740,17 @@ impl<const P: u8> LedgerStore<P> for MemoryStore<P> {
     fn balance(
         &self,
         key: BalanceKey,
-        through: Option<LogIndex>,
+        size: Option<u64>,
     ) -> impl Future<Output = Result<Balance<P>, Self::Error>> + Send {
-        let result = self.with(|journal| Ok(journal.balance(&key, through)?));
+        let result = self.with(|journal| Ok(journal.balance(&key, size)?));
         async move { result }
     }
 
     fn trial_balance(
         &self,
-        through: Option<LogIndex>,
+        size: Option<u64>,
     ) -> impl Future<Output = Result<TrialBalance<P>, Self::Error>> + Send {
-        let result = self.with(|journal| Ok(journal.trial_balance(through)?));
+        let result = self.with(|journal| Ok(journal.trial_balance(size)?));
         async move { result }
     }
 
@@ -829,11 +836,11 @@ impl<const P: u8> LedgerStore<P> for MemoryStore<P> {
         accounts: &[AccountId],
         currency: Currency,
         layer: Layer,
-        through: Option<LogIndex>,
+        size: Option<u64>,
     ) -> impl Future<Output = Result<BTreeMap<AccountId, Balance<P>>, Self::Error>> + Send {
         let wanted: Vec<AccountId> = accounts.to_vec();
         let result = self.with(|journal| {
-            let tb = journal.trial_balance(through)?;
+            let tb = journal.trial_balance(size)?;
             let mut out = BTreeMap::new();
             for account in wanted {
                 let key = BalanceKey {

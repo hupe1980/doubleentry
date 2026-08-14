@@ -1,7 +1,7 @@
 +++
 title = "Debits, credits and gross totals"
 description = "Why the side is explicit rather than a sign, and why a balance carries both gross totals instead of only the net."
-weight = 4
+weight = 5
 +++
 
 ## The side is not a sign

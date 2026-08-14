@@ -30,13 +30,13 @@
 //! *verifies* it instead and refuses a pool that does not enforce it. `sqlx`
 //! enables it by default, so an ordinary pool already passes.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use time::Date;
 
 use crate::account::{
-    Account, AccountId, AccountKind, AccountPath, AccountRecord, AccountRegistry,
+    Account, AccountId, AccountKind, AccountPath, AccountRecord, AccountRegistry, BalanceLimit,
 };
 use crate::balance::{Balance, BalanceKey, TrialBalance};
 use crate::checkpoint::Checkpoint;
@@ -148,6 +148,33 @@ pub enum SqliteError {
     /// The pool opens connections without foreign-key enforcement.
     #[error(transparent)]
     ForeignKeysDisabled(#[from] ForeignKeysDisabled),
+    /// A handle was re-registered against a different account path.
+    ///
+    /// The path at a handle is what every posting row and every sealed balance
+    /// means by it. Rebinding one would silently repoint history, so it is
+    /// refused rather than applied.
+    #[error("account {id} is already bound to a different path")]
+    AccountRebound {
+        /// The offending handle.
+        id: AccountId,
+    },
+    /// An entry would leave an account on a side its balance limit forbids.
+    #[error(
+        "account {account} in {currency} ({layer}) would net to {net_minor} \
+         minor units, which its {limit} limit forbids"
+    )]
+    LimitBreached {
+        /// The account whose limit would be breached.
+        account: AccountId,
+        /// The currency the limit was breached in.
+        currency: Currency,
+        /// The layer the limit was breached in.
+        layer: Layer,
+        /// The limit in force.
+        limit: BalanceLimit,
+        /// The signed net the entry would leave, debit positive.
+        net_minor: i64,
+    },
     /// The database already holds a different ledger.
     #[error("this database holds ledger {found}, not {expected}")]
     WrongLedger {
@@ -506,6 +533,8 @@ impl<const P: u8> SqliteStore<P> {
             }
         }
 
+        Self::check_limits(tx, entry).await?;
+
         *next_index = next_index.saturating_add(1);
         *accumulator = projected;
         Ok(Recorded {
@@ -514,6 +543,65 @@ impl<const P: u8> SqliteStore<P> {
             content_hash,
             is_new: true,
         })
+    }
+
+    /// Refuses the entry if it leaves a constrained account on a forbidden side.
+    ///
+    /// Run *after* the postings are inserted and inside the same transaction, so
+    /// the aggregate sees exactly the balance the entry would leave behind and a
+    /// breach rolls the whole batch back with it. Checking beforehand would race
+    /// with any concurrent append and would have to reimplement the fold.
+    ///
+    /// Deliberately not filtered on `log_index IS NOT NULL`: an unsequenced
+    /// entry is durable, and money it has already committed counts against the
+    /// limit whether or not the sequencer has placed it yet.
+    async fn check_limits(
+        tx: &mut Transaction<'_, Sqlite>,
+        entry: &Entry<Balanced, P>,
+    ) -> Result<(), SqliteError> {
+        let mut checked: BTreeSet<(u32, Currency, Layer)> = BTreeSet::new();
+        for posting in entry.postings() {
+            if !checked.insert((posting.account.index(), posting.currency, posting.layer)) {
+                continue;
+            }
+            let row = sqlx::query(
+                "SELECT a.balance_limit AS lim, \
+                    COALESCE(SUM(CASE WHEN p.direction = 'D' \
+                                      THEN p.amount_minor ELSE -p.amount_minor END), 0) AS net \
+                 FROM accounts a \
+                 LEFT JOIN postings p \
+                   ON p.account_index = a.account_index \
+                  AND p.currency = ?2 AND p.layer = ?3 \
+                 WHERE a.account_index = ?1 AND a.balance_limit <> 'unlimited' \
+                 GROUP BY a.balance_limit",
+            )
+            .bind(i64::from(posting.account.index()))
+            .bind(posting.currency.code())
+            .bind(layer_str(posting.layer))
+            .fetch_optional(&mut **tx)
+            .await?;
+
+            let Some(row) = row else { continue };
+            let code: String = row.try_get("lim")?;
+            let limit = limit_from_code(&code)
+                .ok_or_else(|| SqliteError::malformed(format!("balance limit {code:?}")))?;
+            let net: i64 = row.try_get("net")?;
+            let permitted = match limit {
+                BalanceLimit::Unlimited => true,
+                BalanceLimit::NoCreditBalance => net >= 0,
+                BalanceLimit::NoDebitBalance => net <= 0,
+            };
+            if !permitted {
+                return Err(SqliteError::LimitBreached {
+                    account: posting.account,
+                    currency: posting.currency,
+                    layer: posting.layer,
+                    limit,
+                    net_minor: net,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Loads postings for several entries at once, grouped by log index.
@@ -634,8 +722,14 @@ fn hash_from_bytes(bytes: &[u8]) -> Result<Hash, SqliteError> {
     Ok(Hash::from_bytes(array))
 }
 
-fn through_bound(through: Option<LogIndex>) -> i64 {
-    through.map_or(i64::MAX, |i| i64::try_from(i.get()).unwrap_or(i64::MAX))
+/// The exclusive upper bound on `log_index` for a prefix of `size` entries.
+///
+/// `size` counts entries, so the entries in it are indices `0..size` — hence a
+/// strict `<`. `None` means the whole log. Expressed as an exclusive bound
+/// rather than `size - 1` so that an empty prefix needs no special case: it
+/// binds zero, and nothing is strictly below zero.
+fn prefix_bound(size: Option<u64>) -> i64 {
+    size.map_or(i64::MAX, |n| i64::try_from(n).unwrap_or(i64::MAX))
 }
 
 fn build_posting<const P: u8>(row: &sqlx::sqlite::SqliteRow) -> Result<Posting<P>, SqliteError> {
@@ -886,18 +980,35 @@ impl<const P: u8> LedgerStore<P> for SqliteStore<P> {
 
     async fn register_account(&self, record: &AccountRecord) -> Result<(), Self::Error> {
         {
-            sqlx::query(
-                "INSERT INTO accounts (account_index, path, kind, opened_on, closed_on) \
-                 VALUES (?1, ?2, ?3, ?4, ?5) \
-                 ON CONFLICT (account_index) DO NOTHING",
+            // Upsert, not insert-or-ignore. The path at a handle is immutable
+            // — changing it would repoint every posting row that names it, and
+            // the WHERE clause refuses that outright — but the classification,
+            // the open window and the balance limit are master data. A store
+            // that only ever inserted could not close an account or tighten a
+            // limit, which would leave `AccountRegistry`'s own mutators with
+            // nowhere to go once a ledger became durable.
+            let updated = sqlx::query(
+                "INSERT INTO accounts \
+                    (account_index, path, kind, opened_on, closed_on, balance_limit) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                 ON CONFLICT (account_index) DO UPDATE SET \
+                    kind          = excluded.kind, \
+                    opened_on     = excluded.opened_on, \
+                    closed_on     = excluded.closed_on, \
+                    balance_limit = excluded.balance_limit \
+                 WHERE accounts.path = excluded.path",
             )
             .bind(i64::from(record.id.index()))
             .bind(record.account.path.to_string())
             .bind(record.account.kind.map(kind_code))
             .bind(record.account.opened_on)
             .bind(record.account.closed_on)
+            .bind(limit_code(record.account.limit))
             .execute(&self.pool)
             .await?;
+            if updated.rows_affected() == 0 {
+                return Err(SqliteError::AccountRebound { id: record.id });
+            }
             Ok(())
         }
     }
@@ -905,7 +1016,7 @@ impl<const P: u8> LedgerStore<P> for SqliteStore<P> {
     async fn accounts(&self) -> Result<Vec<AccountRecord>, Self::Error> {
         {
             let rows = sqlx::query(
-                "SELECT account_index, path, kind, opened_on, closed_on \
+                "SELECT account_index, path, kind, opened_on, closed_on, balance_limit \
                  FROM accounts ORDER BY account_index",
             )
             .fetch_all(&self.pool)
@@ -1021,23 +1132,19 @@ impl<const P: u8> LedgerStore<P> for SqliteStore<P> {
         Ok(u64::try_from(n).unwrap_or(0))
     }
 
-    async fn balance(
-        &self,
-        key: BalanceKey,
-        through: Option<LogIndex>,
-    ) -> Result<Balance<P>, Self::Error> {
+    async fn balance(&self, key: BalanceKey, size: Option<u64>) -> Result<Balance<P>, Self::Error> {
         let row = sqlx::query(
             "SELECT \
                COALESCE(SUM(CASE WHEN direction = 'D' THEN amount_minor END), 0) AS debits, \
                COALESCE(SUM(CASE WHEN direction = 'C' THEN amount_minor END), 0) AS credits \
              FROM postings p JOIN entries e ON e.entry_id = p.entry_id \
              WHERE p.account_index = ?1 AND p.currency = ?2 AND p.layer = ?3 \
-               AND e.log_index IS NOT NULL AND e.log_index <= ?4",
+               AND e.log_index IS NOT NULL AND e.log_index < ?4",
         )
         .bind(i64::from(key.account.index()))
         .bind(key.currency.code())
         .bind(layer_str(key.layer))
-        .bind(through_bound(through))
+        .bind(prefix_bound(size))
         .fetch_one(&self.pool)
         .await?;
 
@@ -1047,20 +1154,17 @@ impl<const P: u8> LedgerStore<P> for SqliteStore<P> {
         })
     }
 
-    async fn trial_balance(
-        &self,
-        through: Option<LogIndex>,
-    ) -> Result<TrialBalance<P>, Self::Error> {
+    async fn trial_balance(&self, size: Option<u64>) -> Result<TrialBalance<P>, Self::Error> {
         let rows = sqlx::query(
             "SELECT p.account_index, p.currency, p.layer, \
                COALESCE(SUM(CASE WHEN p.direction = 'D' THEN p.amount_minor END), 0) AS debits, \
                COALESCE(SUM(CASE WHEN p.direction = 'C' THEN p.amount_minor END), 0) AS credits \
              FROM postings p JOIN entries e ON e.entry_id = p.entry_id \
-             WHERE e.log_index IS NOT NULL AND e.log_index <= ?1 \
+             WHERE e.log_index IS NOT NULL AND e.log_index < ?1 \
              GROUP BY p.account_index, p.currency, p.layer \
              ORDER BY p.account_index, p.currency, p.layer",
         )
-        .bind(through_bound(through))
+        .bind(prefix_bound(size))
         .fetch_all(&self.pool)
         .await?;
         build_trial_balance::<P>(&rows)
@@ -1151,12 +1255,11 @@ impl<const P: u8> LedgerStore<P> for SqliteStore<P> {
         let count: i64 = span.try_get("n")?;
 
         let closing = self.trial_balance_through_date(definition.end).await?;
-        let mut chain = SealChain::new();
-        for seal in self.seals().await? {
-            chain
-                .push(seal)
-                .map_err(|e| SqliteError::malformed(e.to_string()))?;
-        }
+        // Rebuilt through the chain rather than counted: seals read back from a
+        // table are rows, not evidence, and the new one has to chain onto a
+        // predecessor that itself still holds.
+        let chain = SealChain::from_seals(self.ledger.clone(), self.seals().await?)
+            .map_err(|e| SqliteError::malformed(e.to_string()))?;
         let position = i64::try_from(chain.len()).unwrap_or(0);
 
         let seal = Seal::build(
@@ -1407,7 +1510,7 @@ impl<const P: u8> LedgerStore<P> for SqliteStore<P> {
         accounts: &[AccountId],
         currency: Currency,
         layer: Layer,
-        through: Option<LogIndex>,
+        size: Option<u64>,
     ) -> Result<BTreeMap<AccountId, Balance<P>>, Self::Error> {
         let mut out = BTreeMap::new();
         if accounts.is_empty() {
@@ -1425,14 +1528,14 @@ impl<const P: u8> LedgerStore<P> for SqliteStore<P> {
                COALESCE(SUM(CASE WHEN p.direction = 'C' THEN p.amount_minor END), 0) AS credits \
              FROM postings p JOIN entries e ON e.entry_id = p.entry_id \
              WHERE p.currency = ?1 AND p.layer = ?2 \
-               AND e.log_index IS NOT NULL AND e.log_index <= ?3 \
+               AND e.log_index IS NOT NULL AND e.log_index < ?3 \
                AND p.account_index IN ({placeholders}) \
              GROUP BY p.account_index"
         );
         let mut query = sqlx::query(&sql)
             .bind(currency.code())
             .bind(layer_str(layer))
-            .bind(through_bound(through));
+            .bind(prefix_bound(size));
         for account in accounts {
             query = query.bind(i64::from(account.index()));
         }
@@ -1463,8 +1566,13 @@ impl<const P: u8> LedgerStore<P> for SqliteStore<P> {
         // in the database rather than by reading the account's whole history.
         // Nothing precedes the first page — reading the account's full balance
         // here would start every statement at its own closing figure.
+        // `after` is an index, and the prefix that precedes the page is
+        // everything up to and including it — one more entry than its index.
         let opening = match cursor.after {
-            Some(after) => self.balance(key, Some(after)).await?,
+            Some(after) => {
+                self.balance(key, Some(after.get().saturating_add(1)))
+                    .await?
+            }
             None => Balance::ZERO,
         };
 
@@ -1528,11 +1636,10 @@ impl<const P: u8> LedgerStore<P> for SqliteStore<P> {
     async fn save_checkpoint(&self, checkpoint: &Checkpoint<P>) -> Result<(), Self::Error> {
         sqlx::query(
             "INSERT INTO checkpoints ( \
-                account_index, currency, layer, through_index, debits_minor, credits_minor, \
+                account_index, currency, layer, debits_minor, credits_minor, \
                 tree_size, tree_root \
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8) \
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7) \
              ON CONFLICT (account_index, currency, layer) DO UPDATE SET \
-                through_index = excluded.through_index, \
                 debits_minor  = excluded.debits_minor, \
                 credits_minor = excluded.credits_minor, \
                 tree_size     = excluded.tree_size, \
@@ -1541,11 +1648,6 @@ impl<const P: u8> LedgerStore<P> for SqliteStore<P> {
         .bind(i64::from(checkpoint.key.account.index()))
         .bind(checkpoint.key.currency.code())
         .bind(layer_str(checkpoint.key.layer))
-        .bind(
-            checkpoint
-                .through_index
-                .map(|i| i64::try_from(i).unwrap_or(i64::MAX)),
-        )
         .bind(checkpoint.balance.debits.to_minor())
         .bind(checkpoint.balance.credits.to_minor())
         .bind(i64::try_from(checkpoint.tree_head.size).unwrap_or(i64::MAX))
@@ -1557,7 +1659,7 @@ impl<const P: u8> LedgerStore<P> for SqliteStore<P> {
 
     async fn load_checkpoint(&self, key: BalanceKey) -> Result<Option<Checkpoint<P>>, Self::Error> {
         let Some(row) = sqlx::query(
-            "SELECT through_index, debits_minor, credits_minor, tree_size, tree_root \
+            "SELECT debits_minor, credits_minor, tree_size, tree_root \
              FROM checkpoints WHERE account_index = ?1 AND currency = ?2 AND layer = ?3",
         )
         .bind(i64::from(key.account.index()))
@@ -1568,11 +1670,9 @@ impl<const P: u8> LedgerStore<P> for SqliteStore<P> {
         else {
             return Ok(None);
         };
-        let through: Option<i64> = row.try_get("through_index")?;
         let size: i64 = row.try_get("tree_size")?;
         Ok(Some(Checkpoint::new(
             key,
-            through.map(|i| u64::try_from(i).unwrap_or(0)),
             Balance {
                 debits: Amount::from_minor(row.try_get::<i64, _>("debits_minor")?),
                 credits: Amount::from_minor(row.try_get::<i64, _>("credits_minor")?),
@@ -1582,6 +1682,25 @@ impl<const P: u8> LedgerStore<P> for SqliteStore<P> {
                 root: hash_from_bytes(&row.try_get::<Vec<u8>, _>("tree_root")?)?,
             },
         )))
+    }
+}
+
+/// The stored code for a balance limit.
+fn limit_code(limit: BalanceLimit) -> &'static str {
+    match limit {
+        BalanceLimit::Unlimited => "unlimited",
+        BalanceLimit::NoCreditBalance => "no_credit",
+        BalanceLimit::NoDebitBalance => "no_debit",
+    }
+}
+
+/// The balance limit a stored code names.
+fn limit_from_code(code: &str) -> Option<BalanceLimit> {
+    match code {
+        "unlimited" => Some(BalanceLimit::Unlimited),
+        "no_credit" => Some(BalanceLimit::NoCreditBalance),
+        "no_debit" => Some(BalanceLimit::NoDebitBalance),
+        _ => None,
     }
 }
 
@@ -1638,6 +1757,9 @@ fn account_record(row: &sqlx::sqlite::SqliteRow) -> Result<AccountRecord, Sqlite
     );
     account.kind = kind.as_deref().and_then(kind_from_code);
     account.closed_on = row.try_get("closed_on")?;
+    let limit: String = row.try_get("balance_limit")?;
+    account.limit = limit_from_code(&limit)
+        .ok_or_else(|| SqliteError::malformed(format!("balance limit {limit:?}")))?;
     Ok(AccountRecord {
         id: AccountId::from_index(u32::try_from(index).unwrap_or(0)),
         account,

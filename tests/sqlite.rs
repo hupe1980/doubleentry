@@ -303,10 +303,8 @@ async fn sealing_a_period_excludes_later_entries() {
     assert_eq!(stored[0].seal_hash, seal.seal_hash);
     assert_eq!(stored[1].seal_hash, second.seal_hash);
 
-    let mut chain = doubleentry::SealChain::new();
-    for s in stored {
-        chain.push(s).expect("chains in the order it was read");
-    }
+    let chain = doubleentry::SealChain::from_seals(h.store.ledger().clone(), stored)
+        .expect("chains in the order it was read");
     chain.verify().expect("the reloaded chain verifies");
     assert!(seal.is_self_consistent());
     assert_eq!(seal.entry_count, 1);
@@ -497,7 +495,7 @@ async fn a_seal_names_the_books_it_covers() {
     assert!(!stolen.is_self_consistent());
 
     // And a chain refuses a seal from another ledger outright.
-    let mut chain = SealChain::new();
+    let mut chain = SealChain::new(seal_a.ledger.clone());
     chain.push(seal_a.clone()).expect("its own seal");
     match chain.push(seal_b) {
         Err(SealChainError::ForeignLedger {

@@ -13,7 +13,8 @@ double-entry bookkeeping inside the engine — and then lets you **prove to a th
 that it did.
 
 📖 **[Documentation](https://hupe1980.github.io/doubleentry)** ·
-🦀 **[API reference](https://docs.rs/doubleentry)**
+🦀 **[API reference](https://docs.rs/doubleentry)** ·
+📋 **[Changelog](CHANGELOG.md)**
 
 ---
 
@@ -30,6 +31,7 @@ know this record wasn't changed after the fact?*
 | **Deterministic** | No clock, no RNG, no hash-map iteration order. Identical inputs produce identical bytes |
 | **Verifiable** | Entries are leaves in an append-only Merkle log with `O(log n)` inclusion and consistency proofs; closed periods are sealed and chained, and a sealed balance can be proven *and named* without disclosing the rest of the books |
 | **Gross-preserving** | Balances carry debit *and* credit totals, so turnover survives netting |
+| **Bounded** | An account can be forbidden from crossing zero, checked inside the write against the balance the entry would leave — so concurrent draws cannot together overdraw it |
 
 ---
 
@@ -147,6 +149,47 @@ cent and nobody can say which entry did it. That is why splitting lives here.
 
 ---
 
+## 🚧 Balance limits
+
+Accounts are unconstrained by default. Where the books would be *wrong* rather than merely
+surprising if a balance crossed zero, say so and the engine enforces it:
+
+```rust
+# use doubleentry::account::BalanceLimit;
+# use doubleentry::period::LedgerId;
+# use doubleentry::{Amount, Currency, Entry, EntryId, IdempotencyKey, Journal, JournalError};
+# use time::macros::date;
+# type Eur = Amount<2>;
+# let mut journal = Journal::<2>::new(LedgerId::new("acme-gmbh")?);
+# let wallet = journal.accounts_mut().register_path("Liabilities:Wallet", date!(2026-01-01))?;
+# let cash = journal.accounts_mut().register_path("Assets:Cash", date!(2026-01-01))?;
+// A customer wallet may not be drawn beyond what was funded.
+journal.accounts_mut().set_limit(wallet, BalanceLimit::NoDebitBalance)?;
+
+let overdraw = Entry::new(
+    EntryId::generate(),
+    IdempotencyKey::new(b"withdrawal-1".to_vec())?,
+    date!(2026-03-15),
+)
+.debit(wallet, Eur::parse("50.00")?, Currency::EUR)
+.credit(cash, Eur::parse("50.00")?, Currency::EUR);
+
+assert!(matches!(
+    journal.record(overdraw),
+    Err(JournalError::LimitBreached { .. })
+));
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Checked against the balance the **whole entry** would leave behind, per currency and per
+layer, so the answer never depends on the order the postings were listed in. Both SQL
+backends enforce it *inside the append transaction* — a limit checked before the write reads
+a pre-image that two concurrent appends both see, each fitting it and together breaching it.
+
+→ [Accounts](https://hupe1980.github.io/doubleentry/docs/accounts/)
+
+---
+
 ## 🔐 Proofs
 
 The log follows the append-only Merkle tree of RFC 6962 / RFC 9162, with BLAKE3 in place of
@@ -234,7 +277,7 @@ the fact cannot leave a seal verifying while its balances quietly mean something
 ## 💾 Persistence
 
 The engine keeps no storage of its own. `LedgerStore` defines what a backend must do, and the
-**conformance suite** — nineteen executable checks — is what decides whether an
+**conformance suite** — twenty executable checks — is what decides whether an
 implementation of it is correct.
 
 | Backend | Feature | Verified against |
@@ -288,6 +331,10 @@ Two structural rules *are* enforced, because no downstream layer can repair them
 - **Only leaves are postable.** Posting to both a node and its descendants makes every rollup
   double-count.
 - **Postings fall inside the account's open window.**
+
+And one you opt into per account, for the same reason — an overdrawn cash account is not
+something a report can repair either: a **balance limit**, checked against the balance an
+entry would leave behind.
 
 ---
 

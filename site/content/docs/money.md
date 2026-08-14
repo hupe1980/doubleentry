@@ -1,7 +1,7 @@
 +++
 title = "Money"
 description = "Exact scaled-integer arithmetic: choosing a precision, allocating without leaking minor units, and why there are no arithmetic operators."
-weight = 3
+weight = 4
 +++
 
 ## Scaled integers, not floats

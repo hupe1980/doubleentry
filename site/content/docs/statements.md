@@ -1,7 +1,7 @@
 +++
 title = "Statements, checkpoints and assertions"
 description = "Reading how an account got to where it is, caching that fold safely, and reconciling the ledger against an outside source."
-weight = 9
+weight = 10
 +++
 
 ## Statements
@@ -38,23 +38,32 @@ history. A checkpoint records that fold up to a point so later reads start from
 there.
 
 Because that trades a definition for a cache, a checkpoint is only safe if it can
-be re-derived. So it carries the log position **and** the tree head it was taken
-against:
+be re-derived. So it carries the tree head it was taken against:
 
 ```rust
 let cp = journal.checkpoint(&cash_key)?;
+assert_eq!(cp.size(), journal.len() as u64);
 journal.verify_checkpoint(&cp)?;    // re-derives and compares
 ```
 
-`verify_checkpoint` checks three things independently: that the position exists,
-that the tree head matches the log *at that size*, and that the balance matches a
-fold. The head check is what makes a stale checkpoint detectable — a checkpoint
-that matches numerically but was taken against a different history is stale by
-construction, not by convention, and silently trusting it would carry a wrong
-balance forward.
+The head does double duty: it **names the prefix** the balance covers, and it
+**pins the history** that prefix belongs to. There is deliberately no separate
+position field — two fields that must agree are two fields that can disagree, and
+this pair used to: a checkpoint taken over an empty ledger recorded "no position"
+where the balance reader understood "the current balance", so it silently started
+failing the moment anything was recorded.
 
-A checkpoint over a prefix stays valid as the log grows, because it describes a
-real prefix and its pinned head lets it be re-derived exactly.
+`verify_checkpoint` checks three things independently: that the prefix is within
+the log, that the tree head matches the log *at that size*, and that a fold over
+exactly that prefix reproduces the balance. The head check is what makes a stale
+checkpoint detectable — one that matches numerically but was taken against a
+different history is stale by construction, not by convention, and silently
+trusting it would carry a wrong balance forward.
+
+A checkpoint stays valid as the log grows, because it describes a real prefix and
+its pinned head lets it be re-derived exactly. That includes the empty one: "this
+account had not moved after zero entries" is a true statement no later append can
+falsify.
 
 ## Balance assertions
 
@@ -83,27 +92,49 @@ named side into that form.
 A failed assertion reports the difference, not just the fact of failure — the
 difference is the number you go looking for.
 
-Assertions can target an earlier log position, which is how you reconcile against
-a statement that arrived late:
+### Where to evaluate it
+
+An assertion names the state of the books it is about, and the two forms answer
+genuinely different questions:
 
 ```rust
-let historical = BalanceAssertion::net(cash_key, expected).at_index(1_204);
+// After the first 1 204 entries. Exact, reproducible, and meaningful only
+// inside this system.
+let positional = BalanceAssertion::net(cash_key, expected).over_prefix(1_204);
+
+// Everything booked on or before 31 March, whenever it was recorded.
+let dated = BalanceAssertion::net(cash_key, expected).on_date(date!(2026-03-31));
 ```
+
+Use the **dated** form to reconcile against anything external. A bank statement
+says "as at 31 March", not "after 4 812 entries", and folding by booking date is
+what puts a late-arriving backdated entry in the period it economically belongs
+to. `journal.balance_on_date` answers the same question directly.
+
+Use the **positional** form when you need a claim that is exact against one
+history — pairing it with a tree head, or pinning a regression test.
 
 ## Historical reads
 
-Both statements and balances accept a log position rather than a date:
+Balances and trial balances take a **prefix size** — a count of entries, not an
+index:
 
 ```rust
-let then = journal.balance(&cash_key, Some(LogIndex::new(1_204)))?;
+let then    = journal.balance(&cash_key, Some(1_204))?;   // after 1 204 entries
+let nothing = journal.balance(&cash_key, Some(0))?;       // the empty ledger
+let now     = journal.balance(&cash_key, None)?;          // everything so far
 ```
 
-"The balance as the journal stood after 1 204 entries" is a well-defined
-question; "the balance on a date" is not, because entries are appended in
-recording order rather than booking-date order and a late correction changes what
-a date means. For the date-shaped question, use
-`trial_balance_through_date`, which folds every entry *booked* on or before a day
-— that is what a period's closing balance means, and it is what
+A count rather than an index because it is the same number a `TreeHead` carries,
+so a balance and the root it belongs with are always named the same way — and
+because `Some(0)` then means something, where a "last index included" of zero
+cannot express an empty prefix at all.
+
+Both forms are well defined and neither replaces the other. "As the journal stood
+after 1 204 entries" is exact against one history. "On a date" is the question
+every external source asks, and `journal.balance_on_date` and
+`trial_balance_through_date` answer it by folding every entry *booked* on or
+before a day — which is also what a period's closing balance means, and what
 [seals](@/docs/periods-and-seals.md) commit to.
 
 Reading a current balance is a lookup. Reading a historical one replays that

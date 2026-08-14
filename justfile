@@ -24,18 +24,26 @@ purity:
     #!/usr/bin/env bash
     # Storage backends are exempt by construction — talking to a database is
     # their whole job — so this covers src/ minus src/storage.
+    #
+    # `now_v7` is in the pattern because it reads the clock as surely as
+    # `SystemTime::now` does, and it is easy to reach for. The two identifier
+    # generators that legitimately call it opt out with an explicit marker, so a
+    # third one cannot appear by accident.
     set -uo pipefail
     hits="$(grep -rn --include='*.rs' -E \
-        'now_utc|SystemTime::now|Instant::now|std::(fs|env|net|process)|\basync\b|\bunsafe\b' \
+        'now_utc|now_v7|SystemTime::now|Instant::now|std::(fs|env|net|process)|\basync\b|\bunsafe\b' \
         src/ \
         | grep -v '^src/storage' \
-        | grep -vE ':[[:space:]]*(///|//!|//)' || true)"
+        | grep -vE ':[[:space:]]*(///|//!|//)' \
+        | grep -v 'purity-exempt' || true)"
     if [ -n "$hits" ]; then
         echo "❌ ambient state, async or unsafe reached the engine:" >&2
         echo "$hits" >&2
         echo "" >&2
         echo "The engine promises equal inputs give equal bytes. Take the date" >&2
-        echo "as a parameter, and keep I/O behind a LedgerStore." >&2
+        echo "as a parameter, and keep I/O behind a LedgerStore. If a clock read" >&2
+        echo "is genuinely off the deterministic path, say so with a" >&2
+        echo "'purity-exempt' marker on the line and document why." >&2
         exit 1
     fi
     echo "🧊 pure: no clock, no I/O, no async, no unsafe"

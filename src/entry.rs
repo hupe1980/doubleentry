@@ -86,7 +86,7 @@ impl EntryId {
     /// calls it.
     #[must_use]
     pub fn generate() -> Self {
-        Self(Uuid::now_v7())
+        Self(Uuid::now_v7()) // purity-exempt: identity, not ledger state
     }
 }
 
@@ -373,18 +373,56 @@ pub enum CurrencyPolicy {
 }
 
 /// Ledger-wide validation settings.
+///
+/// Everything here is off by default: a policy the caller did not ask for is a
+/// rule they will discover by having a valid booking rejected.
 #[derive(Debug, Clone, Default)]
 pub struct LedgerPolicy {
     /// Accepted currencies.
     pub currency: CurrencyPolicy,
-    /// Require an activity dimension on every posting.
+    /// Dimension axes every posting must carry.
     ///
-    /// Enable where accounts must be kept separately per line of business, so
-    /// that an unattributed posting is rejected rather than silently landing
-    /// outside every activity's accounts.
-    pub require_activity: bool,
+    /// Set this where the books cannot be kept without an attribution — a
+    /// regulated activity, a mandate, a fund — so that an unattributed posting
+    /// is rejected at the door rather than silently landing outside every
+    /// grouping a report knows about. Discovering it later means restating.
+    ///
+    /// The engine checks presence, never the value: which values are legal is a
+    /// question about your business, and one this crate has no way to answer.
+    pub required_dimensions: Vec<Label>,
     /// Largest permitted gap in days between booking date and value date.
     pub max_value_date_drift_days: Option<i64>,
+}
+
+impl LedgerPolicy {
+    /// A policy that constrains nothing.
+    #[must_use]
+    pub fn permissive() -> Self {
+        Self::default()
+    }
+
+    /// Restricts the ledger to one currency.
+    #[must_use]
+    pub fn in_currency(mut self, currency: Currency) -> Self {
+        self.currency = CurrencyPolicy::Single(currency);
+        self
+    }
+
+    /// Requires `axis` on every posting.
+    #[must_use]
+    pub fn requiring(mut self, axis: Label) -> Self {
+        if !self.required_dimensions.contains(&axis) {
+            self.required_dimensions.push(axis);
+        }
+        self
+    }
+
+    /// Bounds how far a value date may sit from its booking date.
+    #[must_use]
+    pub fn with_max_value_date_drift(mut self, days: i64) -> Self {
+        self.max_value_date_drift_days = Some(days);
+        self
+    }
 }
 
 /// Everything validation needs to check an entry.
@@ -480,11 +518,13 @@ pub enum ValidationError {
         /// The offending currency.
         currency: Currency,
     },
-    /// A posting lacked an activity dimension where one is required.
-    #[error("posting {index} has no activity dimension")]
-    MissingActivity {
+    /// A posting lacked a dimension the ledger's policy requires.
+    #[error("posting {index} has no {axis} dimension")]
+    MissingDimension {
         /// Index of the offending posting.
         index: usize,
+        /// The axis the policy requires.
+        axis: Label,
     },
     /// The value date was too far from the booking date.
     #[error("value date {value} is more than {max_days} days from booking date {booking}")]
@@ -757,8 +797,13 @@ impl<const P: u8> Entry<Draft, P> {
                 });
             }
 
-            if ctx.policy.require_activity && posting.dimensions.activity.is_none() {
-                errors.push(ValidationError::MissingActivity { index });
+            for axis in &ctx.policy.required_dimensions {
+                if !posting.dimensions.contains(axis.as_str()) {
+                    errors.push(ValidationError::MissingDimension {
+                        index,
+                        axis: axis.clone(),
+                    });
+                }
             }
 
             let balance = totals.entry(posting.currency).or_default();
@@ -826,6 +871,20 @@ impl<const P: u8> Entry<Draft, P> {
 }
 
 impl<S: sealed::State, const P: u8> Entry<S, P> {
+    /// The content hash of these bytes, whatever state the entry is in.
+    ///
+    /// Deliberately not public. The hash of a *draft* proves only that the bytes
+    /// are what they are; publishing it would hand a caller the one input
+    /// [`Entry::adopt_verified`] needs, turning a check that the bytes already
+    /// passed validation into a check that they hash to their own hash.
+    ///
+    /// Inside the crate it has one honest use: deciding idempotency before
+    /// validation runs, so a safe retry cannot trip a rule the original
+    /// submission already passed.
+    pub(crate) fn digest(&self) -> Hash {
+        tagged(tag::ENTRY_V1, &self.to_canonical_bytes())
+    }
+
     /// The entry's identifier.
     #[must_use]
     pub fn id(&self) -> EntryId {
@@ -904,9 +963,16 @@ impl<const P: u8> Entry<Balanced, P> {
     /// document reference. The identifier is deliberately excluded: it is
     /// storage metadata, and two submissions of the same logical transaction
     /// must hash identically for idempotency to be decidable.
+    ///
+    /// The consequence is worth being explicit about, since it bounds what
+    /// [`Entry::adopt_verified`] establishes: the hash binds an entry's
+    /// *contents*, not which row they were read out of. Two entries cannot
+    /// nonetheless share one — the idempotency key is inside the preimage and
+    /// unique across the ledger — so the hash still identifies an entry in
+    /// practice. It is the key, not the identifier, that makes it so.
     #[must_use]
     pub fn content_hash(&self) -> Hash {
-        tagged(tag::ENTRY_V1, &self.to_canonical_bytes())
+        self.digest()
     }
 
     /// Gross debit and credit totals per currency.
@@ -1042,7 +1108,11 @@ impl<'de, const P: u8> serde::Deserialize<'de> for Entry<Draft, P> {
     }
 }
 
-impl<const P: u8> Canonical for Entry<Balanced, P> {
+/// The encoding does not depend on the type state: a draft and the balanced
+/// entry it seals into are the same bytes. Only the *use* of those bytes
+/// differs, which is why [`Entry::content_hash`] is offered on the balanced form
+/// alone.
+impl<S: sealed::State, const P: u8> Canonical for Entry<S, P> {
     fn encode(&self, w: &mut CanonicalWriter) {
         w.u8(P);
         w.bytes(self.idempotency_key.as_bytes());
@@ -1066,7 +1136,7 @@ impl<const P: u8> Canonical for Entry<Balanced, P> {
 mod tests {
     use super::*;
     use crate::account::{Account, AccountPath};
-    use crate::dimensions::{ActivityId, Dimensions};
+    use crate::dimensions::Dimensions;
     use crate::period::{Period, PeriodId};
     use crate::posting::Layer;
     use time::macros::date;
@@ -1343,9 +1413,10 @@ mod tests {
     }
 
     #[test]
-    fn activity_can_be_required_on_every_posting() {
+    fn dimensions_can_be_required_on_every_posting() {
         let mut f = Fixture::new();
-        f.policy.require_activity = true;
+        let activity = Label::new("activity").expect("valid");
+        f.policy = f.policy.clone().requiring(activity.clone());
 
         let err = f
             .draft()
@@ -1356,12 +1427,14 @@ mod tests {
         assert_eq!(
             err.errors()
                 .iter()
-                .filter(|e| matches!(e, ValidationError::MissingActivity { .. }))
+                .filter(|e| matches!(e, ValidationError::MissingDimension { .. }))
                 .count(),
             2
         );
 
-        let dims = Dimensions::none().with_activity(ActivityId::new("Network").expect("valid"));
+        let dims = Dimensions::none()
+            .with(activity, Label::new("Network").expect("valid"))
+            .expect("fits");
         let ok = f
             .draft()
             .post(
@@ -1374,6 +1447,35 @@ mod tests {
             )
             .seal(&f.ctx());
         assert!(ok.is_ok());
+    }
+
+    #[test]
+    fn a_posting_carrying_the_wrong_axis_does_not_satisfy_the_policy() {
+        let mut f = Fixture::new();
+        f.policy = f
+            .policy
+            .clone()
+            .requiring(Label::new("activity").expect("valid"));
+
+        let dims = Dimensions::none()
+            .with(
+                Label::new("segment").expect("valid"),
+                Label::new("Electricity").expect("valid"),
+            )
+            .expect("fits");
+        let err = f
+            .draft()
+            .post(
+                Posting::debit(f.cash, Eur::from_minor(10), Currency::EUR)
+                    .with_dimensions(dims.clone()),
+            )
+            .post(
+                Posting::credit(f.revenue, Eur::from_minor(10), Currency::EUR)
+                    .with_dimensions(dims),
+            )
+            .seal(&f.ctx())
+            .expect_err("wrong axis");
+        assert!(err.any(|e| matches!(e, ValidationError::MissingDimension { .. })));
     }
 
     #[test]

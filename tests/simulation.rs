@@ -22,13 +22,12 @@
     clippy::arithmetic_side_effects
 )]
 
-use doubleentry::account::AccountRegistry;
-use doubleentry::clearing::{ClearedItem, Clearing, ClearingId};
-use doubleentry::entry::{Draft, LedgerPolicy, SealContext};
-use doubleentry::period::{LedgerId, Period, PeriodCalendar, PeriodId, PeriodState};
+use doubleentry::clearing::{Clearing, ClearingId};
+use doubleentry::entry::Draft;
+use doubleentry::period::{LedgerId, Period, PeriodId, PeriodState};
 use doubleentry::{
-    AccountId, AccountPath, ActivityId, Amount, BalanceKey, Currency, Description, Entry, EntryId,
-    Hash, IdempotencyKey, Journal, JournalError, Layer,
+    AccountId, AccountPath, Amount, BalanceKey, Currency, Description, Entry, EntryId, Hash,
+    IdempotencyKey, Journal, JournalError, Label, Layer,
 };
 use proptest::prelude::*;
 use time::macros::date;
@@ -76,14 +75,15 @@ fn op_strategy() -> impl Strategy<Value = Op> {
 }
 
 struct World {
-    accounts: AccountRegistry,
-    calendar: PeriodCalendar,
-    policy: LedgerPolicy,
     left: AccountId,
     right: AccountId,
     journal: Journal<2>,
-    /// Entries recorded so far, in order, with the key used for each.
+    /// Plain appends, with the key and amount that reproduce each. Only these
+    /// are replayable: a reversal is not rebuildable from a key and an amount.
     recorded: Vec<(EntryId, Vec<u8>, i64)>,
+    /// Every entry identifier, appends and reversals alike — the candidates a
+    /// reversal may target.
+    all_ids: Vec<EntryId>,
     /// Clearings recorded so far.
     clearings: Vec<ClearingId>,
     /// Periods already sealed.
@@ -93,32 +93,24 @@ struct World {
 
 impl World {
     fn new() -> Self {
-        let mut accounts = AccountRegistry::new();
-        let left = accounts
+        let mut journal = Journal::<2>::new(test_ledger());
+        let left = journal
+            .accounts_mut()
             .register_path("Sim:Left", date!(2000 - 01 - 01))
             .expect("registers");
-        let right = accounts
+        let right = journal
+            .accounts_mut()
             .register_path("Sim:Right", date!(2000 - 01 - 01))
             .expect("registers");
         Self {
-            accounts,
-            calendar: PeriodCalendar::new(),
-            policy: LedgerPolicy::default(),
             left,
             right,
-            journal: Journal::new(test_ledger()),
+            journal,
             recorded: Vec::new(),
+            all_ids: Vec::new(),
             clearings: Vec::new(),
             sealed: 0,
             next_key: 0,
-        }
-    }
-
-    fn ctx(&self) -> SealContext<'_> {
-        SealContext {
-            accounts: &self.accounts,
-            calendar: &self.calendar,
-            policy: &self.policy,
         }
     }
 
@@ -127,16 +119,16 @@ impl World {
         format!("sim-{}", self.next_key).into_bytes()
     }
 
-    fn build(&self, key: &[u8], amount: i64) -> Option<Entry<doubleentry::Balanced, 2>> {
-        Entry::<Draft, 2>::new(
-            EntryId::generate(),
-            IdempotencyKey::new(key.to_vec()).ok()?,
-            date!(2026 - 06 - 15),
+    fn build(&self, key: &[u8], amount: i64) -> Option<Entry<Draft, 2>> {
+        Some(
+            Entry::<Draft, 2>::new(
+                EntryId::generate(),
+                IdempotencyKey::new(key.to_vec()).ok()?,
+                date!(2026 - 06 - 15),
+            )
+            .debit(self.left, Eur::from_minor(amount), Currency::EUR)
+            .credit(self.right, Eur::from_minor(amount), Currency::EUR),
         )
-        .debit(self.left, Eur::from_minor(amount), Currency::EUR)
-        .credit(self.right, Eur::from_minor(amount), Currency::EUR)
-        .seal(&self.ctx())
-        .ok()
     }
 
     fn apply(&mut self, op: &Op) {
@@ -147,6 +139,7 @@ impl World {
                     let id = entry.id();
                     if self.journal.record(entry).is_ok() {
                         self.recorded.push((id, key, *amount));
+                        self.all_ids.push(id);
                     }
                 }
             }
@@ -174,10 +167,10 @@ impl World {
             }
 
             Op::Reverse { which } => {
-                if self.recorded.is_empty() {
+                if self.all_ids.is_empty() {
                     return;
                 }
-                let (id, _, _) = self.recorded[*which % self.recorded.len()];
+                let id = self.all_ids[*which % self.all_ids.len()];
                 let Some(original) = self.journal.get(id).cloned() else {
                     return;
                 };
@@ -186,16 +179,15 @@ impl World {
                     return;
                 };
                 let draft = original.reverse(EntryId::generate(), k, date!(2026 - 06 - 20));
-                let Ok(reversal) = draft.seal(&self.ctx()) else {
-                    return;
-                };
-                let reversal_id = reversal.id();
-                match self.journal.record(reversal) {
-                    Ok(_) => self.recorded.push((reversal_id, key, 0)),
-                    // The only legitimate refusals are the correction rules.
+                let reversal_id = draft.id();
+                match self.journal.record(draft) {
+                    Ok(_) => self.all_ids.push(reversal_id),
+                    // The only legitimate refusals are the correction rules and
+                    // a booking date whose period has since been sealed.
                     Err(
                         JournalError::AlreadyReversed { .. }
-                        | JournalError::ReversalOfReversal { .. },
+                        | JournalError::ReversalOfReversal { .. }
+                        | JournalError::Invalid(_),
                     ) => {}
                     Err(e) => panic!("unexpected reversal failure: {e}"),
                 }
@@ -234,22 +226,11 @@ impl World {
                     return;
                 }
                 let id = ClearingId::generate();
-                let outcome = self.journal.clear(Clearing {
-                    id,
-                    account: self.left,
-                    currency: Currency::EUR,
-                    cleared_on: date!(2026 - 06 - 25),
-                    items: vec![
-                        ClearedItem {
-                            posting: d.posting,
-                            applied: Eur::from_minor(applied),
-                        },
-                        ClearedItem {
-                            posting: c.posting,
-                            applied: Eur::from_minor(applied),
-                        },
-                    ],
-                });
+                let outcome = self.journal.clear(
+                    Clearing::new(id, key, date!(2026 - 06 - 25))
+                        .apply(d.posting, Eur::from_minor(applied))
+                        .apply(c.posting, Eur::from_minor(applied)),
+                );
                 assert!(
                     outcome.is_ok(),
                     "a clearing within both residuals was refused: {outcome:?}"
@@ -290,13 +271,17 @@ impl World {
                 let Ok(period) = Period::new(id.clone(), start, end) else {
                     return;
                 };
-                if self.calendar.define(period).is_err() {
+                if self.journal.define_period(period).is_err() {
                     return;
                 }
-                if self.calendar.transition(&id, PeriodState::Closing).is_err() {
+                if self
+                    .journal
+                    .transition_period(&id, PeriodState::Closing)
+                    .is_err()
+                {
                     return;
                 }
-                if self.journal.seal_period(&id, &mut self.calendar).is_ok() {
+                if self.journal.seal_period(&id).is_ok() {
                     self.sealed += 1;
                 }
             }
@@ -314,6 +299,10 @@ impl World {
             "the Merkle log stopped agreeing with the entries"
         );
         assert!(self.journal.verify_seals().is_ok(), "the seal chain broke");
+        assert!(
+            self.journal.verify_balances().expect("no overflow"),
+            "the maintained balances drifted from the entries"
+        );
 
         // Every entry is provable under the current head.
         let head = self.journal.head();
@@ -397,7 +386,7 @@ proptest! {
         let _ = IdempotencyKey::parse_hex(&s);
         let _ = AccountPath::parse(&s);
         let _ = Currency::new(&s);
-        let _ = ActivityId::new(s.clone());
+        let _ = Label::new(s.clone());
         let _ = Description::new(s.clone());
         let _ = PeriodId::new(s);
     }
@@ -436,7 +425,7 @@ proptest! {
         let _ = serde_json::from_str::<Currency>(&quoted);
         let _ = serde_json::from_str::<Hash>(&quoted);
         let _ = serde_json::from_str::<AccountPath>(&quoted);
-        let _ = serde_json::from_str::<ActivityId>(&quoted);
+        let _ = serde_json::from_str::<Label>(&quoted);
         let _ = serde_json::from_str::<IdempotencyKey>(&quoted);
         let _ = serde_json::from_str::<Entry<Draft, 2>>(&s);
     }

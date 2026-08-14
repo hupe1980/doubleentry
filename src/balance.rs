@@ -126,6 +126,15 @@ impl<const P: u8> TrialBalance<P> {
         self.entries.insert(key, balance);
     }
 
+    /// Removes one key, returning the balance it held.
+    ///
+    /// For rebuilding a balance set, not for editing one: a trial balance with a
+    /// key removed says the account never moved, which is a different claim from
+    /// a balance of zero.
+    pub fn remove(&mut self, key: &BalanceKey) -> Option<Balance<P>> {
+        self.entries.remove(key)
+    }
+
     /// The balance for one key, if anything has been posted to it.
     #[must_use]
     pub fn get(&self, key: &BalanceKey) -> Option<&Balance<P>> {

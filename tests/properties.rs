@@ -198,6 +198,19 @@ impl Fixture {
     fn account(&self, i: usize) -> AccountId {
         *self.ids.get(i % self.ids.len()).expect("non-empty")
     }
+
+    /// A journal sharing this fixture's accounts, so drafts recorded through it
+    /// are validated against the same registry they were built for.
+    fn journal(&self) -> Journal<2> {
+        let mut journal = Journal::<2>::new(test_ledger());
+        for record in self.accounts.records() {
+            journal
+                .accounts_mut()
+                .restore(record)
+                .expect("restores at its own handle");
+        }
+        journal
+    }
 }
 
 fn draft(key: &[u8]) -> Entry<Draft, 2> {
@@ -284,7 +297,7 @@ proptest! {
         amounts in prop::collection::vec(1i64..100_000, 1..24),
     ) {
         let f = Fixture::new(5);
-        let mut j = Journal::<2>::new(test_ledger());
+        let mut j = f.journal();
 
         for (i, a) in amounts.iter().enumerate() {
             let entry = draft(format!("k{i}").as_bytes())
@@ -292,7 +305,7 @@ proptest! {
                 .credit(f.account(i + 1), Eur::from_minor(*a), Currency::EUR)
                 .seal(&f.ctx())
                 .expect("balances");
-            j.record(entry).expect("records");
+            j.record_validated(entry).expect("records");
         }
 
         prop_assert_eq!(j.len(), amounts.len());
@@ -312,14 +325,14 @@ proptest! {
     #[test]
     fn every_journal_entry_is_provable(count in 1usize..40) {
         let f = Fixture::new(3);
-        let mut j = Journal::<2>::new(test_ledger());
+        let mut j = f.journal();
         for i in 0..count {
             let entry = draft(format!("k{i}").as_bytes())
                 .debit(f.account(i), Eur::from_minor(100), Currency::EUR)
                 .credit(f.account(i + 1), Eur::from_minor(100), Currency::EUR)
                 .seal(&f.ctx())
                 .expect("balances");
-            j.record(entry).expect("records");
+            j.record_validated(entry).expect("records");
         }
 
         let head = j.head();
@@ -336,14 +349,14 @@ proptest! {
     #[test]
     fn a_reversal_restores_every_net_balance(amount in 1i64..1_000_000) {
         let f = Fixture::new(2);
-        let mut j = Journal::<2>::new(test_ledger());
+        let mut j = f.journal();
 
         let original = draft(b"orig")
             .debit(f.account(0), Eur::from_minor(amount), Currency::EUR)
             .credit(f.account(1), Eur::from_minor(amount), Currency::EUR)
             .seal(&f.ctx())
             .expect("balances");
-        j.record(original.clone()).expect("records");
+        j.record_validated(original.clone()).expect("records");
 
         let reversal = original
             .reverse(
@@ -353,7 +366,7 @@ proptest! {
             )
             .seal(&f.ctx())
             .expect("balances");
-        j.record(reversal).expect("records");
+        j.record_validated(reversal).expect("records");
 
         let tb = j.trial_balance(None).expect("no overflow");
         for (_, balance) in tb.iter() {
@@ -366,7 +379,7 @@ proptest! {
     #[test]
     fn replays_are_idempotent(repeats in 1usize..10, amount in 1i64..1_000_000) {
         let f = Fixture::new(2);
-        let mut j = Journal::<2>::new(test_ledger());
+        let mut j = f.journal();
         let mut first_index = None;
 
         for _ in 0..repeats {
@@ -375,7 +388,7 @@ proptest! {
                 .credit(f.account(1), Eur::from_minor(amount), Currency::EUR)
                 .seal(&f.ctx())
                 .expect("balances");
-            let recorded = j.record(entry).expect("records or replays");
+            let recorded = j.record_validated(entry).expect("records or replays");
             match first_index {
                 None => first_index = Some(recorded.index),
                 Some(idx) => {
@@ -394,14 +407,14 @@ proptest! {
     ) {
         let f = Fixture::new(4);
         let build = |take: usize| {
-            let mut j = Journal::<2>::new(test_ledger());
+            let mut j = f.journal();
             for (i, a) in amounts.iter().take(take).enumerate() {
                 let entry = draft(format!("k{i}").as_bytes())
                     .debit(f.account(i), Eur::from_minor(*a), Currency::EUR)
                     .credit(f.account(i + 1), Eur::from_minor(*a), Currency::EUR)
                     .seal(&f.ctx())
                     .expect("balances");
-                j.record(entry).expect("records");
+                j.record_validated(entry).expect("records");
             }
             j
         };
@@ -515,14 +528,14 @@ proptest! {
         use doubleentry::BalanceKey;
 
         let f = Fixture::new(3);
-        let mut j = Journal::<2>::new(test_ledger());
+        let mut j = f.journal();
         for (i, a) in amounts.iter().enumerate() {
             let entry = draft(format!("k{i}").as_bytes())
                 .debit(f.account(i), Eur::from_minor(*a), Currency::EUR)
                 .credit(f.account(i + 1), Eur::from_minor(*a), Currency::EUR)
                 .seal(&f.ctx())
                 .expect("balances");
-            j.record(entry).expect("records");
+            j.record_validated(entry).expect("records");
         }
 
         let key = BalanceKey {
@@ -543,13 +556,13 @@ proptest! {
         use doubleentry::{BalanceAssertion, BalanceKey};
 
         let f = Fixture::new(2);
-        let mut j = Journal::<2>::new(test_ledger());
+        let mut j = f.journal();
         let entry = draft(b"k")
             .debit(f.account(0), Eur::from_minor(amount), Currency::EUR)
             .credit(f.account(1), Eur::from_minor(amount), Currency::EUR)
             .seal(&f.ctx())
             .expect("balances");
-        j.record(entry).expect("records");
+        j.record_validated(entry).expect("records");
 
         let key = BalanceKey {
             account: f.account(0),
@@ -600,13 +613,13 @@ proptest! {
 #[cfg(feature = "serde")]
 #[test]
 fn deserialisation_re_runs_validation() {
-    use doubleentry::{ActivityId, Currency};
+    use doubleentry::{Currency, Label};
 
     // Values that no constructor would accept must not survive a round trip.
     assert!(serde_json::from_str::<Currency>("\"eur\"").is_err());
     assert!(serde_json::from_str::<Currency>("\"EURO\"").is_err());
-    assert!(serde_json::from_str::<ActivityId>("\"\"").is_err());
-    assert!(serde_json::from_str::<ActivityId>("\"bad\\nvalue\"").is_err());
+    assert!(serde_json::from_str::<Label>("\"\"").is_err());
+    assert!(serde_json::from_str::<Label>("\"bad\\nvalue\"").is_err());
     assert!(serde_json::from_str::<Eur>("\"1.234\"").is_err());
     assert!(serde_json::from_str::<Eur>("123").is_err());
 
@@ -627,11 +640,11 @@ proptest! {
         invoice in 100i64..1_000_000,
         payments in prop::collection::vec(1i64..200_000, 1..8),
     ) {
-        use doubleentry::clearing::{ClearedItem, Clearing, ClearingId, PostingRef};
+        use doubleentry::clearing::{Clearing, ClearingId, PostingRef};
         use doubleentry::BalanceKey;
 
         let f = Fixture::new(2);
-        let mut j = Journal::<2>::new(test_ledger());
+        let mut j = f.journal();
 
         let inv = draft(b"invoice")
             .debit(f.account(0), Eur::from_minor(invoice), Currency::EUR)
@@ -639,7 +652,7 @@ proptest! {
             .seal(&f.ctx())
             .expect("balances");
         let invoice_ref = PostingRef::new(inv.id(), 0);
-        j.record(inv).expect("records");
+        j.record_validated(inv).expect("records");
 
         let key = BalanceKey {
             account: f.account(0),
@@ -655,22 +668,17 @@ proptest! {
                 .seal(&f.ctx())
                 .expect("balances");
             let pay_ref = PostingRef::new(p.id(), 0);
-            j.record(p).expect("records");
+            j.record_validated(p).expect("records");
 
             let room = invoice.saturating_sub(applied_total).min(*pay);
             if room <= 0 {
                 continue;
             }
-            j.clear(Clearing {
-                id: ClearingId::generate(),
-                account: f.account(0),
-                currency: Currency::EUR,
-                cleared_on: date!(2026 - 03 - 20),
-                items: vec![
-                    ClearedItem { posting: invoice_ref, applied: Eur::from_minor(room) },
-                    ClearedItem { posting: pay_ref, applied: Eur::from_minor(room) },
-                ],
-            })
+            j.clear(
+                Clearing::new(ClearingId::generate(), key, date!(2026 - 03 - 20))
+                    .apply(invoice_ref, Eur::from_minor(room))
+                    .apply(pay_ref, Eur::from_minor(room)),
+            )
             .expect("within the residual");
             applied_total = applied_total.saturating_add(room);
         }
@@ -696,10 +704,10 @@ proptest! {
     /// Clearing is an assignment, never a movement: balances are untouched.
     #[test]
     fn clearing_never_moves_money(amount in 1i64..1_000_000) {
-        use doubleentry::clearing::{ClearedItem, Clearing, ClearingId, PostingRef};
+        use doubleentry::clearing::{Clearing, ClearingId, PostingRef};
 
         let f = Fixture::new(2);
-        let mut j = Journal::<2>::new(test_ledger());
+        let mut j = f.journal();
 
         let a = draft(b"a")
             .debit(f.account(0), Eur::from_minor(amount), Currency::EUR)
@@ -707,7 +715,7 @@ proptest! {
             .seal(&f.ctx())
             .expect("balances");
         let a_ref = PostingRef::new(a.id(), 0);
-        j.record(a).expect("records");
+        j.record_validated(a).expect("records");
 
         let b = draft(b"b")
             .credit(f.account(0), Eur::from_minor(amount), Currency::EUR)
@@ -715,20 +723,20 @@ proptest! {
             .seal(&f.ctx())
             .expect("balances");
         let b_ref = PostingRef::new(b.id(), 0);
-        j.record(b).expect("records");
+        j.record_validated(b).expect("records");
 
         let before = j.trial_balance(None).expect("ok");
         let id = ClearingId::generate();
-        j.clear(Clearing {
-            id,
+        let key = doubleentry::BalanceKey {
             account: f.account(0),
             currency: Currency::EUR,
-            cleared_on: date!(2026 - 03 - 20),
-            items: vec![
-                ClearedItem { posting: a_ref, applied: Eur::from_minor(amount) },
-                ClearedItem { posting: b_ref, applied: Eur::from_minor(amount) },
-            ],
-        })
+            layer: Layer::Settled,
+        };
+        j.clear(
+            Clearing::new(id, key, date!(2026 - 03 - 20))
+                .apply(a_ref, Eur::from_minor(amount))
+                .apply(b_ref, Eur::from_minor(amount)),
+        )
         .expect("clears");
         prop_assert_eq!(&before, &j.trial_balance(None).expect("ok"));
 

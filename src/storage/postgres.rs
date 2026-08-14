@@ -33,7 +33,7 @@ use crate::account::{Account, AccountId, AccountKind, AccountPath, AccountRecord
 use crate::balance::{Balance, BalanceKey, TrialBalance};
 use crate::checkpoint::Checkpoint;
 use crate::clearing::{Clearing, ClearingId, OpenItem, PostingRef};
-use crate::dimensions::{ActivityId, CostObjectId, Dimensions, Label, PartyId, SegmentId};
+use crate::dimensions::{Dimensions, Label};
 use crate::entry::{
     Balanced, Description, DocumentRef, Draft, Entry, EntryId, IdempotencyKey, IntegrityError,
     Provenance,
@@ -41,7 +41,8 @@ use crate::entry::{
 use crate::hash::Hash;
 use crate::journal::{LogIndex, Recorded};
 use crate::merkle::{
-    ConsistencyProof, InclusionProof, MerkleAccumulator, MerkleLog, ProofError, TreeHead,
+    ConsistencyProof, InclusionProof, MalformedAccumulator, MerkleAccumulator, MerkleLog,
+    ProofError, TreeHead,
 };
 use crate::money::{Amount, Currency, MoneyError};
 use crate::period::{LedgerId, Period, PeriodCalendar, PeriodId, PeriodState};
@@ -162,6 +163,18 @@ pub enum PostgresError {
         /// The schema unqualified names currently resolve to.
         found: String,
     },
+    /// The persisted Merkle accumulator does not describe the stored log.
+    #[error(transparent)]
+    Accumulator(#[from] MalformedAccumulator),
+    /// The entry identifier is already used by a different entry.
+    #[error("entry {id} is already recorded")]
+    DuplicateId {
+        /// The offending identifier.
+        id: EntryId,
+    },
+    /// The calendar refused a period operation.
+    #[error(transparent)]
+    Period(#[from] crate::period::PeriodError),
     /// The database already holds a different ledger.
     #[error("this database holds ledger {found}, not {expected}")]
     WrongLedger {
@@ -369,58 +382,17 @@ impl<const P: u8> PostgresStore<P> {
         Ok(())
     }
 
-    /// Defines a period so it can later be sealed.
+    /// The calendar as the database holds it.
     ///
-    /// # Errors
-    ///
-    /// Returns any error the database raises.
-    pub async fn define_period(
-        &self,
-        id: &PeriodId,
-        starts_on: Date,
-        ends_on: Date,
-        state: PeriodState,
-    ) -> Result<(), PostgresError> {
-        sqlx::query(
-            "INSERT INTO periods (period_id, starts_on, ends_on, state) VALUES ($1, $2, $3, $4) \
-             ON CONFLICT (period_id) DO UPDATE SET state = EXCLUDED.state",
-        )
-        .bind(id.as_str())
-        .bind(starts_on)
-        .bind(ends_on)
-        .bind(period_state_str(state))
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    /// Every defined period, with its persisted state — to reconstruct a
-    /// [`PeriodCalendar`] on start-up so sealed periods keep rejecting postings.
+    /// Use it to validate drafts locally without another round trip per entry.
     ///
     /// # Errors
     ///
     /// Returns any error the database raises, or a malformed row.
-    pub async fn periods(&self) -> Result<Vec<Period>, PostgresError> {
-        let rows = sqlx::query(
-            "SELECT period_id, starts_on, ends_on, state FROM periods ORDER BY starts_on",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-        let mut out = Vec::with_capacity(rows.len());
-        for row in &rows {
-            let id: String = row.try_get("period_id")?;
-            let starts_on: Date = row.try_get("starts_on")?;
-            let ends_on: Date = row.try_get("ends_on")?;
-            let state: String = row.try_get("state")?;
-            let id = PeriodId::new(id).map_err(|e| PostgresError::malformed(e.to_string()))?;
-            let mut period = Period::new(id, starts_on, ends_on)
-                .map_err(|e| PostgresError::malformed(e.to_string()))?;
-            period.state = period_state_from(&state).ok_or_else(|| {
-                PostgresError::malformed(format!("unknown period state {state:?}"))
-            })?;
-            out.push(period);
-        }
-        Ok(out)
+    pub async fn calendar(&self) -> Result<PeriodCalendar, PostgresError> {
+        Ok(PeriodCalendar::from_periods(
+            <Self as LedgerStore<P>>::periods(self).await?,
+        )?)
     }
 
     /// Every content hash in log order, which is the Merkle log's leaf sequence.
@@ -465,10 +437,12 @@ impl<const P: u8> PostgresStore<P> {
                 .fetch_one(&mut **tx)
                 .await?
                 .try_get("n")?;
-        Ok(MerkleAccumulator::from_parts(
+        // Checked, not trusted: a row lost, duplicated or returned out of order
+        // would otherwise produce a plausible-looking wrong root.
+        Ok(MerkleAccumulator::try_from_parts(
             subtrees,
             u64::try_from(size).unwrap_or(0),
-        ))
+        )?)
     }
 
     /// Persists the accumulator, replacing what was there.
@@ -502,19 +476,31 @@ impl<const P: u8> PostgresStore<P> {
         }
         let rows = sqlx::query(
             "SELECT entry_id, posting_index, account_index, direction, amount_minor, currency, \
-             layer, dim_activity, dim_segment, dim_cost_object, dim_party \
+             layer \
              FROM postings WHERE entry_id = ANY($1) ORDER BY entry_id, posting_index",
         )
         .bind(ids)
         .fetch_all(&self.pool)
         .await?;
 
+        // One query for the axes too, rather than one per posting.
+        let dim_rows = sqlx::query(
+            "SELECT entry_id, posting_index, axis, value FROM posting_dimensions \
+             WHERE entry_id = ANY($1) ORDER BY entry_id, posting_index, axis",
+        )
+        .bind(ids)
+        .fetch_all(&self.pool)
+        .await?;
+        let dimensions = dimensions_from(&dim_rows)?;
+
         for row in &rows {
             let entry_id: uuid::Uuid = row.try_get("entry_id")?;
-            grouped
-                .entry(entry_id)
-                .or_default()
-                .push(build_posting::<P>(row)?);
+            let posting_index: i16 = row.try_get("posting_index")?;
+            let mut posting = build_posting::<P>(row)?;
+            if let Some(dims) = dimensions.get(&(entry_id, posting_index)) {
+                posting.dimensions = dims.clone();
+            }
+            grouped.entry(entry_id).or_default().push(posting);
         }
         Ok(grouped)
     }
@@ -530,6 +516,23 @@ impl<const P: u8> PostgresStore<P> {
         placement: Placement,
     ) -> Result<Recorded, PostgresError> {
         let content_hash = entry.content_hash();
+
+        // The primary key would refuse this anyway; catching it here turns a
+        // constraint violation into an error that names what went wrong. Scoped
+        // to a *different* idempotency key, so a genuine retry — same
+        // identifier, same key — still falls through to the replay path below
+        // rather than being reported as a clash with itself.
+        let clash: Option<i32> =
+            sqlx::query("SELECT 1 AS x FROM entries WHERE entry_id = $1 AND idempotency_key <> $2")
+                .bind(entry.id().as_uuid())
+                .bind(entry.idempotency_key().as_bytes())
+                .fetch_optional(&mut **tx)
+                .await?
+                .map(|row| row.try_get("x"))
+                .transpose()?;
+        if clash.is_some() {
+            return Err(PostgresError::DuplicateId { id: entry.id() });
+        }
 
         if let Some(original) = entry.reverses() {
             Self::check_reversal(tx, entry, original).await?;
@@ -613,25 +616,35 @@ impl<const P: u8> PostgresStore<P> {
         };
 
         for (position, posting) in entry.postings().iter().enumerate() {
+            let position = i16::try_from(position).unwrap_or(i16::MAX);
             sqlx::query(
                 "INSERT INTO postings ( \
                     entry_id, posting_index, account_index, direction, amount_minor, currency, \
-                    layer, dim_activity, dim_segment, dim_cost_object, dim_party \
-                 ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+                    layer \
+                 ) VALUES ($1,$2,$3,$4,$5,$6,$7)",
             )
             .bind(entry.id().as_uuid())
-            .bind(i16::try_from(position).unwrap_or(i16::MAX))
+            .bind(position)
             .bind(i32::try_from(posting.account.index()).unwrap_or(i32::MAX))
             .bind(direction_str(posting.direction))
             .bind(posting.amount.to_minor())
             .bind(posting.currency.code())
             .bind(layer_str(posting.layer))
-            .bind(posting.dimensions.activity.as_ref().map(|d| d.as_str()))
-            .bind(posting.dimensions.segment.as_ref().map(|d| d.as_str()))
-            .bind(posting.dimensions.cost_object.as_ref().map(|d| d.as_str()))
-            .bind(posting.dimensions.party.as_ref().map(|d| d.as_str()))
             .execute(&mut **tx)
             .await?;
+
+            for (axis, value) in posting.dimensions.iter() {
+                sqlx::query(
+                    "INSERT INTO posting_dimensions (entry_id, posting_index, axis, value) \
+                     VALUES ($1,$2,$3,$4)",
+                )
+                .bind(entry.id().as_uuid())
+                .bind(position)
+                .bind(axis.as_str())
+                .bind(value.as_str())
+                .execute(&mut **tx)
+                .await?;
+            }
         }
 
         if let Some(projected) = projected {
@@ -791,32 +804,35 @@ fn build_posting<const P: u8>(row: &sqlx::postgres::PgRow) -> Result<Posting<P>,
     let currency = Currency::new(currency.trim())
         .map_err(|_| PostgresError::malformed(format!("currency {currency:?}")))?;
 
-    let mut dimensions = Dimensions::none();
-    if let Some(v) = row.try_get::<Option<String>, _>("dim_activity")? {
-        dimensions.activity =
-            Some(ActivityId::new(v).map_err(|e| PostgresError::malformed(e.to_string()))?);
-    }
-    if let Some(v) = row.try_get::<Option<String>, _>("dim_segment")? {
-        dimensions.segment =
-            Some(SegmentId::new(v).map_err(|e| PostgresError::malformed(e.to_string()))?);
-    }
-    if let Some(v) = row.try_get::<Option<String>, _>("dim_cost_object")? {
-        dimensions.cost_object =
-            Some(CostObjectId::new(v).map_err(|e| PostgresError::malformed(e.to_string()))?);
-    }
-    if let Some(v) = row.try_get::<Option<String>, _>("dim_party")? {
-        dimensions.party =
-            Some(PartyId::new(v).map_err(|e| PostgresError::malformed(e.to_string()))?);
-    }
-
     Ok(Posting {
         account: AccountId::from_index(u32::try_from(account).unwrap_or(0)),
         direction,
         amount: Amount::from_minor(amount),
         currency,
         layer,
-        dimensions,
+        dimensions: Dimensions::none(),
     })
+}
+
+/// `(entry_id, posting_index)` to the axes attached to that posting.
+type DimensionIndex = std::collections::BTreeMap<(uuid::Uuid, i16), Dimensions>;
+
+fn dimensions_from(rows: &[sqlx::postgres::PgRow]) -> Result<DimensionIndex, PostgresError> {
+    let mut out: DimensionIndex = std::collections::BTreeMap::new();
+    for row in rows {
+        let entry_id: uuid::Uuid = row.try_get("entry_id")?;
+        let posting_index: i16 = row.try_get("posting_index")?;
+        let axis: String = row.try_get("axis")?;
+        let value: String = row.try_get("value")?;
+        out.entry((entry_id, posting_index))
+            .or_default()
+            .set(
+                Label::new(axis).map_err(|e| PostgresError::malformed(e.to_string()))?,
+                Label::new(value).map_err(|e| PostgresError::malformed(e.to_string()))?,
+            )
+            .map_err(|e| PostgresError::malformed(e.to_string()))?;
+    }
+    Ok(out)
 }
 
 fn build_stored_entry<const P: u8>(
@@ -1200,12 +1216,72 @@ impl<const P: u8> LedgerStore<P> for PostgresStore<P> {
         Ok(self.log().await?.consistency_proof(old_size)?)
     }
 
-    async fn seal_period(
+    async fn define_period(&self, period: &Period) -> Result<(), Self::Error> {
+        // The EXCLUDE constraint enforces non-overlap; this insert only has to
+        // be idempotent for a caller that declares its calendar on every start.
+        sqlx::query(
+            "INSERT INTO periods (period_id, starts_on, ends_on, state) VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (period_id) DO UPDATE SET \
+                starts_on = EXCLUDED.starts_on, \
+                ends_on   = EXCLUDED.ends_on, \
+                state     = EXCLUDED.state",
+        )
+        .bind(period.id.as_str())
+        .bind(period.start)
+        .bind(period.end)
+        .bind(period_state_str(period.state))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn transition_period(
         &self,
         period: &PeriodId,
-        calendar: &mut PeriodCalendar,
-    ) -> Result<Seal, Self::Error> {
-        let Some(definition) = calendar.get(period).cloned() else {
+        to: PeriodState,
+    ) -> Result<(), Self::Error> {
+        // Checked against the calendar's rules rather than written blindly: the
+        // database can say a state is one of three, not that this one follows
+        // from the last.
+        let mut calendar = self.calendar().await?;
+        calendar.transition(period, to)?;
+        sqlx::query("UPDATE periods SET state = $2 WHERE period_id = $1")
+            .bind(period.as_str())
+            .bind(period_state_str(to))
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn periods(&self) -> Result<Vec<Period>, Self::Error> {
+        let rows = sqlx::query(
+            "SELECT period_id, starts_on, ends_on, state FROM periods ORDER BY starts_on",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let id: String = row.try_get("period_id")?;
+            let starts_on: Date = row.try_get("starts_on")?;
+            let ends_on: Date = row.try_get("ends_on")?;
+            let state: String = row.try_get("state")?;
+            let id = PeriodId::new(id).map_err(|e| PostgresError::malformed(e.to_string()))?;
+            let mut period = Period::new(id, starts_on, ends_on)
+                .map_err(|e| PostgresError::malformed(e.to_string()))?;
+            period.state = period_state_from(&state).ok_or_else(|| {
+                PostgresError::malformed(format!("unknown period state {state:?}"))
+            })?;
+            out.push(period);
+        }
+        Ok(out)
+    }
+
+    async fn seal_period(&self, period: &PeriodId) -> Result<Seal, Self::Error> {
+        let Some(definition) = <Self as LedgerStore<P>>::periods(self)
+            .await?
+            .into_iter()
+            .find(|p| p.id == *period)
+        else {
             return Err(PostgresError::UnknownPeriod {
                 period: period.clone(),
             });
@@ -1220,9 +1296,14 @@ impl<const P: u8> LedgerStore<P> for PostgresStore<P> {
         // Which entries belong to the period, and the closing balance through
         // its last day — not the whole journal, which would pull in entries
         // booked into later periods.
+        //
+        // Sequenced entries only. In deferred mode an entry can be durable
+        // without a position, and one that is not in the log the tree head
+        // commits to must not be counted as covered by it.
         let span = sqlx::query(
             "SELECT MIN(log_index) AS first, MAX(log_index) AS last, COUNT(*)::BIGINT AS n \
-             FROM entries WHERE booking_date BETWEEN $1 AND $2",
+             FROM entries \
+             WHERE log_index IS NOT NULL AND booking_date BETWEEN $1 AND $2",
         )
         .bind(definition.start)
         .bind(definition.end)
@@ -1278,10 +1359,6 @@ impl<const P: u8> LedgerStore<P> for PostgresStore<P> {
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
-
-        calendar
-            .transition(period, PeriodState::Sealed)
-            .map_err(|e| PostgresError::malformed(e.to_string()))?;
         Ok(seal)
     }
 
@@ -1352,35 +1429,52 @@ impl<const P: u8> LedgerStore<P> for PostgresStore<P> {
             }
         }
 
+        // A repeated identifier is a caller mistake, not a database failure, so
+        // it is named rather than surfacing as a primary-key violation.
+        let taken: Option<i32> = sqlx::query("SELECT 1 AS x FROM clearings WHERE clearing_id = $1")
+            .bind(clearing.id.as_uuid())
+            .fetch_optional(&mut *tx)
+            .await?
+            .map(|row| row.try_get("x"))
+            .transpose()?;
+        if taken.is_some() {
+            return Err(crate::clearing::ClearingError::DuplicateId { id: clearing.id }.into());
+        }
+
         let mut sides = Balance::<P>::ZERO;
         for item in &clearing.items {
-            let residual = residual_of::<P>(&mut tx, item.posting).await?;
-            let (direction, _, account, currency) =
-                posting_side::<P>(&mut tx, item.posting).await?;
-            if account != clearing.account {
+            let facts = posting_facts::<P>(&mut tx, item.posting).await?;
+            if facts.account != clearing.account {
                 return Err(crate::clearing::ClearingError::WrongAccount {
                     posting: item.posting,
                     expected: clearing.account,
                 }
                 .into());
             }
-            if currency != clearing.currency {
+            if facts.currency != clearing.currency {
                 return Err(crate::clearing::ClearingError::WrongCurrency {
                     posting: item.posting,
                     expected: clearing.currency,
                 }
                 .into());
             }
-            if item.applied > residual {
+            if facts.layer != clearing.layer {
+                return Err(crate::clearing::ClearingError::WrongLayer {
+                    posting: item.posting,
+                    expected: clearing.layer,
+                }
+                .into());
+            }
+            if item.applied > facts.residual {
                 return Err(crate::clearing::ClearingError::OverApplied {
                     posting: item.posting,
                     requested_minor: item.applied.to_minor(),
-                    residual_minor: residual.to_minor(),
+                    residual_minor: facts.residual.to_minor(),
                     scale: P,
                 }
                 .into());
             }
-            sides.add(direction, item.applied)?;
+            sides.add(facts.direction, item.applied)?;
         }
         if !sides.is_balanced() {
             return Err(crate::clearing::ClearingError::Unbalanced {
@@ -1392,12 +1486,13 @@ impl<const P: u8> LedgerStore<P> for PostgresStore<P> {
         }
 
         sqlx::query(
-            "INSERT INTO clearings (clearing_id, account_index, currency, cleared_on) \
-             VALUES ($1,$2,$3,$4)",
+            "INSERT INTO clearings (clearing_id, account_index, currency, layer, cleared_on) \
+             VALUES ($1,$2,$3,$4,$5)",
         )
         .bind(clearing.id.as_uuid())
         .bind(i32::try_from(clearing.account.index()).unwrap_or(i32::MAX))
         .bind(clearing.currency.code())
+        .bind(layer_str(clearing.layer))
         .bind(clearing.cleared_on)
         .execute(&mut *tx)
         .await?;
@@ -1523,15 +1618,22 @@ impl<const P: u8> LedgerStore<P> for PostgresStore<P> {
         let after = cursor
             .after
             .map_or(-1i64, |i| i64::try_from(i.get()).unwrap_or(i64::MAX));
-        let limit = i64::try_from(cursor.effective_limit()).unwrap_or(i64::MAX);
+        let limit = cursor.effective_limit();
 
-        // The running balance needs everything before the page, so it is summed
-        // in the database rather than by reading the account's whole history.
-        let opening = self
-            .fold_balance(&key, cursor.after.map(|i| LogIndex::new(i.get())))
-            .await?;
+        // The running balance needs everything strictly before the page, so it
+        // is summed in the database rather than by reading the account's whole
+        // history. Nothing precedes the first page — reading the account's full
+        // balance here would start every statement at its own closing figure.
+        let opening = match cursor.after {
+            Some(after) => self.fold_balance(&key, Some(after)).await?,
+            None => Balance::ZERO,
+        };
 
-        let rows = sqlx::query(
+        // One row past the page, so "is there more" is answered by the query
+        // rather than guessed from a full page — which would hand back a cursor
+        // that yields nothing.
+        let probe = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
+        let mut rows = sqlx::query(
             "SELECT e.log_index, e.entry_id, e.booking_date, e.kind, p.posting_index, \
                     p.direction, p.amount_minor \
              FROM postings p JOIN entries e ON e.entry_id = p.entry_id \
@@ -1543,9 +1645,11 @@ impl<const P: u8> LedgerStore<P> for PostgresStore<P> {
         .bind(key.currency.code())
         .bind(layer_str(key.layer))
         .bind(after)
-        .bind(limit)
+        .bind(probe)
         .fetch_all(&self.pool)
         .await?;
+        let has_more = rows.len() > limit;
+        rows.truncate(limit);
 
         let mut running = opening;
         let mut lines = Vec::with_capacity(rows.len());
@@ -1578,13 +1682,10 @@ impl<const P: u8> LedgerStore<P> for PostgresStore<P> {
             });
         }
 
-        let next = lines
-            .last()
-            .filter(|_| lines.len() >= cursor.effective_limit())
-            .map(|l| Cursor {
-                after: Some(l.index),
-                limit: cursor.limit,
-            });
+        let next = lines.last().filter(|_| has_more).map(|l| Cursor {
+            after: Some(l.index),
+            limit: cursor.limit,
+        });
         Ok(StatementPage { lines, next })
     }
 
@@ -1650,7 +1751,12 @@ impl<const P: u8> LedgerStore<P> for PostgresStore<P> {
 }
 
 impl<const P: u8> PostgresStore<P> {
-    /// Folds every entry booked on or before `end` into a trial balance.
+    /// Folds every *sequenced* entry booked on or before `end`.
+    ///
+    /// The `log_index IS NOT NULL` predicate is what keeps a seal honest: the
+    /// tree head it carries covers only sequenced entries, so a closing balance
+    /// that folded in unsequenced ones would commit to money the tree head does
+    /// not account for. In deferred mode that window is real.
     async fn trial_balance_through_date(
         &self,
         end: Date,
@@ -1660,7 +1766,7 @@ impl<const P: u8> PostgresStore<P> {
                COALESCE(SUM(p.amount_minor) FILTER (WHERE p.direction = 'D'), 0)::BIGINT AS debits, \
                COALESCE(SUM(p.amount_minor) FILTER (WHERE p.direction = 'C'), 0)::BIGINT AS credits \
              FROM postings p JOIN entries e ON e.entry_id = p.entry_id \
-             WHERE e.booking_date <= $1 \
+             WHERE e.log_index IS NOT NULL AND e.booking_date <= $1 \
              GROUP BY p.account_index, p.currency, p.layer \
              ORDER BY p.account_index, p.currency, p.layer",
         )
@@ -1693,13 +1799,31 @@ impl<const P: u8> PostgresStore<P> {
     }
 }
 
-async fn posting_side<const P: u8>(
+/// What a clearing needs to know about one posting: which side, which account,
+/// which currency, which layer, and how much of it is still open.
+struct PostingFacts<const P: u8> {
+    direction: Direction,
+    account: AccountId,
+    currency: Currency,
+    layer: Layer,
+    residual: Amount<P>,
+}
+
+/// One query rather than two: the residual and the posting's own facts come from
+/// the same row, so they cannot describe different moments.
+async fn posting_facts<const P: u8>(
     tx: &mut Transaction<'_, Postgres>,
     reference: PostingRef,
-) -> Result<(Direction, Amount<P>, AccountId, Currency), PostgresError> {
+) -> Result<PostingFacts<P>, PostgresError> {
     let row = sqlx::query(
-        "SELECT direction, amount_minor, account_index, currency \
-         FROM postings WHERE entry_id = $1 AND posting_index = $2",
+        "SELECT p.direction, p.account_index, p.currency, p.layer, \
+           (p.amount_minor - COALESCE(( \
+                SELECT SUM(ci.applied_minor) FROM clearing_items ci \
+                JOIN clearings c ON c.clearing_id = ci.clearing_id \
+                WHERE ci.entry_id = p.entry_id AND ci.posting_index = p.posting_index \
+                  AND c.reset_on IS NULL \
+            ), 0))::BIGINT AS residual \
+         FROM postings p WHERE p.entry_id = $1 AND p.posting_index = $2",
     )
     .bind(reference.entry.as_uuid())
     .bind(i16::try_from(reference.index).unwrap_or(i16::MAX))
@@ -1708,19 +1832,23 @@ async fn posting_side<const P: u8>(
     .ok_or(crate::clearing::ClearingError::UnknownPosting { posting: reference })?;
 
     let direction: String = row.try_get("direction")?;
-    let amount: i64 = row.try_get("amount_minor")?;
     let account: i32 = row.try_get("account_index")?;
     let currency: String = row.try_get("currency")?;
-    Ok((
-        match direction.as_str() {
+    let layer: String = row.try_get("layer")?;
+    Ok(PostingFacts {
+        direction: match direction.as_str() {
             "D" => Direction::Debit,
             _ => Direction::Credit,
         },
-        Amount::from_minor(amount),
-        AccountId::from_index(u32::try_from(account).unwrap_or(0)),
-        Currency::new(currency.trim())
+        account: AccountId::from_index(u32::try_from(account).unwrap_or(0)),
+        currency: Currency::new(currency.trim())
             .map_err(|_| PostgresError::malformed(format!("currency {currency:?}")))?,
-    ))
+        layer: match layer.as_str() {
+            "pending" => Layer::Pending,
+            _ => Layer::Settled,
+        },
+        residual: Amount::from_minor(row.try_get::<i64, _>("residual")?),
+    })
 }
 
 /// Loads an entry's postings inside an open transaction.
@@ -1729,35 +1857,31 @@ async fn load_postings_tx<const P: u8>(
     entry_id: uuid::Uuid,
 ) -> Result<Vec<Posting<P>>, PostgresError> {
     let rows = sqlx::query(
-        "SELECT posting_index, account_index, direction, amount_minor, currency, layer, \
-         dim_activity, dim_segment, dim_cost_object, dim_party \
+        "SELECT posting_index, account_index, direction, amount_minor, currency, layer \
          FROM postings WHERE entry_id = $1 ORDER BY posting_index",
     )
     .bind(entry_id)
     .fetch_all(&mut **tx)
     .await?;
-    rows.iter().map(build_posting::<P>).collect()
-}
-
-async fn residual_of<const P: u8>(
-    tx: &mut Transaction<'_, Postgres>,
-    reference: PostingRef,
-) -> Result<Amount<P>, PostgresError> {
-    let row = sqlx::query(
-        "SELECT p.amount_minor - COALESCE(( \
-             SELECT SUM(ci.applied_minor) FROM clearing_items ci \
-             JOIN clearings c ON c.clearing_id = ci.clearing_id \
-             WHERE ci.entry_id = p.entry_id AND ci.posting_index = p.posting_index \
-               AND c.reset_on IS NULL \
-         ), 0)::BIGINT AS residual \
-         FROM postings p WHERE p.entry_id = $1 AND p.posting_index = $2",
+    let dim_rows = sqlx::query(
+        "SELECT entry_id, posting_index, axis, value FROM posting_dimensions \
+         WHERE entry_id = $1 ORDER BY posting_index, axis",
     )
-    .bind(reference.entry.as_uuid())
-    .bind(i16::try_from(reference.index).unwrap_or(i16::MAX))
-    .fetch_optional(&mut **tx)
-    .await?
-    .ok_or(crate::clearing::ClearingError::UnknownPosting { posting: reference })?;
-    Ok(Amount::from_minor(row.try_get::<i64, _>("residual")?))
+    .bind(entry_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    let dimensions = dimensions_from(&dim_rows)?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let posting_index: i16 = row.try_get("posting_index")?;
+        let mut posting = build_posting::<P>(row)?;
+        if let Some(dims) = dimensions.get(&(entry_id, posting_index)) {
+            posting.dimensions = dims.clone();
+        }
+        out.push(posting);
+    }
+    Ok(out)
 }
 
 /// The stored code for a reporting classification.

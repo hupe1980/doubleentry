@@ -1,10 +1,14 @@
-//! The in-memory journal.
+//! The in-memory journal — the engine's reference implementation.
 //!
-//! A journal holds validated entries in append order, maintains the Merkle log
-//! that commits to them, and enforces idempotency and reversal rules. It has no
-//! storage of its own: it is the reference implementation of the engine's
-//! semantics, the substrate for deterministic testing, and the thing a
-//! persistence layer is expected to agree with.
+//! A journal is one entity's books: its accounts, its calendar, its policy, its
+//! entries in append order, the Merkle log that commits to them, its seals and
+//! its clearings. It holds all of that together because every one of those
+//! pieces is needed to decide whether the next booking is legal, and splitting
+//! them across the caller's own variables is how they drift apart.
+//!
+//! It has no storage. It is the semantics a [`LedgerStore`](crate::LedgerStore)
+//! is expected to agree with, the substrate for deterministic testing, and — for
+//! a process that does not need durability — a usable ledger on its own.
 //!
 //! # Idempotency
 //!
@@ -13,23 +17,39 @@
 //! what makes a retry safe across an at-least-once delivery path. Submitting the
 //! same key with different content is a conflict and is refused — never a silent
 //! overwrite, and never a second entry.
+//!
+//! # Cost
+//!
+//! Balances and per-account posting lists are maintained as entries arrive, so
+//! reading the current trial balance, one account's balance, or one account's
+//! statement costs what the answer costs and not what the history costs. Asking
+//! for a *historical* state — a balance as of an earlier log position — replays
+//! that account's postings up to the position, which is linear in the postings
+//! on that account rather than in the journal.
+//!
+//! Proofs and whole-log verification are `O(n)` by nature. They are audit-time
+//! operations, not write-path ones.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use time::Date;
 
+use crate::account::{AccountRecord, AccountRegistry};
 use crate::balance::{Balance, BalanceKey, TrialBalance};
 use crate::checkpoint::{AssertionOutcome, BalanceAssertion, Checkpoint, CheckpointError};
 use crate::clearing::{
     Clearing, ClearingError, ClearingId, ClearingRegister, OpenItem, PostingLookup, PostingRef,
 };
-use crate::entry::{Balanced, Entry, EntryId, IdempotencyKey, SealContext, ValidationErrors};
+use crate::entry::{
+    Balanced, Draft, Entry, EntryId, IdempotencyKey, LedgerPolicy, SealContext, ValidationErrors,
+};
 use crate::hash::Hash;
 use crate::merkle::{ConsistencyProof, InclusionProof, MerkleLog, ProofError, TreeHead};
 use crate::money::{Currency, MoneyError};
-use crate::period::{LedgerId, PeriodCalendar, PeriodId, PeriodState};
-use crate::posting::Layer;
+use crate::period::{LedgerId, Period, PeriodCalendar, PeriodError, PeriodId, PeriodState};
+use crate::posting::{Layer, Posting};
 use crate::seal::{PeriodCoverage, Seal, SealChain, SealChainError};
+use crate::storage::StatementLine;
 
 /// Position of an entry in the journal.
 ///
@@ -175,6 +195,10 @@ pub enum JournalError {
     #[error(transparent)]
     Clearing(#[from] ClearingError),
 
+    /// The calendar refused a period operation.
+    #[error(transparent)]
+    Period(#[from] PeriodError),
+
     /// The period is not ready to be sealed.
     #[error("period {period} is {state}; only a closing period can be sealed")]
     PeriodNotClosing {
@@ -196,15 +220,34 @@ pub enum JournalError {
     Seal(#[from] SealChainError),
 }
 
+/// Where one posting sits: which entry, and which posting within it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Site {
+    index: LogIndex,
+    posting: u16,
+}
+
 /// An append-only journal of validated entries.
+///
+/// See the [module documentation](self) for what it owns and why.
 #[derive(Debug, Clone)]
 pub struct Journal<const P: u8> {
     ledger: LedgerId,
+    accounts: AccountRegistry,
+    calendar: PeriodCalendar,
+    policy: LedgerPolicy,
+
     entries: Vec<Entry<Balanced, P>>,
     log: MerkleLog,
     by_id: BTreeMap<EntryId, LogIndex>,
     by_key: BTreeMap<IdempotencyKey, (EntryId, LogIndex, Hash)>,
     reversed_by: BTreeMap<EntryId, EntryId>,
+
+    /// Current balances, maintained as entries arrive.
+    balances: TrialBalance<P>,
+    /// Where each balance key's postings are, in log order.
+    sites: BTreeMap<BalanceKey, Vec<Site>>,
+
     seals: SealChain,
     clearings: ClearingRegister<P>,
 }
@@ -215,38 +258,183 @@ impl<const P: u8> Journal<P> {
     /// A journal is one entity's books, not a shared table: the ledger it names
     /// is bound into every seal it produces, so seals from two journals can
     /// never be mistaken for one chain.
+    ///
+    /// It starts with no accounts, no periods, and a policy that constrains
+    /// nothing. Register accounts before posting to them; define periods when
+    /// you want to be able to seal them.
     #[must_use]
     pub fn new(ledger: LedgerId) -> Self {
         Self {
             ledger,
+            accounts: AccountRegistry::new(),
+            calendar: PeriodCalendar::new(),
+            policy: LedgerPolicy::default(),
             entries: Vec::new(),
             log: MerkleLog::new(),
             by_id: BTreeMap::new(),
             by_key: BTreeMap::new(),
             reversed_by: BTreeMap::new(),
+            balances: TrialBalance::new(),
+            sites: BTreeMap::new(),
             seals: SealChain::new(),
             clearings: ClearingRegister::new(),
         }
     }
 
-    /// Validates a draft and records it.
-    pub fn seal_and_record(
-        &mut self,
-        draft: crate::entry::Entry<crate::entry::Draft, P>,
-        ctx: &SealContext<'_>,
-    ) -> Result<Recorded, JournalError> {
-        let entry = draft.seal(ctx)?;
-        self.record(entry)
+    /// Sets the ledger-wide policy.
+    ///
+    /// Applies to what is recorded next. It does not re-validate what is already
+    /// recorded, and it must not: an entry that was legal when written stays
+    /// readable forever.
+    #[must_use]
+    pub fn with_policy(mut self, policy: LedgerPolicy) -> Self {
+        self.policy = policy;
+        self
     }
 
-    /// Records an already-validated entry.
+    // ── master data ─────────────────────────────────────────────────────────
+
+    /// The ledger these books belong to.
+    #[must_use]
+    pub fn ledger(&self) -> &LedgerId {
+        &self.ledger
+    }
+
+    /// The accounts that may be posted to.
+    #[must_use]
+    pub fn accounts(&self) -> &AccountRegistry {
+        &self.accounts
+    }
+
+    /// The account registry, for registering, closing, and reopening accounts.
+    ///
+    /// Master data is mutable while the journal is not: closing an account
+    /// changes what may be booked next and never what was booked already.
+    pub fn accounts_mut(&mut self) -> &mut AccountRegistry {
+        &mut self.accounts
+    }
+
+    /// The period calendar.
+    #[must_use]
+    pub fn calendar(&self) -> &PeriodCalendar {
+        &self.calendar
+    }
+
+    /// The period calendar, for defining periods and moving them through their
+    /// lifecycle.
+    ///
+    /// Sealing is [`Journal::seal_period`]'s job: it has to commit to the
+    /// balances before the period's state changes, which a bare transition
+    /// cannot do.
+    pub fn calendar_mut(&mut self) -> &mut PeriodCalendar {
+        &mut self.calendar
+    }
+
+    /// The ledger-wide policy.
+    #[must_use]
+    pub fn policy(&self) -> &LedgerPolicy {
+        &self.policy
+    }
+
+    /// Defines a period.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PeriodError`] for a duplicate identifier or an overlapping
+    /// range.
+    pub fn define_period(&mut self, period: Period) -> Result<(), JournalError> {
+        self.calendar.define(period)?;
+        Ok(())
+    }
+
+    /// Moves a period through its lifecycle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PeriodError`] when the transition is not permitted.
+    pub fn transition_period(
+        &mut self,
+        period: &PeriodId,
+        to: PeriodState,
+    ) -> Result<(), JournalError> {
+        self.calendar.transition(period, to)?;
+        Ok(())
+    }
+
+    /// Everything validation needs, borrowed from this journal.
+    ///
+    /// Use it to validate a draft without recording it — a dry run, or a batch
+    /// checked before any of it is committed. [`Journal::record`] builds it for
+    /// you.
+    #[must_use]
+    pub fn context(&self) -> SealContext<'_> {
+        SealContext {
+            accounts: &self.accounts,
+            calendar: &self.calendar,
+            policy: &self.policy,
+        }
+    }
+
+    // ── recording ───────────────────────────────────────────────────────────
+
+    /// Validates a draft against this journal and records it.
+    ///
+    /// The usual way in. [`Journal::record_validated`] exists for an entry that
+    /// was validated elsewhere — read what it costs before reaching for it.
+    ///
+    /// # Idempotency comes first
+    ///
+    /// The key is resolved *before* validation runs, not after. Otherwise a
+    /// retry of an entry that was accepted months ago would be refused today
+    /// because its period has since been sealed or its account has closed —
+    /// turning an at-least-once delivery path into a source of spurious errors
+    /// precisely when the ledger is least able to act on them. A safe retry must
+    /// not be able to trip a rule the original submission already passed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JournalError::Invalid`] with every violation found, and the
+    /// idempotency and correction errors of [`Journal::record_validated`].
+    pub fn record(&mut self, draft: Entry<Draft, P>) -> Result<Recorded, JournalError> {
+        let content_hash = draft.digest();
+        if let Some((existing_id, existing_index, stored)) =
+            self.by_key.get(draft.idempotency_key())
+        {
+            if *stored == content_hash {
+                return Ok(Recorded {
+                    id: *existing_id,
+                    index: Some(*existing_index),
+                    content_hash,
+                    is_new: false,
+                });
+            }
+            return Err(JournalError::IdempotencyConflict {
+                existing: *existing_id,
+                stored: *stored,
+                submitted: content_hash,
+            });
+        }
+
+        let entry = draft.seal(&self.context())?;
+        self.record_validated(entry)
+    }
+
+    /// Records an entry that has already passed validation.
+    ///
+    /// The entry must have been sealed against *this* journal's accounts,
+    /// calendar and policy. Sealing it against a different context and recording
+    /// it here would book against accounts this ledger does not have, or into a
+    /// period it has already sealed.
     ///
     /// # Errors
     ///
     /// Returns [`JournalError::IdempotencyConflict`] when the key has been used
     /// for different content, and the reversal errors when the entry violates
     /// the correction rules.
-    pub fn record(&mut self, entry: Entry<Balanced, P>) -> Result<Recorded, JournalError> {
+    pub fn record_validated(
+        &mut self,
+        entry: Entry<Balanced, P>,
+    ) -> Result<Recorded, JournalError> {
         let content_hash = entry.content_hash();
 
         // Idempotency is settled before anything else: a safe retry must not be
@@ -274,29 +462,28 @@ impl<const P: u8> Journal<P> {
         }
 
         if let Some(original) = entry.reverses() {
-            let Some(original_index) = self.by_id.get(&original) else {
-                return Err(JournalError::UnknownOriginal { id: original });
-            };
-            if let Some(existing) = self.reversed_by.get(&original) {
-                return Err(JournalError::AlreadyReversed {
-                    id: original,
-                    by: *existing,
-                });
-            }
-            let position = usize::try_from(original_index.get()).unwrap_or(usize::MAX);
-            let Some(target) = self.entries.get(position) else {
-                return Err(JournalError::UnknownOriginal { id: original });
-            };
-            if target.reverses().is_some() {
-                return Err(JournalError::ReversalOfReversal { id: original });
-            }
-            if !is_inversion_of(target, &entry) {
-                return Err(JournalError::NotAnInversion { id: original });
-            }
-            self.reversed_by.insert(original, entry.id());
+            self.check_reversal(&entry, original)?;
+        }
+
+        // Everything that can fail has failed by now, except accumulating the
+        // balances — which is checked against a copy so a rejected entry cannot
+        // leave the journal half-applied.
+        let mut balances = self.balances.clone();
+        for posting in entry.postings() {
+            balances.apply(posting)?;
         }
 
         let index = LogIndex(self.log.append(content_hash));
+        if let Some(original) = entry.reverses() {
+            self.reversed_by.insert(original, entry.id());
+        }
+        for (position, posting) in entry.postings().iter().enumerate() {
+            self.sites.entry(key_of(posting)).or_default().push(Site {
+                index,
+                posting: u16::try_from(position).unwrap_or(u16::MAX),
+            });
+        }
+        self.balances = balances;
         self.by_id.insert(entry.id(), index);
         self.by_key.insert(
             entry.idempotency_key().clone(),
@@ -312,6 +499,118 @@ impl<const P: u8> Journal<P> {
             is_new: true,
         })
     }
+
+    /// Records several entries, or none of them.
+    ///
+    /// Atomicity across entries is not optional: an invoice and the entry that
+    /// offsets it must not be separable by a failure partway through. Entries
+    /// are applied in order and, if any is refused, everything this call added
+    /// is undone — leaving the journal byte-identical to how it started.
+    ///
+    /// An idempotent replay inside a batch is not a failure: it returns the
+    /// original outcome, like a single-entry replay, and the rest of the batch
+    /// proceeds.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first entry's failure, having applied nothing.
+    pub fn record_batch(
+        &mut self,
+        entries: impl IntoIterator<Item = Entry<Balanced, P>>,
+    ) -> Result<Vec<Recorded>, JournalError> {
+        let mark = self.entries.len();
+        let mut out = Vec::new();
+        for entry in entries {
+            match self.record_validated(entry) {
+                Ok(recorded) => out.push(recorded),
+                Err(e) => {
+                    self.rollback_to(mark);
+                    return Err(e);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Undoes every append since the journal held `mark` entries.
+    ///
+    /// The exact inverse of the appends it removes: identifiers, keys, reversal
+    /// links, posting sites and balances all come back to what they were. The
+    /// balance of a key an undone posting touched is recomputed from the
+    /// postings that remain, rather than subtracted from — subtraction would
+    /// have to trust that what is being removed is exactly what was added, and
+    /// recomputation does not.
+    fn rollback_to(&mut self, mark: usize) {
+        let mut touched: BTreeSet<BalanceKey> = BTreeSet::new();
+        while self.entries.len() > mark {
+            let Some(entry) = self.entries.pop() else {
+                break;
+            };
+            let index = LogIndex(self.entries.len() as u64);
+            self.by_id.remove(&entry.id());
+            self.by_key.remove(entry.idempotency_key());
+            if let Some(original) = entry.reverses() {
+                self.reversed_by.remove(&original);
+            }
+            for posting in entry.postings() {
+                let key = key_of(posting);
+                if let Some(sites) = self.sites.get_mut(&key) {
+                    sites.retain(|site| site.index != index);
+                }
+                touched.insert(key);
+            }
+        }
+        self.log.truncate(self.entries.len() as u64);
+
+        for key in touched {
+            let mut balance = Balance::ZERO;
+            let mut overflowed = false;
+            for posting in self.postings_on_through(&key, None) {
+                if balance.add(posting.direction, posting.amount).is_err() {
+                    overflowed = true;
+                    break;
+                }
+            }
+            // A prefix of a set of postings that already summed cannot overflow,
+            // so this is unreachable; leaving the stale total in place would be
+            // worse than reporting zero, and reporting zero is caught by
+            // `verify_balances`.
+            let balance = if overflowed { Balance::ZERO } else { balance };
+            match self.sites.get(&key) {
+                Some(sites) if !sites.is_empty() => self.balances.set(key, balance),
+                _ => {
+                    self.sites.remove(&key);
+                    self.balances.remove(&key);
+                }
+            }
+        }
+    }
+
+    /// Enforces the correction rules against what is already recorded.
+    fn check_reversal(
+        &self,
+        entry: &Entry<Balanced, P>,
+        original: EntryId,
+    ) -> Result<(), JournalError> {
+        let Some(target) = self.get(original) else {
+            return Err(JournalError::UnknownOriginal { id: original });
+        };
+        if let Some(existing) = self.reversed_by.get(&original) {
+            return Err(JournalError::AlreadyReversed {
+                id: original,
+                by: *existing,
+            });
+        }
+        if target.reverses().is_some() {
+            return Err(JournalError::ReversalOfReversal { id: original });
+        }
+        if !is_inversion_of(target, entry) {
+            return Err(JournalError::NotAnInversion { id: original });
+        }
+        Ok(())
+    }
+
+    // ── reading ─────────────────────────────────────────────────────────────
 
     /// Number of recorded entries.
     #[must_use]
@@ -344,11 +643,19 @@ impl<const P: u8> Journal<P> {
         self.by_id.get(&id).and_then(|i| self.at(*i))
     }
 
+    /// The log position of an entry.
+    #[must_use]
+    pub fn index_of(&self, id: EntryId) -> Option<LogIndex> {
+        self.by_id.get(&id).copied()
+    }
+
     /// The reversal of an entry, if one has been recorded.
     #[must_use]
     pub fn reversal_of(&self, id: EntryId) -> Option<EntryId> {
         self.reversed_by.get(&id).copied()
     }
+
+    // ── proofs ──────────────────────────────────────────────────────────────
 
     /// The current tree head.
     #[must_use]
@@ -357,6 +664,10 @@ impl<const P: u8> Journal<P> {
     }
 
     /// The tree head as of an earlier size.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProofError::SizeOutOfRange`] for a size beyond the log.
     pub fn head_at(&self, size: u64) -> Result<TreeHead, ProofError> {
         Ok(TreeHead {
             size,
@@ -365,56 +676,21 @@ impl<const P: u8> Journal<P> {
     }
 
     /// Proves that the entry at `index` is committed to by the current head.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProofError::IndexOutOfRange`] for a position beyond the log.
     pub fn prove_inclusion(&self, index: LogIndex) -> Result<InclusionProof, ProofError> {
         self.log.inclusion_proof(index.get())
     }
 
     /// Proves that the log at `old_size` is a prefix of the current log.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProofError::SizeOutOfRange`] for a size beyond the log.
     pub fn prove_consistency(&self, old_size: u64) -> Result<ConsistencyProof, ProofError> {
         self.log.consistency_proof(old_size)
-    }
-
-    /// Folds the journal into a trial balance.
-    ///
-    /// Passing `through` restricts the fold to a prefix of the log, which is how
-    /// a historical view is reconstructed: not "the balance on a date" but "the
-    /// balance as the journal stood after `through` entries".
-    pub fn trial_balance(&self, through: Option<LogIndex>) -> Result<TrialBalance<P>, MoneyError> {
-        let limit = through.map_or(self.entries.len(), |i| {
-            usize::try_from(i.get().saturating_add(1)).unwrap_or(usize::MAX)
-        });
-        let mut tb = TrialBalance::new();
-        for entry in self.entries.iter().take(limit) {
-            for posting in entry.postings() {
-                tb.apply(posting)?;
-            }
-        }
-        Ok(tb)
-    }
-
-    /// The balance of one account, currency, and layer.
-    pub fn balance(
-        &self,
-        key: &BalanceKey,
-        through: Option<LogIndex>,
-    ) -> Result<Balance<P>, MoneyError> {
-        Ok(self.trial_balance(through)?.get_or_zero(key))
-    }
-
-    /// Checks that debits equal credits across the whole journal.
-    ///
-    /// Every entry balances individually, so this must hold; running it is a
-    /// direct test that the fold and the invariant have not drifted apart.
-    pub fn verify_balanced(&self) -> Result<bool, MoneyError> {
-        let tb = self.trial_balance(None)?;
-        for currency in tb.currencies() {
-            for layer in [Layer::Settled, Layer::Pending] {
-                if !tb.totals(currency, layer)?.is_balanced() {
-                    return Ok(false);
-                }
-            }
-        }
-        Ok(true)
     }
 
     /// Recomputes the Merkle log from the stored entries and compares it.
@@ -436,9 +712,122 @@ impl<const P: u8> Journal<P> {
         recomputed.root() == self.log.root()
     }
 
+    // ── balances ────────────────────────────────────────────────────────────
+
+    /// The trial balance, optionally as of a log position.
+    ///
+    /// Passing `through` restricts the fold to a prefix of the log, which is how
+    /// a historical view is reconstructed: not "the balance on a date" but "the
+    /// balance as the journal stood after `through` entries".
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MoneyError::Overflow`] if accumulating overflows, which cannot
+    /// happen for a prefix of a journal that accepted the entries in the first
+    /// place.
+    pub fn trial_balance(&self, through: Option<LogIndex>) -> Result<TrialBalance<P>, MoneyError> {
+        let Some(limit) = through else {
+            return Ok(self.balances.clone());
+        };
+        if limit.get().saturating_add(1) >= self.entries.len() as u64 {
+            return Ok(self.balances.clone());
+        }
+        let mut tb = TrialBalance::new();
+        for entry in self.entries_through(limit) {
+            for posting in entry.postings() {
+                tb.apply(posting)?;
+            }
+        }
+        Ok(tb)
+    }
+
+    /// The balance of one account, currency, and layer.
+    ///
+    /// Reading the current balance is a lookup. Reading a historical one replays
+    /// that key's postings, which is linear in how much has moved through the
+    /// account rather than in the size of the journal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MoneyError::Overflow`] if accumulating overflows.
+    pub fn balance(
+        &self,
+        key: &BalanceKey,
+        through: Option<LogIndex>,
+    ) -> Result<Balance<P>, MoneyError> {
+        let Some(limit) = through else {
+            return Ok(self.balances.get_or_zero(key));
+        };
+        let mut balance = Balance::ZERO;
+        for posting in self.postings_on_through(key, Some(limit)) {
+            balance.add(posting.direction, posting.amount)?;
+        }
+        Ok(balance)
+    }
+
+    /// Checks that debits equal credits across the whole journal.
+    ///
+    /// Every entry balances individually, so this must hold; running it is a
+    /// direct test that the maintained balances and the invariant have not
+    /// drifted apart.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MoneyError::Overflow`] if totalling overflows.
+    pub fn verify_balanced(&self) -> Result<bool, MoneyError> {
+        let tb = self.trial_balance(None)?;
+        for currency in tb.currencies() {
+            for layer in [Layer::Settled, Layer::Pending] {
+                if !tb.totals(currency, layer)?.is_balanced() {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    /// Recomputes the maintained balances from the entries and compares them.
+    ///
+    /// The incremental trial balance is derived state, like the Merkle subtree
+    /// stack. This proves it has not drifted from the entries it summarises.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MoneyError::Overflow`] if the recomputation overflows.
+    pub fn verify_balances(&self) -> Result<bool, MoneyError> {
+        let mut recomputed = TrialBalance::new();
+        for entry in &self.entries {
+            for posting in entry.postings() {
+                recomputed.apply(posting)?;
+            }
+        }
+        Ok(recomputed == self.balances)
+    }
+
     /// Currencies present in the journal, in deterministic order.
-    pub fn currencies(&self) -> Result<Vec<Currency>, MoneyError> {
-        Ok(self.trial_balance(None)?.currencies())
+    #[must_use]
+    pub fn currencies(&self) -> Vec<Currency> {
+        self.balances.currencies()
+    }
+
+    /// Folds every entry booked on or before `end` into a trial balance.
+    ///
+    /// This is what a period's *closing* balance means: cumulative through the
+    /// period's last day. Folding the whole journal instead would pull in
+    /// entries booked into later periods, which is wrong whenever a period is
+    /// sealed after the next one has begun — the normal case.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MoneyError::Overflow`] if accumulating overflows.
+    pub fn trial_balance_through_date(&self, end: Date) -> Result<TrialBalance<P>, MoneyError> {
+        let mut tb = TrialBalance::new();
+        for entry in self.entries.iter().filter(|e| e.booking_date() <= end) {
+            for posting in entry.postings() {
+                tb.apply(posting)?;
+            }
+        }
+        Ok(tb)
     }
 
     // ── statements ──────────────────────────────────────────────────────────
@@ -448,31 +837,27 @@ impl<const P: u8> Journal<P> {
     ///
     /// This is the account statement a reader actually wants: a trial balance
     /// says where an account ended up, and says nothing about how it got there.
-    pub fn statement(
-        &self,
-        key: &BalanceKey,
-    ) -> Result<Vec<crate::storage::StatementLine<P>>, MoneyError> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MoneyError::Overflow`] if the running balance overflows.
+    pub fn statement(&self, key: &BalanceKey) -> Result<Vec<StatementLine<P>>, MoneyError> {
         let mut running = Balance::ZERO;
         let mut out = Vec::new();
-        for (i, entry) in self.entries.iter().enumerate() {
-            for (index, posting) in entry.postings().iter().enumerate() {
-                if posting.account != key.account
-                    || posting.currency != key.currency
-                    || posting.layer != key.layer
-                {
-                    continue;
-                }
-                running.add(posting.direction, posting.amount)?;
-                out.push(crate::storage::StatementLine {
-                    index: LogIndex(i as u64),
-                    posting: PostingRef::new(entry.id(), u16::try_from(index).unwrap_or(u16::MAX)),
-                    booking_date: entry.booking_date(),
-                    direction: posting.direction,
-                    amount: posting.amount,
-                    running,
-                    kind: entry.kind().cloned(),
-                });
-            }
+        for site in self.sites.get(key).into_iter().flatten() {
+            let Some((entry, posting)) = self.resolve(*site) else {
+                continue;
+            };
+            running.add(posting.direction, posting.amount)?;
+            out.push(StatementLine {
+                index: site.index,
+                posting: PostingRef::new(entry.id(), site.posting),
+                booking_date: entry.booking_date(),
+                direction: posting.direction,
+                amount: posting.amount,
+                running,
+                kind: entry.kind().cloned(),
+            });
         }
         Ok(out)
     }
@@ -480,26 +865,48 @@ impl<const P: u8> Journal<P> {
     /// References to every posting on `key`, in log order.
     #[must_use]
     pub fn postings_on(&self, key: &BalanceKey) -> Vec<PostingRef> {
-        let mut out = Vec::new();
-        for entry in &self.entries {
-            for (index, posting) in entry.postings().iter().enumerate() {
-                if posting.account == key.account
-                    && posting.currency == key.currency
-                    && posting.layer == key.layer
-                {
-                    out.push(PostingRef::new(
-                        entry.id(),
-                        u16::try_from(index).unwrap_or(u16::MAX),
-                    ));
-                }
-            }
-        }
-        out
+        self.sites
+            .get(key)
+            .into_iter()
+            .flatten()
+            .filter_map(|site| {
+                self.at(site.index)
+                    .map(|entry| PostingRef::new(entry.id(), site.posting))
+            })
+            .collect()
+    }
+
+    fn resolve(&self, site: Site) -> Option<(&Entry<Balanced, P>, &Posting<P>)> {
+        let entry = self.at(site.index)?;
+        let posting = entry.postings().get(usize::from(site.posting))?;
+        Some((entry, posting))
+    }
+
+    fn entries_through(&self, limit: LogIndex) -> impl Iterator<Item = &Entry<Balanced, P>> {
+        let count = usize::try_from(limit.get().saturating_add(1)).unwrap_or(usize::MAX);
+        self.entries.iter().take(count)
+    }
+
+    fn postings_on_through(
+        &self,
+        key: &BalanceKey,
+        limit: Option<LogIndex>,
+    ) -> impl Iterator<Item = &Posting<P>> {
+        self.sites
+            .get(key)
+            .into_iter()
+            .flatten()
+            .take_while(move |site| limit.is_none_or(|l| site.index <= l))
+            .filter_map(|site| self.resolve(*site).map(|(_, posting)| posting))
     }
 
     // ── clearing ────────────────────────────────────────────────────────────
 
     /// Records that a set of postings offset one another.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClearingError`] when the clearing breaks one of its rules.
     pub fn clear(&mut self, clearing: Clearing<P>) -> Result<(), JournalError> {
         // Split the borrow: the register needs to read postings while mutating
         // its own state, so resolve against a snapshot of the entry index.
@@ -512,6 +919,10 @@ impl<const P: u8> Journal<P> {
     }
 
     /// Releases a clearing, reopening the items it had assigned.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClearingError`] when the clearing is unknown or already reset.
     pub fn reset_clearing(&mut self, id: ClearingId, on: Date) -> Result<(), JournalError> {
         self.clearings.reset(id, on)?;
         Ok(())
@@ -524,6 +935,11 @@ impl<const P: u8> Journal<P> {
     }
 
     /// Postings on `key` with something still outstanding.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClearingError`] if a recorded clearing references a posting
+    /// this journal does not hold, which would be a bug in this crate.
     pub fn open_items(&self, key: &BalanceKey) -> Result<Vec<OpenItem<P>>, JournalError> {
         let candidates = self.postings_on(key);
         let lookup = PostingIndex {
@@ -540,36 +956,18 @@ impl<const P: u8> Journal<P> {
     ///
     /// Entries are appended in recording order, not booking-date order, so a
     /// period's entries need not be contiguous — hence the separate count.
-    fn index_span(&self, start: Date, end: Date) -> (Option<u64>, Option<u64>, u64) {
-        let mut first = None;
-        let mut last = None;
-        let mut count = 0u64;
+    fn coverage(&self, start: Date, end: Date) -> PeriodCoverage {
+        let mut coverage = PeriodCoverage::EMPTY;
         for (i, entry) in self.entries.iter().enumerate() {
             let date = entry.booking_date();
             if date >= start && date <= end {
                 let index = i as u64;
-                first.get_or_insert(index);
-                last = Some(index);
-                count = count.saturating_add(1);
+                coverage.first_index.get_or_insert(index);
+                coverage.last_index = Some(index);
+                coverage.entry_count = coverage.entry_count.saturating_add(1);
             }
         }
-        (first, last, count)
-    }
-
-    /// Folds every entry booked on or before `end` into a trial balance.
-    ///
-    /// This is what a period's *closing* balance means: cumulative through the
-    /// period's last day. Folding the whole journal instead would pull in
-    /// entries booked into later periods, which is wrong whenever a period is
-    /// sealed after the next one has begun — the normal case.
-    pub fn trial_balance_through_date(&self, end: Date) -> Result<TrialBalance<P>, MoneyError> {
-        let mut tb = TrialBalance::new();
-        for entry in self.entries.iter().filter(|e| e.booking_date() <= end) {
-            for posting in entry.postings() {
-                tb.apply(posting)?;
-            }
-        }
-        Ok(tb)
+        coverage
     }
 
     /// Seals a closing period, committing to its entries and closing balances.
@@ -578,14 +976,17 @@ impl<const P: u8> Journal<P> {
     /// postings is a separate, earlier decision, so that verification runs
     /// against a set that can no longer grow underneath it.
     ///
-    /// On success the calendar advances the period to [`PeriodState::Sealed`]
-    /// and the seal is appended to the chain.
-    pub fn seal_period(
-        &mut self,
-        period: &PeriodId,
-        calendar: &mut PeriodCalendar,
-    ) -> Result<Seal, JournalError> {
-        let Some(definition) = calendar.get(period) else {
+    /// On success the period advances to [`PeriodState::Sealed`] and the seal is
+    /// appended to the chain. The transition happens first, so a seal that the
+    /// chain refuses cannot leave a period marked sealed with nothing sealing it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JournalError::UnknownPeriod`] when the period is not defined,
+    /// [`JournalError::PeriodNotClosing`] when it is not ready, and
+    /// [`JournalError::Seal`] when the seal does not chain onto the last one.
+    pub fn seal_period(&mut self, period: &PeriodId) -> Result<Seal, JournalError> {
+        let Some(definition) = self.calendar.get(period) else {
             return Err(JournalError::UnknownPeriod {
                 period: period.clone(),
             });
@@ -596,36 +997,23 @@ impl<const P: u8> Journal<P> {
                 state: definition.state,
             });
         }
+        let (start, end) = (definition.start, definition.end);
 
-        let (first_index, last_index, entry_count) =
-            self.index_span(definition.start, definition.end);
-        let closing = self.trial_balance_through_date(definition.end)?;
+        let coverage = self.coverage(start, end);
+        let closing = self.trial_balance_through_date(end)?;
         let seal = Seal::build(
             self.ledger.clone(),
             period.clone(),
-            PeriodCoverage {
-                first_index,
-                last_index,
-                entry_count,
-            },
+            coverage,
             self.head(),
             &closing,
             self.seals.head(),
         );
 
+        // Chain first: a refused seal must leave the period exactly as it was.
         self.seals.push(seal.clone())?;
-        calendar
-            .transition(period, PeriodState::Sealed)
-            .map_err(|_| JournalError::UnknownPeriod {
-                period: period.clone(),
-            })?;
+        self.calendar.transition(period, PeriodState::Sealed)?;
         Ok(seal)
-    }
-
-    /// The ledger these books belong to.
-    #[must_use]
-    pub fn ledger(&self) -> &LedgerId {
-        &self.ledger
     }
 
     /// The chain of seals recorded so far.
@@ -635,6 +1023,10 @@ impl<const P: u8> Journal<P> {
     }
 
     /// Verifies every seal and every link between them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SealChainError`] naming the first seal that does not hold.
     pub fn verify_seals(&self) -> Result<(), SealChainError> {
         self.seals.verify()
     }
@@ -642,6 +1034,10 @@ impl<const P: u8> Journal<P> {
     // ── checkpoints and assertions ──────────────────────────────────────────
 
     /// Takes a checkpoint of one balance at the current log position.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MoneyError::Overflow`] if reading the balance overflows.
     pub fn checkpoint(&self, key: &BalanceKey) -> Result<Checkpoint<P>, MoneyError> {
         let through = self.entries.len().checked_sub(1).map(|i| i as u64);
         Ok(Checkpoint::new(
@@ -657,6 +1053,10 @@ impl<const P: u8> Journal<P> {
     /// Checks the tree head as well as the balance: a checkpoint that matches
     /// numerically but was taken against a different history is stale, and
     /// silently trusting it would carry a stale balance forward.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CheckpointError`] naming which of the three checks failed.
     pub fn verify_checkpoint(&self, checkpoint: &Checkpoint<P>) -> Result<(), CheckpointError> {
         if let Some(index) = checkpoint.through_index
             && index >= self.len() as u64
@@ -681,12 +1081,30 @@ impl<const P: u8> Journal<P> {
     }
 
     /// Evaluates a balance assertion against the journal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MoneyError::Overflow`] if reading the balance overflows.
     pub fn check_assertion(
         &self,
         assertion: &BalanceAssertion<P>,
     ) -> Result<AssertionOutcome<P>, MoneyError> {
         let actual = self.balance(&assertion.key, assertion.at.map(LogIndex))?;
         assertion.check(&actual)
+    }
+
+    /// Every account with its handle, for a backend to persist.
+    #[must_use]
+    pub fn account_records(&self) -> Vec<AccountRecord> {
+        self.accounts.records()
+    }
+}
+
+fn key_of<const P: u8>(posting: &Posting<P>) -> BalanceKey {
+    BalanceKey {
+        account: posting.account,
+        currency: posting.currency,
+        layer: posting.layer,
     }
 }
 
@@ -729,144 +1147,196 @@ fn is_inversion_of<const P: u8>(
 
 #[cfg(test)]
 mod tests {
-    /// The ledger these tests keep their books in.
-    fn test_ledger() -> LedgerId {
-        LedgerId::new("test-ledger").expect("valid")
-    }
-
     use super::*;
-    use crate::account::{AccountId, AccountRegistry};
-    use crate::entry::{Description, Draft, LedgerPolicy};
-    use crate::money::Amount;
-    use crate::period::PeriodCalendar;
+    use crate::account::AccountId;
+    use crate::entry::{Description, Draft};
+    use crate::money::{Amount, Currency};
+    use crate::posting::{Direction, Posting};
     use time::macros::date;
 
     type Eur = Amount<2>;
 
-    struct Fixture {
-        accounts: AccountRegistry,
-        calendar: PeriodCalendar,
-        policy: LedgerPolicy,
+    /// A journal with two accounts, ready to post to.
+    struct Books {
+        journal: Journal<2>,
         cash: AccountId,
         revenue: AccountId,
     }
 
-    impl Fixture {
+    impl Books {
         fn new() -> Self {
-            let mut accounts = AccountRegistry::new();
-            let cash = accounts
+            let mut journal = Journal::<2>::new(LedgerId::new("test-ledger").expect("valid"));
+            let cash = journal
+                .accounts_mut()
                 .register_path("Assets:Cash", date!(2026 - 01 - 01))
                 .expect("registers");
-            let revenue = accounts
+            let revenue = journal
+                .accounts_mut()
                 .register_path("Income:Sales", date!(2026 - 01 - 01))
                 .expect("registers");
             Self {
-                accounts,
-                calendar: PeriodCalendar::new(),
-                policy: LedgerPolicy::default(),
+                journal,
                 cash,
                 revenue,
             }
         }
 
-        fn ctx(&self) -> SealContext<'_> {
-            SealContext {
-                accounts: &self.accounts,
-                calendar: &self.calendar,
-                policy: &self.policy,
-            }
+        fn draft(&self, key: &[u8], minor: i64) -> Entry<Draft, 2> {
+            self.draft_on(key, minor, date!(2026 - 03 - 15))
         }
 
-        fn draft(&self, key: &[u8], minor: i64) -> Entry<Draft, 2> {
+        fn draft_on(&self, key: &[u8], minor: i64, on: Date) -> Entry<Draft, 2> {
             Entry::new(
                 EntryId::generate(),
                 IdempotencyKey::new(key.to_vec()).expect("valid"),
-                date!(2026 - 03 - 15),
+                on,
             )
             .debit(self.cash, Eur::from_minor(minor), Currency::EUR)
             .credit(self.revenue, Eur::from_minor(minor), Currency::EUR)
         }
 
         fn sealed(&self, key: &[u8], minor: i64) -> Entry<Balanced, 2> {
-            self.draft(key, minor).seal(&self.ctx()).expect("balances")
+            self.draft(key, minor)
+                .seal(&self.journal.context())
+                .expect("balances")
+        }
+
+        fn record(&mut self, key: &[u8], minor: i64) -> Recorded {
+            let draft = self.draft(key, minor);
+            self.journal.record(draft).expect("records")
+        }
+
+        fn cash_key(&self) -> BalanceKey {
+            BalanceKey {
+                account: self.cash,
+                currency: Currency::EUR,
+                layer: Layer::Settled,
+            }
+        }
+
+        fn march(&mut self) -> PeriodId {
+            let id = PeriodId::new("2026-03").expect("valid");
+            self.journal
+                .define_period(
+                    Period::new(id.clone(), date!(2026 - 03 - 01), date!(2026 - 03 - 31))
+                        .expect("valid range"),
+                )
+                .expect("defines");
+            id
         }
     }
 
+    // ── recording ───────────────────────────────────────────────────────────
+
     #[test]
     fn records_entries_in_order() {
-        let f = Fixture::new();
-        let mut j = Journal::<2>::new(test_ledger());
-        let a = j.record(f.sealed(b"a", 100)).expect("records");
-        let b = j.record(f.sealed(b"b", 200)).expect("records");
-        assert_eq!(a.index.expect("sequenced inline").get(), 0);
-        assert_eq!(b.index.expect("sequenced inline").get(), 1);
-        assert_eq!(j.len(), 2);
-        assert!(a.is_new && b.is_new);
+        let mut b = Books::new();
+        let first = b.record(b"a", 100);
+        let second = b.record(b"b", 200);
+        assert_eq!(first.index.expect("sequenced inline").get(), 0);
+        assert_eq!(second.index.expect("sequenced inline").get(), 1);
+        assert_eq!(b.journal.len(), 2);
+        assert!(first.is_new && second.is_new);
+    }
+
+    #[test]
+    fn a_draft_is_validated_against_the_journals_own_accounts() {
+        let mut b = Books::new();
+        let ghost = AccountId::from_index(999);
+        let bad = Entry::<Draft, 2>::new(
+            EntryId::generate(),
+            IdempotencyKey::new(b"ghost".to_vec()).expect("valid"),
+            date!(2026 - 03 - 15),
+        )
+        .debit(ghost, Eur::from_minor(10), Currency::EUR)
+        .credit(b.revenue, Eur::from_minor(10), Currency::EUR);
+
+        assert!(matches!(
+            b.journal.record(bad),
+            Err(JournalError::Invalid(_))
+        ));
+        assert!(b.journal.is_empty());
     }
 
     #[test]
     fn an_identical_resubmission_is_a_no_op() {
-        let f = Fixture::new();
-        let mut j = Journal::<2>::new(test_ledger());
-        let first = j.record(f.sealed(b"same-key", 100)).expect("records");
+        let mut b = Books::new();
+        let first = b.record(b"same-key", 100);
 
         // A different entry identifier, but the same logical transaction.
-        let replay = j.record(f.sealed(b"same-key", 100)).expect("replays");
+        let replay = b.record(b"same-key", 100);
         assert!(!replay.is_new);
         assert_eq!(replay.id, first.id);
         assert_eq!(replay.index, first.index);
-        assert_eq!(j.len(), 1, "a replay must not append");
+        assert_eq!(b.journal.len(), 1, "a replay must not append");
     }
 
     #[test]
     fn the_same_key_with_different_content_is_a_conflict() {
-        let f = Fixture::new();
-        let mut j = Journal::<2>::new(test_ledger());
-        j.record(f.sealed(b"key", 100)).expect("records");
-        let err = j
-            .record(f.sealed(b"key", 999))
-            .expect_err("must not overwrite");
+        let mut b = Books::new();
+        b.record(b"key", 100);
+        let draft = b.draft(b"key", 999);
+        let err = b.journal.record(draft).expect_err("must not overwrite");
         assert!(matches!(err, JournalError::IdempotencyConflict { .. }));
-        assert_eq!(j.len(), 1, "a conflict must not append");
+        assert_eq!(b.journal.len(), 1, "a conflict must not append");
     }
 
     #[test]
     fn duplicate_entry_ids_are_refused() {
-        let f = Fixture::new();
-        let mut j = Journal::<2>::new(test_ledger());
-        let entry = f.sealed(b"k1", 100);
+        let mut b = Books::new();
+        let entry = b.sealed(b"k1", 100);
         let id = entry.id();
-        j.record(entry).expect("records");
+        b.journal.record_validated(entry).expect("records");
 
         let clash = Entry::<Draft, 2>::new(
             id,
             IdempotencyKey::new(b"k2".to_vec()).expect("valid"),
             date!(2026 - 03 - 15),
         )
-        .debit(f.cash, Eur::from_minor(1), Currency::EUR)
-        .credit(f.revenue, Eur::from_minor(1), Currency::EUR)
-        .seal(&f.ctx())
-        .expect("balances");
+        .debit(b.cash, Eur::from_minor(1), Currency::EUR)
+        .credit(b.revenue, Eur::from_minor(1), Currency::EUR);
 
         assert!(matches!(
-            j.record(clash),
+            b.journal.record(clash),
             Err(JournalError::DuplicateId { .. })
         ));
     }
 
     #[test]
+    fn a_policy_applies_to_what_is_recorded_next() {
+        let mut b = Books::new();
+        b.record(b"before", 100);
+
+        b.journal = std::mem::replace(
+            &mut b.journal,
+            Journal::<2>::new(LedgerId::new("scratch").expect("valid")),
+        )
+        .with_policy(LedgerPolicy::permissive().in_currency(Currency::USD));
+
+        // What was already recorded stays readable …
+        assert_eq!(b.journal.len(), 1);
+        // … and the new rule applies to the next booking.
+        let draft = b.draft(b"after", 100);
+        assert!(matches!(
+            b.journal.record(draft),
+            Err(JournalError::Invalid(_))
+        ));
+    }
+
+    // ── proofs ──────────────────────────────────────────────────────────────
+
+    #[test]
     fn every_recorded_entry_can_be_proven_included() {
-        let f = Fixture::new();
-        let mut j = Journal::<2>::new(test_ledger());
+        let mut b = Books::new();
         for i in 0..12i64 {
-            let key = format!("k{i}");
-            j.record(f.sealed(key.as_bytes(), 100 + i))
-                .expect("records");
+            b.record(format!("k{i}").as_bytes(), 100 + i);
         }
-        let head = j.head();
-        for (i, entry) in j.entries().iter().enumerate() {
-            let index = LogIndex(i as u64);
-            let proof = j.prove_inclusion(index).expect("in range");
+        let head = b.journal.head();
+        for (i, entry) in b.journal.entries().iter().enumerate() {
+            let proof = b
+                .journal
+                .prove_inclusion(LogIndex(i as u64))
+                .expect("in range");
             assert!(
                 proof.verify(&entry.content_hash(), &head.root),
                 "entry {i} must be provably included"
@@ -876,80 +1346,86 @@ mod tests {
 
     #[test]
     fn growth_is_provably_append_only() {
-        let f = Fixture::new();
-        let mut j = Journal::<2>::new(test_ledger());
+        let mut b = Books::new();
         for i in 0..5i64 {
-            j.record(f.sealed(format!("a{i}").as_bytes(), 10 + i))
-                .expect("records");
+            b.record(format!("a{i}").as_bytes(), 10 + i);
         }
-        let early = j.head();
-
+        let early = b.journal.head();
         for i in 0..7i64 {
-            j.record(f.sealed(format!("b{i}").as_bytes(), 20 + i))
-                .expect("records");
+            b.record(format!("b{i}").as_bytes(), 20 + i);
         }
-        let later = j.head();
+        let later = b.journal.head();
 
-        let proof = j.prove_consistency(early.size).expect("in range");
+        let proof = b.journal.prove_consistency(early.size).expect("in range");
         assert!(proof.verify(&early.root, &later.root));
     }
 
     #[test]
+    fn a_historical_head_matches_the_log_as_it_stood() {
+        let mut b = Books::new();
+        b.record(b"a", 100);
+        let snapshot = b.journal.head();
+        b.record(b"b", 200);
+
+        let reconstructed = b.journal.head_at(snapshot.size).expect("in range");
+        assert_eq!(reconstructed, snapshot);
+        assert_ne!(b.journal.head(), snapshot);
+    }
+
+    // ── corrections ─────────────────────────────────────────────────────────
+
+    #[test]
     fn a_reversal_requires_a_known_original() {
-        let f = Fixture::new();
-        let mut j = Journal::<2>::new(test_ledger());
-        let orphan = f.sealed(b"orphan", 100);
+        let b = Books::new();
+        let orphan = b.sealed(b"orphan", 100);
         let reversal = orphan
             .reverse(
                 EntryId::generate(),
                 IdempotencyKey::new(b"rev".to_vec()).expect("valid"),
                 date!(2026 - 04 - 01),
             )
-            .seal(&f.ctx())
+            .seal(&b.journal.context())
             .expect("balances");
+        let mut journal = b.journal;
         assert!(matches!(
-            j.record(reversal),
+            journal.record_validated(reversal),
             Err(JournalError::UnknownOriginal { .. })
         ));
     }
 
     #[test]
     fn an_entry_can_only_be_reversed_once() {
-        let f = Fixture::new();
-        let mut j = Journal::<2>::new(test_ledger());
-        let original = f.sealed(b"orig", 100);
-        j.record(original.clone()).expect("records");
+        let mut b = Books::new();
+        let original = b.sealed(b"orig", 100);
+        b.journal
+            .record_validated(original.clone())
+            .expect("records");
 
-        let first = original
-            .reverse(
+        for (key, on) in [
+            (b"rev1".as_slice(), date!(2026 - 04 - 01)),
+            (b"rev2".as_slice(), date!(2026 - 04 - 02)),
+        ] {
+            let reversal = original.reverse(
                 EntryId::generate(),
-                IdempotencyKey::new(b"rev1".to_vec()).expect("valid"),
-                date!(2026 - 04 - 01),
-            )
-            .seal(&f.ctx())
-            .expect("balances");
-        j.record(first).expect("records the reversal");
-
-        let second = original
-            .reverse(
-                EntryId::generate(),
-                IdempotencyKey::new(b"rev2".to_vec()).expect("valid"),
-                date!(2026 - 04 - 02),
-            )
-            .seal(&f.ctx())
-            .expect("balances");
-        assert!(matches!(
-            j.record(second),
-            Err(JournalError::AlreadyReversed { .. })
-        ));
+                IdempotencyKey::new(key.to_vec()).expect("valid"),
+                on,
+            );
+            let outcome = b.journal.record(reversal);
+            if key == b"rev1" {
+                outcome.expect("the first reversal is accepted");
+            } else {
+                assert!(matches!(outcome, Err(JournalError::AlreadyReversed { .. })));
+            }
+        }
     }
 
     #[test]
     fn a_reversal_cannot_itself_be_reversed() {
-        let f = Fixture::new();
-        let mut j = Journal::<2>::new(test_ledger());
-        let original = f.sealed(b"orig", 100);
-        j.record(original.clone()).expect("records");
+        let mut b = Books::new();
+        let original = b.sealed(b"orig", 100);
+        b.journal
+            .record_validated(original.clone())
+            .expect("records");
 
         let reversal = original
             .reverse(
@@ -957,419 +1433,30 @@ mod tests {
                 IdempotencyKey::new(b"rev".to_vec()).expect("valid"),
                 date!(2026 - 04 - 01),
             )
-            .seal(&f.ctx())
+            .seal(&b.journal.context())
             .expect("balances");
         let reversal_id = reversal.id();
-        j.record(reversal.clone()).expect("records");
+        b.journal
+            .record_validated(reversal.clone())
+            .expect("records");
 
-        let double = reversal
-            .reverse(
-                EntryId::generate(),
-                IdempotencyKey::new(b"rev-rev".to_vec()).expect("valid"),
-                date!(2026 - 04 - 02),
-            )
-            .seal(&f.ctx())
-            .expect("balances");
+        let double = reversal.reverse(
+            EntryId::generate(),
+            IdempotencyKey::new(b"rev-rev".to_vec()).expect("valid"),
+            date!(2026 - 04 - 02),
+        );
         assert!(matches!(
-            j.record(double),
+            b.journal.record(double),
             Err(JournalError::ReversalOfReversal { id }) if id == reversal_id
         ));
     }
 
     #[test]
-    fn the_journal_always_balances() {
-        let f = Fixture::new();
-        let mut j = Journal::<2>::new(test_ledger());
-        for i in 0..6i64 {
-            j.record(f.sealed(format!("k{i}").as_bytes(), 10 + i))
-                .expect("records");
-        }
-        assert!(j.verify_balanced().expect("no overflow"));
-        assert!(j.verify_log());
-    }
-
-    #[test]
-    fn a_reversal_nets_the_original_out() {
-        let f = Fixture::new();
-        let mut j = Journal::<2>::new(test_ledger());
-        let original = f.sealed(b"orig", 4200);
-        j.record(original.clone()).expect("records");
-
-        let before = j
-            .balance(
-                &BalanceKey {
-                    account: f.cash,
-                    currency: Currency::EUR,
-                    layer: Layer::Settled,
-                },
-                None,
-            )
-            .expect("no overflow");
-        assert_eq!(before.debits, Eur::from_minor(4200));
-
-        let reversal = original
-            .reverse(
-                EntryId::generate(),
-                IdempotencyKey::new(b"rev".to_vec()).expect("valid"),
-                date!(2026 - 04 - 01),
-            )
-            .seal(&f.ctx())
-            .expect("balances");
-        j.record(reversal).expect("records");
-
-        let after = j
-            .balance(
-                &BalanceKey {
-                    account: f.cash,
-                    currency: Currency::EUR,
-                    layer: Layer::Settled,
-                },
-                None,
-            )
-            .expect("no overflow");
-
-        // Net is zero, but both gross totals survive: the reversal is visible.
-        assert_eq!(after.signed_net().expect("ok"), Eur::ZERO);
-        assert_eq!(after.debits, Eur::from_minor(4200));
-        assert_eq!(after.credits, Eur::from_minor(4200));
-    }
-
-    #[test]
-    fn a_prefix_fold_reconstructs_an_earlier_state() {
-        let f = Fixture::new();
-        let mut j = Journal::<2>::new(test_ledger());
-        j.record(f.sealed(b"a", 100)).expect("records");
-        j.record(f.sealed(b"b", 200)).expect("records");
-        j.record(f.sealed(b"c", 300)).expect("records");
-
-        let key = BalanceKey {
-            account: f.cash,
-            currency: Currency::EUR,
-            layer: Layer::Settled,
-        };
-        assert_eq!(
-            j.balance(&key, Some(LogIndex(0))).expect("ok").debits,
-            Eur::from_minor(100)
-        );
-        assert_eq!(
-            j.balance(&key, Some(LogIndex(1))).expect("ok").debits,
-            Eur::from_minor(300)
-        );
-        assert_eq!(
-            j.balance(&key, None).expect("ok").debits,
-            Eur::from_minor(600)
-        );
-    }
-
-    #[test]
-    fn a_historical_head_matches_the_log_as_it_stood() {
-        let f = Fixture::new();
-        let mut j = Journal::<2>::new(test_ledger());
-        j.record(f.sealed(b"a", 100)).expect("records");
-        let snapshot = j.head();
-        j.record(f.sealed(b"b", 200)).expect("records");
-
-        let reconstructed = j.head_at(snapshot.size).expect("in range");
-        assert_eq!(reconstructed, snapshot);
-        assert_ne!(j.head(), snapshot);
-    }
-
-    #[test]
-    fn seal_and_record_rejects_an_invalid_draft() {
-        let f = Fixture::new();
-        let mut j = Journal::<2>::new(test_ledger());
-        let bad = Entry::<Draft, 2>::new(
-            EntryId::generate(),
-            IdempotencyKey::new(b"bad".to_vec()).expect("valid"),
-            date!(2026 - 03 - 15),
-        )
-        .debit(f.cash, Eur::from_minor(100), Currency::EUR)
-        .credit(f.revenue, Eur::from_minor(99), Currency::EUR);
-
-        assert!(matches!(
-            j.seal_and_record(bad, &f.ctx()),
-            Err(JournalError::Invalid(_))
-        ));
-        assert!(j.is_empty());
-    }
-
-    fn march(calendar: &mut PeriodCalendar) -> PeriodId {
-        let id = PeriodId::new("2026-03").expect("valid");
-        calendar
-            .define(
-                crate::period::Period::new(
-                    id.clone(),
-                    date!(2026 - 03 - 01),
-                    date!(2026 - 03 - 31),
-                )
-                .expect("valid range"),
-            )
-            .expect("defines");
-        id
-    }
-
-    #[test]
-    fn sealing_requires_a_closing_period() {
-        let f = Fixture::new();
-        let mut j = Journal::<2>::new(test_ledger());
-        let mut calendar = PeriodCalendar::new();
-        let id = march(&mut calendar);
-        j.record(f.sealed(b"a", 100)).expect("records");
-
-        // Open is not enough: postings must be stopped before verification runs.
-        assert!(matches!(
-            j.seal_period(&id, &mut calendar),
-            Err(JournalError::PeriodNotClosing {
-                state: PeriodState::Open,
-                ..
-            })
-        ));
-
-        calendar.transition(&id, PeriodState::Closing).expect("ok");
-        let seal = j.seal_period(&id, &mut calendar).expect("seals");
-        assert!(seal.is_self_consistent());
-        assert_eq!(seal.entry_count, 1);
-        assert_eq!(
-            calendar.state_on(date!(2026 - 03 - 15)),
-            PeriodState::Sealed
-        );
-    }
-
-    #[test]
-    fn sealing_an_unknown_period_is_an_error() {
-        let mut j = Journal::<2>::new(test_ledger());
-        let mut calendar = PeriodCalendar::new();
-        let ghost = PeriodId::new("nope").expect("valid");
-        assert!(matches!(
-            j.seal_period(&ghost, &mut calendar),
-            Err(JournalError::UnknownPeriod { .. })
-        ));
-    }
-
-    #[test]
-    fn consecutive_seals_chain_and_verify() {
-        let f = Fixture::new();
-        let mut j = Journal::<2>::new(test_ledger());
-        let mut calendar = PeriodCalendar::new();
-
-        let march_id = march(&mut calendar);
-        j.record(f.sealed(b"a", 100)).expect("records");
-        calendar
-            .transition(&march_id, PeriodState::Closing)
-            .expect("ok");
-        let first = j.seal_period(&march_id, &mut calendar).expect("seals");
-
-        let april_id = PeriodId::new("2026-04").expect("valid");
-        calendar
-            .define(
-                crate::period::Period::new(
-                    april_id.clone(),
-                    date!(2026 - 04 - 01),
-                    date!(2026 - 04 - 30),
-                )
-                .expect("valid range"),
-            )
-            .expect("defines");
-        calendar
-            .transition(&april_id, PeriodState::Closing)
-            .expect("ok");
-        let second = j.seal_period(&april_id, &mut calendar).expect("seals");
-
-        assert_eq!(first.prev_seal, None);
-        assert_eq!(second.prev_seal, Some(first.seal_hash));
-        assert_eq!(j.seals().len(), 2);
-        assert!(j.verify_seals().is_ok());
-    }
-
-    #[test]
-    fn a_seal_excludes_entries_booked_into_later_periods() {
-        // Sealing March in April is the normal case; April must not leak into
-        // March's closing balance.
-        let f = Fixture::new();
-        let mut j = Journal::<2>::new(test_ledger());
-        let mut calendar = PeriodCalendar::new();
-        let id = march(&mut calendar);
-
-        j.record(f.sealed(b"march", 100)).expect("records");
-
-        let april = Entry::<Draft, 2>::new(
-            EntryId::generate(),
-            IdempotencyKey::new(b"april".to_vec()).expect("valid"),
-            date!(2026 - 04 - 10),
-        )
-        .debit(f.cash, Eur::from_minor(900), Currency::EUR)
-        .credit(f.revenue, Eur::from_minor(900), Currency::EUR)
-        .seal(&f.ctx())
-        .expect("balances");
-        j.record(april).expect("records");
-
-        calendar.transition(&id, PeriodState::Closing).expect("ok");
-        let seal = j.seal_period(&id, &mut calendar).expect("seals");
-
-        assert_eq!(seal.entry_count, 1, "only the March entry belongs to March");
-
-        let march_only = j
-            .trial_balance_through_date(date!(2026 - 03 - 31))
-            .expect("ok");
-        assert_eq!(
-            seal.trial_balance_root,
-            crate::seal::trial_balance_root(&march_only)
-        );
-        assert_ne!(
-            seal.trial_balance_root,
-            crate::seal::trial_balance_root(&j.trial_balance(None).expect("ok")),
-            "the whole-journal balance must not be what was sealed"
-        );
-    }
-
-    #[test]
-    fn a_seal_commits_to_the_balances_at_that_moment() {
-        let f = Fixture::new();
-        let mut j = Journal::<2>::new(test_ledger());
-        let mut calendar = PeriodCalendar::new();
-        let id = march(&mut calendar);
-
-        j.record(f.sealed(b"a", 100)).expect("records");
-        calendar.transition(&id, PeriodState::Closing).expect("ok");
-        let seal = j.seal_period(&id, &mut calendar).expect("seals");
-
-        // A later entry cannot retroactively change what the seal committed to.
-        let later = Entry::<Draft, 2>::new(
-            EntryId::generate(),
-            IdempotencyKey::new(b"later".to_vec()).expect("valid"),
-            date!(2026 - 04 - 05),
-        )
-        .debit(f.cash, Eur::from_minor(200), Currency::EUR)
-        .credit(f.revenue, Eur::from_minor(200), Currency::EUR)
-        .seal(&f.ctx())
-        .expect("balances");
-        j.record(later).expect("records");
-
-        let recomputed = crate::seal::trial_balance_root(&j.trial_balance(None).expect("ok"));
-        assert_ne!(recomputed, seal.trial_balance_root);
-        assert!(seal.is_self_consistent());
-    }
-
-    #[test]
-    fn a_checkpoint_round_trips_against_the_journal() {
-        let f = Fixture::new();
-        let mut j = Journal::<2>::new(test_ledger());
-        j.record(f.sealed(b"a", 100)).expect("records");
-        j.record(f.sealed(b"b", 250)).expect("records");
-
-        let key = BalanceKey {
-            account: f.cash,
-            currency: Currency::EUR,
-            layer: Layer::Settled,
-        };
-        let cp = j.checkpoint(&key).expect("no overflow");
-        assert_eq!(cp.balance.debits, Eur::from_minor(350));
-        assert!(j.verify_checkpoint(&cp).is_ok());
-    }
-
-    #[test]
-    fn a_prefix_checkpoint_stays_valid_as_the_log_grows() {
-        let f = Fixture::new();
-        let mut j = Journal::<2>::new(test_ledger());
-        j.record(f.sealed(b"a", 100)).expect("records");
-
-        let key = BalanceKey {
-            account: f.cash,
-            currency: Currency::EUR,
-            layer: Layer::Settled,
-        };
-        let stale = j.checkpoint(&key).expect("ok");
-
-        // The log grows. The checkpoint still describes a real prefix, and its
-        // pinned head lets it be re-derived exactly, so it remains valid.
-        j.record(f.sealed(b"b", 250)).expect("records");
-        assert!(j.verify_checkpoint(&stale).is_ok());
-
-        // A restated balance is caught.
-        let mut restated = stale;
-        restated.balance.debits = Eur::from_minor(9_999);
-        assert!(matches!(
-            j.verify_checkpoint(&restated),
-            Err(CheckpointError::BalanceMismatch)
-        ));
-
-        // So is a checkpoint claiming a history the log never had.
-        let mut forged = stale;
-        forged.tree_head.root = crate::Hash::from_bytes([0xabu8; 32]);
-        assert!(matches!(
-            j.verify_checkpoint(&forged),
-            Err(CheckpointError::HeadMismatch)
-        ));
-    }
-
-    #[test]
-    fn a_checkpoint_beyond_the_log_is_rejected() {
-        let f = Fixture::new();
-        let mut j = Journal::<2>::new(test_ledger());
-        j.record(f.sealed(b"a", 100)).expect("records");
-        let key = BalanceKey {
-            account: f.cash,
-            currency: Currency::EUR,
-            layer: Layer::Settled,
-        };
-        let mut cp = j.checkpoint(&key).expect("ok");
-        cp.through_index = Some(99);
-        assert!(matches!(
-            j.verify_checkpoint(&cp),
-            Err(CheckpointError::IndexOutOfRange { index: 99 })
-        ));
-    }
-
-    #[test]
-    fn balance_assertions_catch_divergence() {
-        let f = Fixture::new();
-        let mut j = Journal::<2>::new(test_ledger());
-        j.record(f.sealed(b"a", 100)).expect("records");
-        j.record(f.sealed(b"b", 250)).expect("records");
-
-        let key = BalanceKey {
-            account: f.cash,
-            currency: Currency::EUR,
-            layer: Layer::Settled,
-        };
-
-        let holds = BalanceAssertion::net(key, Eur::from_minor(350));
-        assert!(j.check_assertion(&holds).expect("ok").held());
-
-        let wrong = BalanceAssertion::net(key, Eur::from_minor(300));
-        let outcome = j.check_assertion(&wrong).expect("ok");
-        assert!(!outcome.held());
-        assert!(matches!(
-            outcome,
-            AssertionOutcome::Failed {
-                difference,
-                ..
-            } if difference == Eur::from_minor(50)
-        ));
-    }
-
-    #[test]
-    fn an_assertion_can_target_an_earlier_log_position() {
-        let f = Fixture::new();
-        let mut j = Journal::<2>::new(test_ledger());
-        j.record(f.sealed(b"a", 100)).expect("records");
-        j.record(f.sealed(b"b", 250)).expect("records");
-
-        let key = BalanceKey {
-            account: f.cash,
-            currency: Currency::EUR,
-            layer: Layer::Settled,
-        };
-        let earlier = BalanceAssertion::net(key, Eur::from_minor(100)).at_index(0);
-        assert!(j.check_assertion(&earlier).expect("ok").held());
-    }
-
-    #[test]
     fn an_entry_claiming_a_reversal_it_does_not_perform_is_refused() {
-        let f = Fixture::new();
-        let mut j = Journal::<2>::new(test_ledger());
-        let original = f.sealed(b"orig", 1000);
-        j.record(original.clone()).expect("records");
+        let mut b = Books::new();
+        let original = b.sealed(b"orig", 1000);
+        let original_id = original.id();
+        b.journal.record_validated(original).expect("records");
 
         // Names the original, but the postings do not invert it.
         let forged = Entry::<Draft, 2>::new(
@@ -1377,38 +1464,162 @@ mod tests {
             IdempotencyKey::new(b"forged".to_vec()).expect("valid"),
             date!(2026 - 04 - 01),
         )
-        .reversing(original.id(), original.booking_date())
-        .debit(f.revenue, Eur::from_minor(1), Currency::EUR)
-        .credit(f.cash, Eur::from_minor(1), Currency::EUR)
-        .seal(&f.ctx())
-        .expect("balances on its own");
+        .reversing(original_id, date!(2026 - 03 - 15))
+        .debit(b.revenue, Eur::from_minor(1), Currency::EUR)
+        .credit(b.cash, Eur::from_minor(1), Currency::EUR);
 
         assert!(matches!(
-            j.record(forged),
+            b.journal.record(forged),
             Err(JournalError::NotAnInversion { .. })
         ));
-        assert_eq!(j.reversal_of(original.id()), None, "must stay unreversed");
-        assert_eq!(j.len(), 1);
+        assert_eq!(b.journal.reversal_of(original_id), None, "stays unreversed");
+        assert_eq!(b.journal.len(), 1);
     }
 
     #[test]
-    fn a_statement_shows_movements_and_the_running_balance() {
-        let f = Fixture::new();
-        let mut j = Journal::<2>::new(test_ledger());
-        j.record(f.sealed(b"a", 100)).expect("records");
-        j.record(f.sealed(b"b", 250)).expect("records");
+    fn a_reversal_nets_the_original_out() {
+        let mut b = Books::new();
+        let original = b.sealed(b"orig", 4200);
+        b.journal
+            .record_validated(original.clone())
+            .expect("records");
 
-        let key = BalanceKey {
-            account: f.cash,
-            currency: Currency::EUR,
-            layer: Layer::Settled,
-        };
-        let lines = j.statement(&key).expect("no overflow");
+        let key = b.cash_key();
+        assert_eq!(
+            b.journal.balance(&key, None).expect("no overflow").debits,
+            Eur::from_minor(4200)
+        );
+
+        let reversal = original.reverse(
+            EntryId::generate(),
+            IdempotencyKey::new(b"rev".to_vec()).expect("valid"),
+            date!(2026 - 04 - 01),
+        );
+        b.journal.record(reversal).expect("records");
+
+        // Net is zero, but both gross totals survive: the reversal is visible.
+        let after = b.journal.balance(&key, None).expect("no overflow");
+        assert_eq!(after.signed_net().expect("ok"), Eur::ZERO);
+        assert_eq!(after.debits, Eur::from_minor(4200));
+        assert_eq!(after.credits, Eur::from_minor(4200));
+    }
+
+    #[test]
+    fn a_reversal_of_a_sealed_period_books_into_an_open_one() {
+        let mut b = Books::new();
+        let original = b.sealed(b"orig", 100);
+        b.journal
+            .record_validated(original.clone())
+            .expect("records");
+
+        let march = b.march();
+        b.journal
+            .transition_period(&march, PeriodState::Closing)
+            .expect("ok");
+        b.journal.seal_period(&march).expect("seals");
+
+        // Back into March: refused, because March no longer accepts postings.
+        let refused = original.reverse(
+            EntryId::generate(),
+            IdempotencyKey::new(b"r1".to_vec()).expect("valid"),
+            date!(2026 - 03 - 20),
+        );
+        assert!(matches!(
+            b.journal.record(refused),
+            Err(JournalError::Invalid(_))
+        ));
+
+        // Into April: accepted, and it still says which period it belongs to.
+        let accepted = original.reverse(
+            EntryId::generate(),
+            IdempotencyKey::new(b"r2".to_vec()).expect("valid"),
+            date!(2026 - 04 - 01),
+        );
+        let recorded = b.journal.record(accepted).expect("books into April");
+        let stored = b.journal.get(recorded.id).expect("recorded");
+        assert_eq!(stored.original_booking_date(), Some(date!(2026 - 03 - 15)));
+    }
+
+    // ── balances ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn the_journal_always_balances() {
+        let mut b = Books::new();
+        for i in 0..6i64 {
+            b.record(format!("k{i}").as_bytes(), 10 + i);
+        }
+        assert!(b.journal.verify_balanced().expect("no overflow"));
+        assert!(b.journal.verify_balances().expect("no overflow"));
+        assert!(b.journal.verify_log());
+    }
+
+    #[test]
+    fn maintained_balances_match_a_full_recomputation_at_every_size() {
+        // The incremental trial balance is derived state and has to be checked
+        // the same way the Merkle subtree stack is.
+        let mut b = Books::new();
+        for i in 0..40i64 {
+            b.record(format!("k{i}").as_bytes(), 1 + i);
+            assert!(
+                b.journal.verify_balances().expect("no overflow"),
+                "diverged after {i} entries"
+            );
+        }
+    }
+
+    #[test]
+    fn a_prefix_fold_reconstructs_an_earlier_state() {
+        let mut b = Books::new();
+        b.record(b"a", 100);
+        b.record(b"b", 200);
+        b.record(b"c", 300);
+
+        let key = b.cash_key();
+        for (through, expected) in [(Some(0u64), 100i64), (Some(1), 300), (Some(2), 600)] {
+            assert_eq!(
+                b.journal
+                    .balance(&key, through.map(LogIndex))
+                    .expect("ok")
+                    .debits,
+                Eur::from_minor(expected)
+            );
+        }
+        assert_eq!(
+            b.journal.balance(&key, None).expect("ok").debits,
+            Eur::from_minor(600)
+        );
+
+        // And the whole trial balance agrees with the per-key answer.
+        let tb = b.journal.trial_balance(Some(LogIndex(1))).expect("ok");
+        assert_eq!(tb.get_or_zero(&key).debits, Eur::from_minor(300));
+    }
+
+    #[test]
+    fn a_rejected_entry_leaves_the_balances_untouched() {
+        let mut b = Books::new();
+        b.record(b"a", 100);
+        let before = b.journal.trial_balance(None).expect("ok");
+
+        let draft = b.draft(b"a", 999);
+        assert!(b.journal.record(draft).is_err());
+        assert_eq!(before, b.journal.trial_balance(None).expect("ok"));
+        assert!(b.journal.verify_balances().expect("ok"));
+    }
+
+    // ── statements ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_statement_shows_movements_and_the_running_balance() {
+        let mut b = Books::new();
+        b.record(b"a", 100);
+        b.record(b"b", 250);
+
+        let lines = b.journal.statement(&b.cash_key()).expect("no overflow");
         assert_eq!(lines.len(), 2);
 
         let first = lines.first().expect("present");
         assert_eq!(first.amount, Eur::from_minor(100));
-        assert_eq!(first.direction, crate::posting::Direction::Debit);
+        assert_eq!(first.direction, Direction::Debit);
         assert_eq!(first.running.debits, Eur::from_minor(100));
 
         let second = lines.get(1).expect("present");
@@ -1418,149 +1629,500 @@ mod tests {
 
     #[test]
     fn a_statement_ignores_other_accounts_and_layers() {
-        let f = Fixture::new();
-        let mut j = Journal::<2>::new(test_ledger());
-        j.record(f.sealed(b"a", 100)).expect("records");
+        let mut b = Books::new();
+        b.record(b"a", 100);
 
         let pending = Entry::<Draft, 2>::new(
             EntryId::generate(),
             IdempotencyKey::new(b"p".to_vec()).expect("valid"),
             date!(2026 - 03 - 16),
         )
+        .post(Posting::debit(b.cash, Eur::from_minor(500), Currency::EUR).in_layer(Layer::Pending))
         .post(
-            crate::posting::Posting::debit(f.cash, Eur::from_minor(500), Currency::EUR)
+            Posting::credit(b.revenue, Eur::from_minor(500), Currency::EUR)
                 .in_layer(Layer::Pending),
-        )
-        .post(
-            crate::posting::Posting::credit(f.revenue, Eur::from_minor(500), Currency::EUR)
-                .in_layer(Layer::Pending),
-        )
-        .seal(&f.ctx())
-        .expect("balances");
-        j.record(pending).expect("records");
+        );
+        b.journal.record(pending).expect("records");
 
-        let settled = BalanceKey {
-            account: f.cash,
-            currency: Currency::EUR,
-            layer: Layer::Settled,
-        };
-        assert_eq!(j.statement(&settled).expect("ok").len(), 1);
+        let settled = b.cash_key();
+        assert_eq!(b.journal.statement(&settled).expect("ok").len(), 1);
 
         let reserved = BalanceKey {
             layer: Layer::Pending,
             ..settled
         };
-        assert_eq!(j.statement(&reserved).expect("ok").len(), 1);
-    }
-
-    #[test]
-    fn open_items_track_invoices_against_payments() {
-        let f = Fixture::new();
-        let mut j = Journal::<2>::new(test_ledger());
-
-        // An invoice raises a receivable; a payment settles part of it.
-        let invoice = f.sealed(b"invoice", 1000);
-        j.record(invoice.clone()).expect("records");
-
-        let payment = Entry::<Draft, 2>::new(
-            EntryId::generate(),
-            IdempotencyKey::new(b"payment".to_vec()).expect("valid"),
-            date!(2026 - 03 - 20),
-        )
-        .credit(f.cash, Eur::from_minor(400), Currency::EUR)
-        .debit(f.revenue, Eur::from_minor(400), Currency::EUR)
-        .seal(&f.ctx())
-        .expect("balances");
-        let payment_id = payment.id();
-        j.record(payment).expect("records");
-
-        let key = BalanceKey {
-            account: f.cash,
-            currency: Currency::EUR,
-            layer: Layer::Settled,
-        };
-
-        // Before clearing, both postings are open.
-        assert_eq!(j.open_items(&key).expect("ok").len(), 2);
-
-        j.clear(crate::clearing::Clearing {
-            id: crate::clearing::ClearingId::generate(),
-            account: f.cash,
-            currency: Currency::EUR,
-            cleared_on: date!(2026 - 03 - 20),
-            items: vec![
-                crate::clearing::ClearedItem {
-                    posting: crate::clearing::PostingRef::new(invoice.id(), 0),
-                    applied: Eur::from_minor(400),
-                },
-                crate::clearing::ClearedItem {
-                    posting: crate::clearing::PostingRef::new(payment_id, 0),
-                    applied: Eur::from_minor(400),
-                },
-            ],
-        })
-        .expect("clears");
-
-        // The payment is fully applied; the invoice keeps its remainder open.
-        let open = j.open_items(&key).expect("ok");
-        assert_eq!(open.len(), 1);
-        let item = open.first().expect("present");
-        assert_eq!(item.residual, Eur::from_minor(600));
-        assert_eq!(j.clearings().len(), 1);
-    }
-
-    #[test]
-    fn clearing_does_not_change_any_balance() {
-        let f = Fixture::new();
-        let mut j = Journal::<2>::new(test_ledger());
-        let invoice = f.sealed(b"invoice", 1000);
-        j.record(invoice.clone()).expect("records");
-        let payment = Entry::<Draft, 2>::new(
-            EntryId::generate(),
-            IdempotencyKey::new(b"payment".to_vec()).expect("valid"),
-            date!(2026 - 03 - 20),
-        )
-        .credit(f.cash, Eur::from_minor(1000), Currency::EUR)
-        .debit(f.revenue, Eur::from_minor(1000), Currency::EUR)
-        .seal(&f.ctx())
-        .expect("balances");
-        let payment_id = payment.id();
-        j.record(payment).expect("records");
-
-        let before = j.trial_balance(None).expect("ok");
-        j.clear(crate::clearing::Clearing {
-            id: crate::clearing::ClearingId::generate(),
-            account: f.cash,
-            currency: Currency::EUR,
-            cleared_on: date!(2026 - 03 - 20),
-            items: vec![
-                crate::clearing::ClearedItem {
-                    posting: crate::clearing::PostingRef::new(invoice.id(), 0),
-                    applied: Eur::from_minor(1000),
-                },
-                crate::clearing::ClearedItem {
-                    posting: crate::clearing::PostingRef::new(payment_id, 0),
-                    applied: Eur::from_minor(1000),
-                },
-            ],
-        })
-        .expect("clears");
-
-        // Clearing is an assignment, not a movement.
-        assert_eq!(before, j.trial_balance(None).expect("ok"));
-        assert!(j.verify_log());
+        assert_eq!(b.journal.statement(&reserved).expect("ok").len(), 1);
+        assert_eq!(
+            b.journal.balance(&reserved, None).expect("ok").debits,
+            Eur::from_minor(500)
+        );
     }
 
     #[test]
     fn description_does_not_affect_ordering_or_balance() {
-        let f = Fixture::new();
-        let mut j = Journal::<2>::new(test_ledger());
-        let entry = f
+        let mut b = Books::new();
+        let entry = b
             .draft(b"k", 500)
-            .with_description(Description::new("annotated").expect("valid"))
-            .seal(&f.ctx())
+            .with_description(Description::new("annotated").expect("valid"));
+        b.journal.record(entry).expect("records");
+        assert!(b.journal.verify_balanced().expect("ok"));
+    }
+
+    // ── clearing ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn open_items_track_invoices_against_payments() {
+        let mut b = Books::new();
+
+        // An invoice raises a receivable; a payment settles part of it.
+        let invoice = b.record(b"invoice", 1000);
+
+        let payment = Entry::<Draft, 2>::new(
+            EntryId::generate(),
+            IdempotencyKey::new(b"payment".to_vec()).expect("valid"),
+            date!(2026 - 03 - 20),
+        )
+        .credit(b.cash, Eur::from_minor(400), Currency::EUR)
+        .debit(b.revenue, Eur::from_minor(400), Currency::EUR);
+        let payment = b.journal.record(payment).expect("records");
+
+        let key = b.cash_key();
+
+        // Before clearing, both postings are open.
+        assert_eq!(b.journal.open_items(&key).expect("ok").len(), 2);
+
+        b.journal
+            .clear(
+                Clearing::new(ClearingId::generate(), key, date!(2026 - 03 - 20))
+                    .apply(PostingRef::new(invoice.id, 0), Eur::from_minor(400))
+                    .apply(PostingRef::new(payment.id, 0), Eur::from_minor(400)),
+            )
+            .expect("clears");
+
+        // The payment is fully applied; the invoice keeps its remainder open.
+        let open = b.journal.open_items(&key).expect("ok");
+        assert_eq!(open.len(), 1);
+        assert_eq!(
+            open.first().expect("present").residual,
+            Eur::from_minor(600)
+        );
+        assert_eq!(b.journal.clearings().len(), 1);
+    }
+
+    #[test]
+    fn clearing_does_not_change_any_balance() {
+        let mut b = Books::new();
+        let invoice = b.record(b"invoice", 1000);
+        let payment = Entry::<Draft, 2>::new(
+            EntryId::generate(),
+            IdempotencyKey::new(b"payment".to_vec()).expect("valid"),
+            date!(2026 - 03 - 20),
+        )
+        .credit(b.cash, Eur::from_minor(1000), Currency::EUR)
+        .debit(b.revenue, Eur::from_minor(1000), Currency::EUR);
+        let payment = b.journal.record(payment).expect("records");
+
+        let before = b.journal.trial_balance(None).expect("ok");
+        b.journal
+            .clear(
+                Clearing::new(ClearingId::generate(), b.cash_key(), date!(2026 - 03 - 20))
+                    .apply(PostingRef::new(invoice.id, 0), Eur::from_minor(1000))
+                    .apply(PostingRef::new(payment.id, 0), Eur::from_minor(1000)),
+            )
+            .expect("clears");
+
+        // Clearing is an assignment, not a movement.
+        assert_eq!(before, b.journal.trial_balance(None).expect("ok"));
+        assert!(b.journal.verify_log());
+    }
+
+    #[test]
+    fn a_clearing_cannot_cross_layers() {
+        let mut b = Books::new();
+        let settled = b.record(b"settled", 500);
+        let reserved = Entry::<Draft, 2>::new(
+            EntryId::generate(),
+            IdempotencyKey::new(b"reserved".to_vec()).expect("valid"),
+            date!(2026 - 03 - 16),
+        )
+        .post(Posting::credit(b.cash, Eur::from_minor(500), Currency::EUR).in_layer(Layer::Pending))
+        .post(
+            Posting::debit(b.revenue, Eur::from_minor(500), Currency::EUR).in_layer(Layer::Pending),
+        );
+        let reserved = b.journal.record(reserved).expect("records");
+
+        let attempt = Clearing::new(ClearingId::generate(), b.cash_key(), date!(2026 - 03 - 20))
+            .apply(PostingRef::new(settled.id, 0), Eur::from_minor(500))
+            .apply(PostingRef::new(reserved.id, 0), Eur::from_minor(500));
+        assert!(matches!(
+            b.journal.clear(attempt),
+            Err(JournalError::Clearing(ClearingError::WrongLayer { .. }))
+        ));
+    }
+
+    // ── periods and seals ───────────────────────────────────────────────────
+
+    #[test]
+    fn sealing_requires_a_closing_period() {
+        let mut b = Books::new();
+        let id = b.march();
+        b.record(b"a", 100);
+
+        // Open is not enough: postings must be stopped before verification runs.
+        assert!(matches!(
+            b.journal.seal_period(&id),
+            Err(JournalError::PeriodNotClosing {
+                state: PeriodState::Open,
+                ..
+            })
+        ));
+
+        b.journal
+            .transition_period(&id, PeriodState::Closing)
+            .expect("ok");
+        let seal = b.journal.seal_period(&id).expect("seals");
+        assert!(seal.is_self_consistent());
+        assert_eq!(seal.entry_count, 1);
+        assert_eq!(
+            b.journal.calendar().state_on(date!(2026 - 03 - 15)),
+            PeriodState::Sealed
+        );
+    }
+
+    #[test]
+    fn sealing_an_unknown_period_is_an_error() {
+        let mut b = Books::new();
+        let ghost = PeriodId::new("nope").expect("valid");
+        assert!(matches!(
+            b.journal.seal_period(&ghost),
+            Err(JournalError::UnknownPeriod { .. })
+        ));
+    }
+
+    #[test]
+    fn a_sealed_period_cannot_be_sealed_twice() {
+        let mut b = Books::new();
+        let id = b.march();
+        b.record(b"a", 100);
+        b.journal
+            .transition_period(&id, PeriodState::Closing)
+            .expect("ok");
+        b.journal.seal_period(&id).expect("seals");
+        assert!(matches!(
+            b.journal.seal_period(&id),
+            Err(JournalError::PeriodNotClosing {
+                state: PeriodState::Sealed,
+                ..
+            })
+        ));
+        assert_eq!(b.journal.seals().len(), 1);
+    }
+
+    #[test]
+    fn consecutive_seals_chain_and_verify() {
+        let mut b = Books::new();
+        let march_id = b.march();
+        b.record(b"a", 100);
+        b.journal
+            .transition_period(&march_id, PeriodState::Closing)
+            .expect("ok");
+        let first = b.journal.seal_period(&march_id).expect("seals");
+
+        let april_id = PeriodId::new("2026-04").expect("valid");
+        b.journal
+            .define_period(
+                Period::new(
+                    april_id.clone(),
+                    date!(2026 - 04 - 01),
+                    date!(2026 - 04 - 30),
+                )
+                .expect("valid range"),
+            )
+            .expect("defines");
+        b.journal
+            .transition_period(&april_id, PeriodState::Closing)
+            .expect("ok");
+        let second = b.journal.seal_period(&april_id).expect("seals");
+
+        assert_eq!(first.prev_seal, None);
+        assert_eq!(second.prev_seal, Some(first.seal_hash));
+        assert_eq!(b.journal.seals().len(), 2);
+        assert!(b.journal.verify_seals().is_ok());
+    }
+
+    #[test]
+    fn a_seal_excludes_entries_booked_into_later_periods() {
+        // Sealing March in April is the normal case; April must not leak into
+        // March's closing balance.
+        let mut b = Books::new();
+        let id = b.march();
+        b.record(b"march", 100);
+
+        let april = b.draft_on(b"april", 900, date!(2026 - 04 - 10));
+        b.journal.record(april).expect("records");
+
+        b.journal
+            .transition_period(&id, PeriodState::Closing)
+            .expect("ok");
+        let seal = b.journal.seal_period(&id).expect("seals");
+
+        assert_eq!(seal.entry_count, 1, "only the March entry belongs to March");
+
+        let march_only = b
+            .journal
+            .trial_balance_through_date(date!(2026 - 03 - 31))
+            .expect("ok");
+        assert_eq!(
+            seal.trial_balance_root,
+            crate::seal::trial_balance_root(&march_only)
+        );
+        assert_ne!(
+            seal.trial_balance_root,
+            crate::seal::trial_balance_root(&b.journal.trial_balance(None).expect("ok")),
+            "the whole-journal balance must not be what was sealed"
+        );
+    }
+
+    #[test]
+    fn a_seal_commits_to_the_balances_at_that_moment() {
+        let mut b = Books::new();
+        let id = b.march();
+        b.record(b"a", 100);
+        b.journal
+            .transition_period(&id, PeriodState::Closing)
+            .expect("ok");
+        let seal = b.journal.seal_period(&id).expect("seals");
+
+        // A later entry cannot retroactively change what the seal committed to.
+        let later = b.draft_on(b"later", 200, date!(2026 - 04 - 05));
+        b.journal.record(later).expect("records");
+
+        let recomputed =
+            crate::seal::trial_balance_root(&b.journal.trial_balance(None).expect("ok"));
+        assert_ne!(recomputed, seal.trial_balance_root);
+        assert!(seal.is_self_consistent());
+    }
+
+    #[test]
+    fn a_sealed_balance_can_be_proven_from_the_seal_alone() {
+        let mut b = Books::new();
+        let id = b.march();
+        b.record(b"a", 119_000);
+        b.journal
+            .transition_period(&id, PeriodState::Closing)
+            .expect("ok");
+        let seal = b.journal.seal_period(&id).expect("seals");
+
+        let closing = b
+            .journal
+            .trial_balance_through_date(date!(2026 - 03 - 31))
+            .expect("ok");
+        let proof = crate::seal::TrialBalanceCommitment::of(&closing)
+            .prove(&b.cash_key())
+            .expect("cash was posted to");
+        assert!(proof.verify_against(&seal));
+        assert_eq!(proof.balance.debits, Eur::from_minor(119_000));
+    }
+
+    // ── checkpoints and assertions ──────────────────────────────────────────
+
+    #[test]
+    fn a_checkpoint_round_trips_against_the_journal() {
+        let mut b = Books::new();
+        b.record(b"a", 100);
+        b.record(b"b", 250);
+
+        let cp = b.journal.checkpoint(&b.cash_key()).expect("no overflow");
+        assert_eq!(cp.balance.debits, Eur::from_minor(350));
+        assert!(b.journal.verify_checkpoint(&cp).is_ok());
+    }
+
+    #[test]
+    fn a_prefix_checkpoint_stays_valid_as_the_log_grows() {
+        let mut b = Books::new();
+        b.record(b"a", 100);
+        let stale = b.journal.checkpoint(&b.cash_key()).expect("ok");
+
+        // The log grows. The checkpoint still describes a real prefix, and its
+        // pinned head lets it be re-derived exactly, so it remains valid.
+        b.record(b"b", 250);
+        assert!(b.journal.verify_checkpoint(&stale).is_ok());
+
+        // A restated balance is caught.
+        let mut restated = stale;
+        restated.balance.debits = Eur::from_minor(9_999);
+        assert!(matches!(
+            b.journal.verify_checkpoint(&restated),
+            Err(CheckpointError::BalanceMismatch)
+        ));
+
+        // So is a checkpoint claiming a history the log never had.
+        let mut forged = stale;
+        forged.tree_head.root = crate::Hash::from_bytes([0xabu8; 32]);
+        assert!(matches!(
+            b.journal.verify_checkpoint(&forged),
+            Err(CheckpointError::HeadMismatch)
+        ));
+    }
+
+    #[test]
+    fn a_checkpoint_beyond_the_log_is_rejected() {
+        let mut b = Books::new();
+        b.record(b"a", 100);
+        let mut cp = b.journal.checkpoint(&b.cash_key()).expect("ok");
+        cp.through_index = Some(99);
+        assert!(matches!(
+            b.journal.verify_checkpoint(&cp),
+            Err(CheckpointError::IndexOutOfRange { index: 99 })
+        ));
+    }
+
+    #[test]
+    fn balance_assertions_catch_divergence() {
+        let mut b = Books::new();
+        b.record(b"a", 100);
+        b.record(b"b", 250);
+        let key = b.cash_key();
+
+        let holds = BalanceAssertion::net(key, Eur::from_minor(350));
+        assert!(b.journal.check_assertion(&holds).expect("ok").held());
+
+        let wrong = BalanceAssertion::net(key, Eur::from_minor(300));
+        let outcome = b.journal.check_assertion(&wrong).expect("ok");
+        assert!(!outcome.held());
+        assert!(matches!(
+            outcome,
+            AssertionOutcome::Failed { difference, .. } if difference == Eur::from_minor(50)
+        ));
+    }
+
+    #[test]
+    fn an_assertion_can_target_an_earlier_log_position() {
+        let mut b = Books::new();
+        b.record(b"a", 100);
+        b.record(b"b", 250);
+        let earlier = BalanceAssertion::net(b.cash_key(), Eur::from_minor(100)).at_index(0);
+        assert!(b.journal.check_assertion(&earlier).expect("ok").held());
+    }
+
+    #[test]
+    fn a_clearing_may_not_be_recorded_twice_under_one_identifier() {
+        let mut b = Books::new();
+        let invoice = b.record(b"invoice", 1000);
+        let payment = Entry::<Draft, 2>::new(
+            EntryId::generate(),
+            IdempotencyKey::new(b"payment".to_vec()).expect("valid"),
+            date!(2026 - 03 - 20),
+        )
+        .credit(b.cash, Eur::from_minor(1000), Currency::EUR)
+        .debit(b.revenue, Eur::from_minor(1000), Currency::EUR);
+        let payment = b.journal.record(payment).expect("records");
+
+        let id = ClearingId::generate();
+        let key = b.cash_key();
+        let build = || {
+            Clearing::new(id, key, date!(2026 - 03 - 20))
+                .apply(PostingRef::new(invoice.id, 0), Eur::from_minor(400))
+                .apply(PostingRef::new(payment.id, 0), Eur::from_minor(400))
+        };
+        b.journal.clear(build()).expect("clears");
+        assert!(matches!(
+            b.journal.clear(build()),
+            Err(JournalError::Clearing(ClearingError::DuplicateId { .. }))
+        ));
+    }
+
+    // ── batches ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_batch_lands_in_full_or_not_at_all() {
+        let mut b = Books::new();
+        b.record(b"existing", 100);
+        let before = b.journal.clone();
+
+        // The third entry reuses the second's key with different content.
+        let batch = vec![
+            b.sealed(b"batch-a", 100),
+            b.sealed(b"batch-b", 200),
+            b.sealed(b"batch-b", 300),
+        ];
+        assert!(matches!(
+            b.journal.record_batch(batch),
+            Err(JournalError::IdempotencyConflict { .. })
+        ));
+
+        // Byte-identical to how it started: index, keys, balances, tree head.
+        assert_eq!(b.journal.len(), before.len());
+        assert_eq!(b.journal.head(), before.head());
+        assert_eq!(
+            b.journal.trial_balance(None).expect("ok"),
+            before.trial_balance(None).expect("ok")
+        );
+        assert!(b.journal.verify_log());
+        assert!(b.journal.verify_balances().expect("ok"));
+        assert!(b.journal.statement(&b.cash_key()).expect("ok").len() == 1);
+    }
+
+    #[test]
+    fn rolling_back_a_batch_releases_its_keys_and_identifiers() {
+        let mut b = Books::new();
+        let good = b.sealed(b"reusable", 100);
+        let poison = b.sealed(b"poison", 200);
+        let clash = b.sealed(b"poison", 300);
+
+        assert!(
+            b.journal
+                .record_batch(vec![good.clone(), poison, clash])
+                .is_err()
+        );
+
+        // The rolled-back key and identifier are free again, so a corrected
+        // batch can reuse them.
+        b.journal
+            .record_batch(vec![good])
+            .expect("the key was released");
+        assert_eq!(b.journal.len(), 1);
+        assert!(b.journal.verify_log());
+    }
+
+    #[test]
+    fn rolling_back_a_batch_releases_a_reversal_link() {
+        let mut b = Books::new();
+        let original = b.sealed(b"orig", 100);
+        let original_id = original.id();
+        b.journal.record_validated(original.clone()).expect("ok");
+
+        let reversal = original
+            .reverse(
+                EntryId::generate(),
+                IdempotencyKey::new(b"rev".to_vec()).expect("valid"),
+                date!(2026 - 04 - 01),
+            )
+            .seal(&b.journal.context())
             .expect("balances");
-        j.record(entry).expect("records");
-        assert!(j.verify_balanced().expect("ok"));
+        let poison = b.sealed(b"orig", 999);
+
+        assert!(b.journal.record_batch(vec![reversal, poison]).is_err());
+        assert_eq!(
+            b.journal.reversal_of(original_id),
+            None,
+            "an undone reversal must not leave the original marked corrected"
+        );
+        assert_eq!(b.journal.len(), 1);
+    }
+
+    #[test]
+    fn a_replay_inside_a_batch_is_not_a_failure() {
+        let mut b = Books::new();
+        let first = b.record(b"a", 100);
+        let outcomes = b
+            .journal
+            .record_batch(vec![b.sealed(b"a", 100), b.sealed(b"c", 300)])
+            .expect("a replay is not a conflict");
+        assert_eq!(outcomes.len(), 2);
+        assert!(!outcomes[0].is_new);
+        assert_eq!(outcomes[0].id, first.id);
+        assert!(outcomes[1].is_new);
+        assert_eq!(b.journal.len(), 2);
     }
 }

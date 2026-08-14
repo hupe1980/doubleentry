@@ -15,7 +15,7 @@
 )]
 
 use doubleentry::account::AccountRegistry;
-use doubleentry::clearing::{ClearedItem, Clearing, ClearingId, PostingRef};
+use doubleentry::clearing::{Clearing, ClearingId, PostingRef};
 use doubleentry::entry::{Draft, LedgerPolicy, SealContext};
 use doubleentry::period::{LedgerId, Period, PeriodCalendar, PeriodId, PeriodState};
 use doubleentry::seal::{Seal, SealChain, SealChainError};
@@ -248,7 +248,7 @@ async fn the_stored_tree_head_matches_a_full_rebuild() {
 
 #[tokio::test]
 async fn sealing_a_period_excludes_later_entries() {
-    let mut h = Harness::start().await;
+    let h = Harness::start().await;
     h.store
         .append(&EntryBatch::single(h.entry_on(
             b"march",
@@ -267,56 +267,34 @@ async fn sealing_a_period_excludes_later_entries() {
         .expect("appends");
 
     let march = PeriodId::new("2026-03").expect("valid");
-    h.calendar
-        .define(
-            Period::new(march.clone(), date!(2026 - 03 - 01), date!(2026 - 03 - 31))
-                .expect("valid range"),
-        )
-        .expect("defines");
-    h.calendar
-        .transition(&march, PeriodState::Closing)
-        .expect("closes");
     h.store
         .define_period(
-            &march,
-            date!(2026 - 03 - 01),
-            date!(2026 - 03 - 31),
-            PeriodState::Closing,
+            &Period::new(march.clone(), date!(2026 - 03 - 01), date!(2026 - 03 - 31))
+                .expect("valid range"),
         )
         .await
         .expect("defines");
-
-    let seal = h
-        .store
-        .seal_period(&march, &mut h.calendar)
+    h.store
+        .transition_period(&march, PeriodState::Closing)
         .await
-        .expect("seals");
+        .expect("closes");
+
+    let seal = h.store.seal_period(&march).await.expect("seals");
 
     // Seal a second period so the chain has an order to get wrong.
     let april = PeriodId::new("2026-04").expect("valid");
-    h.calendar
-        .define(
-            Period::new(april.clone(), date!(2026 - 04 - 01), date!(2026 - 04 - 30))
-                .expect("valid range"),
-        )
-        .expect("defines");
-    h.calendar
-        .transition(&april, PeriodState::Closing)
-        .expect("closes");
     h.store
         .define_period(
-            &april,
-            date!(2026 - 04 - 01),
-            date!(2026 - 04 - 30),
-            PeriodState::Closing,
+            &Period::new(april.clone(), date!(2026 - 04 - 01), date!(2026 - 04 - 30))
+                .expect("valid range"),
         )
         .await
         .expect("defines");
-    let second = h
-        .store
-        .seal_period(&april, &mut h.calendar)
+    h.store
+        .transition_period(&april, PeriodState::Closing)
         .await
-        .expect("seals");
+        .expect("closes");
+    let second = h.store.seal_period(&april).await.expect("seals");
     assert_eq!(second.prev_seal, Some(seal.seal_hash));
 
     // Reading them back must reproduce the chain, and it must verify.
@@ -361,22 +339,11 @@ async fn open_items_track_partial_settlement() {
 
     let clearing_id = ClearingId::generate();
     h.store
-        .clear(Clearing {
-            id: clearing_id,
-            account: h.left,
-            currency: Currency::EUR,
-            cleared_on: date!(2026 - 03 - 20),
-            items: vec![
-                ClearedItem {
-                    posting: PostingRef::new(invoice_id, 0),
-                    applied: Eur::from_minor(400),
-                },
-                ClearedItem {
-                    posting: PostingRef::new(payment_id, 0),
-                    applied: Eur::from_minor(400),
-                },
-            ],
-        })
+        .clear(
+            Clearing::new(clearing_id, h.key(), date!(2026 - 03 - 20))
+                .apply(PostingRef::new(invoice_id, 0), Eur::from_minor(400))
+                .apply(PostingRef::new(payment_id, 0), Eur::from_minor(400)),
+        )
         .await
         .expect("clears");
 
@@ -549,30 +516,19 @@ async fn seal_one_period(h: &Harness, key: &[u8]) -> Seal {
         .append(&EntryBatch::single(h.entry(key, 5_00)))
         .await
         .expect("appends");
-    let mut calendar = PeriodCalendar::new();
     let period = PeriodId::new("2026-03").expect("valid");
-    calendar
-        .define(
-            Period::new(period.clone(), date!(2026 - 03 - 01), date!(2026 - 03 - 31))
-                .expect("valid"),
-        )
-        .expect("defines");
-    calendar
-        .transition(&period, PeriodState::Closing)
-        .expect("closes");
     h.store
         .define_period(
-            &period,
-            date!(2026 - 03 - 01),
-            date!(2026 - 03 - 31),
-            PeriodState::Closing,
+            &Period::new(period.clone(), date!(2026 - 03 - 01), date!(2026 - 03 - 31))
+                .expect("valid range"),
         )
         .await
         .expect("defines");
     h.store
-        .seal_period(&period, &mut calendar)
+        .transition_period(&period, PeriodState::Closing)
         .await
-        .expect("seals")
+        .expect("closes");
+    h.store.seal_period(&period).await.expect("seals")
 }
 
 /// A database remembers which ledger it holds, and refuses another one.

@@ -59,6 +59,32 @@ impl Hash {
         Ok(Self(out))
     }
 
+    /// Hashes `payload` under a caller-chosen domain separation tag.
+    ///
+    /// This is the same construction the engine uses for its own digests, with
+    /// the tag length-prefixed so `domain || payload` is unambiguous. It is
+    /// public because a caller needs it: [`DocumentRef::new`](crate::DocumentRef::new)
+    /// takes the content hash of a source document, and the alternative to
+    /// offering a construction is every caller inventing one — usually a bare
+    /// SHA-256 with no domain separation, which is exactly the mistake this
+    /// module exists to avoid.
+    ///
+    /// Pick a domain that names *your* document type, not this crate's. Tags
+    /// beginning `doubleentry/` are reserved for the engine, and reusing one
+    /// would let a document hash be mistaken for an entry hash.
+    ///
+    /// ```
+    /// # use doubleentry::{DocumentRef, Hash};
+    /// let pdf = b"%PDF-1.7 ...";
+    /// let document = DocumentRef::new("INV-2026-0001", Hash::digest(b"acme/invoice/v1", pdf))?;
+    /// assert!(document.is_verifiable());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    #[must_use]
+    pub fn digest(domain: &[u8], payload: &[u8]) -> Self {
+        tagged(domain, payload)
+    }
+
     /// Renders as a 64-character lowercase hex string.
     #[must_use]
     pub fn to_hex(&self) -> String {
@@ -147,6 +173,12 @@ pub(crate) mod tag {
     pub(crate) const ACCOUNT_BINDING_V1: &[u8] = b"doubleentry/accountbinding/v1";
 }
 
+/// The prefix every tag this crate uses starts with.
+///
+/// Callers of [`Hash::digest`] should stay out of this namespace so a document
+/// digest can never be mistaken for one of the engine's own.
+pub const RESERVED_DOMAIN_PREFIX: &[u8] = b"doubleentry/";
+
 /// Hashes `payload` under a domain separation `tag`.
 #[must_use]
 pub(crate) fn tagged(tag: &[u8], payload: &[u8]) -> Hash {
@@ -213,5 +245,32 @@ mod tests {
     fn tag_length_prefix_prevents_boundary_collision() {
         // Without the length prefix, ("ab", "c") and ("a", "bc") would collide.
         assert_ne!(tagged(b"ab", b"c"), tagged(b"a", b"bc"));
+    }
+
+    #[test]
+    fn the_public_digest_is_the_engines_own_construction() {
+        assert_eq!(
+            Hash::digest(b"acme/doc/v1", b"x"),
+            tagged(b"acme/doc/v1", b"x")
+        );
+    }
+
+    #[test]
+    fn every_engine_tag_lives_under_the_reserved_prefix() {
+        // A caller told to stay out of this namespace can only do so if the
+        // engine actually stays inside it.
+        for t in [
+            tag::ENTRY_V1,
+            tag::ACCOUNT_V1,
+            tag::SEAL_V1,
+            tag::TRIAL_BALANCE_V1,
+            tag::ACCOUNT_BINDING_V1,
+        ] {
+            assert!(
+                t.starts_with(RESERVED_DOMAIN_PREFIX),
+                "{:?} escapes the reserved prefix",
+                std::str::from_utf8(t)
+            );
+        }
     }
 }

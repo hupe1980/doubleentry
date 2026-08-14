@@ -33,10 +33,10 @@ use time::Date;
 use uuid::Uuid;
 
 use crate::account::AccountId;
-use crate::balance::Balance;
+use crate::balance::{Balance, BalanceKey};
 use crate::entry::EntryId;
 use crate::money::{Amount, Currency, MoneyError};
-use crate::posting::{Direction, Posting};
+use crate::posting::{Direction, Layer, Posting};
 
 /// A reference to one posting inside one entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -86,7 +86,7 @@ impl ClearingId {
     /// never calls it.
     #[must_use]
     pub fn generate() -> Self {
-        Self(Uuid::now_v7())
+        Self(Uuid::now_v7()) // purity-exempt: identity, not ledger state
     }
 }
 
@@ -107,6 +107,10 @@ pub struct ClearedItem<const P: u8> {
 }
 
 /// A record that a set of postings offset one another.
+///
+/// Scoped to one `(account, currency, layer)` — the same key a balance and an
+/// open-item list are reported against. Anything wider would let a clearing
+/// relate postings that never appear in the same statement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Clearing<const P: u8> {
@@ -116,10 +120,49 @@ pub struct Clearing<const P: u8> {
     pub account: AccountId,
     /// The currency the items are in.
     pub currency: Currency,
+    /// Whether settled movements or reservations are being cleared.
+    ///
+    /// A reservation and a settled payment are different claims on the same
+    /// account: netting one against the other would report an open item as
+    /// closed while the money had not moved. Both layers clear the same way;
+    /// they just do not clear against each other.
+    pub layer: Layer,
     /// The date the assignment was made.
     pub cleared_on: Date,
     /// The postings and the amounts applied to each.
     pub items: Vec<ClearedItem<P>>,
+}
+
+impl<const P: u8> Clearing<P> {
+    /// The balance key this clearing operates on.
+    #[must_use]
+    pub fn key(&self) -> BalanceKey {
+        BalanceKey {
+            account: self.account,
+            currency: self.currency,
+            layer: self.layer,
+        }
+    }
+
+    /// Starts a settled clearing on one account and currency.
+    #[must_use]
+    pub fn new(id: ClearingId, key: BalanceKey, cleared_on: Date) -> Self {
+        Self {
+            id,
+            account: key.account,
+            currency: key.currency,
+            layer: key.layer,
+            cleared_on,
+            items: Vec::new(),
+        }
+    }
+
+    /// Applies `applied` of `posting` in this clearing.
+    #[must_use]
+    pub fn apply(mut self, posting: PostingRef, applied: Amount<P>) -> Self {
+        self.items.push(ClearedItem { posting, applied });
+        self
+    }
 }
 
 /// Something that can resolve a [`PostingRef`] to the posting it names.
@@ -165,6 +208,14 @@ pub enum ClearingError {
         posting: PostingRef,
         /// The currency the clearing is for.
         expected: Currency,
+    },
+    /// A referenced posting is in a different layer.
+    #[error("posting {posting} is not in the {expected} layer")]
+    WrongLayer {
+        /// The offending reference.
+        posting: PostingRef,
+        /// The layer the clearing is for.
+        expected: Layer,
     },
     /// An applied amount was zero or negative.
     #[error("posting {posting} was applied a non-positive amount")]
@@ -354,6 +405,12 @@ impl<const P: u8> ClearingRegister<P> {
                     expected: clearing.currency,
                 });
             }
+            if posting.layer != clearing.layer {
+                return Err(ClearingError::WrongLayer {
+                    posting: item.posting,
+                    expected: clearing.layer,
+                });
+            }
 
             let residual = posting.amount.checked_sub(self.applied_to(item.posting))?;
             if item.applied > residual {
@@ -481,7 +538,6 @@ impl<const P: u8> ClearingRegister<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::posting::Layer;
     use time::macros::date;
 
     type Eur = Amount<2>;
@@ -521,20 +577,23 @@ mod tests {
         (Table { postings }, refs)
     }
 
-    fn clearing(items: &[(PostingRef, i64)]) -> Clearing<2> {
-        Clearing {
-            id: ClearingId::generate(),
+    fn key(layer: Layer) -> BalanceKey {
+        BalanceKey {
             account: account(),
             currency: Currency::EUR,
-            cleared_on: date!(2026 - 03 - 15),
-            items: items
-                .iter()
-                .map(|(posting, applied)| ClearedItem {
-                    posting: *posting,
-                    applied: Eur::from_minor(*applied),
-                })
-                .collect(),
+            layer,
         }
+    }
+
+    fn clearing(items: &[(PostingRef, i64)]) -> Clearing<2> {
+        clearing_in(Layer::Settled, items)
+    }
+
+    fn clearing_in(layer: Layer, items: &[(PostingRef, i64)]) -> Clearing<2> {
+        items.iter().fold(
+            Clearing::new(ClearingId::generate(), key(layer), date!(2026 - 03 - 15)),
+            |c, (posting, applied)| c.apply(*posting, Eur::from_minor(*applied)),
+        )
     }
 
     #[test]
@@ -798,14 +857,36 @@ mod tests {
     }
 
     #[test]
-    fn pending_postings_can_be_cleared_like_any_other() {
-        // The register is layer-agnostic; a reservation is cleared the same way.
+    fn reservations_clear_against_reservations() {
         let entry = EntryId::generate();
         let a = PostingRef::new(entry, 0);
         let b = PostingRef::new(entry, 1);
         let mut postings = BTreeMap::new();
+        for (reference, direction) in [(a, Direction::Debit), (b, Direction::Credit)] {
+            postings.insert(
+                reference,
+                Posting::new(account(), direction, Eur::from_minor(50), Currency::EUR)
+                    .in_layer(Layer::Pending),
+            );
+        }
+        let t = Table { postings };
+        let mut reg = ClearingRegister::<2>::new();
+        assert!(
+            reg.clear(clearing_in(Layer::Pending, &[(a, 50), (b, 50)]), &t)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_reservation_does_not_clear_against_a_settled_movement() {
+        // Netting the two would report an open item closed while the money had
+        // not moved.
+        let entry = EntryId::generate();
+        let reserved = PostingRef::new(entry, 0);
+        let settled = PostingRef::new(entry, 1);
+        let mut postings = BTreeMap::new();
         postings.insert(
-            a,
+            reserved,
             Posting::new(
                 account(),
                 Direction::Debit,
@@ -815,17 +896,22 @@ mod tests {
             .in_layer(Layer::Pending),
         );
         postings.insert(
-            b,
+            settled,
             Posting::new(
                 account(),
                 Direction::Credit,
                 Eur::from_minor(50),
                 Currency::EUR,
-            )
-            .in_layer(Layer::Pending),
+            ),
         );
         let t = Table { postings };
         let mut reg = ClearingRegister::<2>::new();
-        assert!(reg.clear(clearing(&[(a, 50), (b, 50)]), &t).is_ok());
+        assert!(matches!(
+            reg.clear(
+                clearing_in(Layer::Settled, &[(reserved, 50), (settled, 50)]),
+                &t
+            ),
+            Err(ClearingError::WrongLayer { .. })
+        ));
     }
 }

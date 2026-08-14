@@ -26,8 +26,8 @@ use doubleentry::storage::iceberg::{
 };
 use doubleentry::storage::{EntryBatch, LedgerStore, MemoryStore};
 use doubleentry::{
-    AccountId, ActivityId, Amount, Currency, Dimensions, Entry, EntryId, Hash, IdempotencyKey,
-    Posting, Provenance, Seal, SegmentId, TreeHead,
+    AccountId, Amount, Currency, Dimensions, Entry, EntryId, Hash, IdempotencyKey, Label, Posting,
+    Provenance, Seal, TreeHead,
 };
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
 use time::macros::date;
@@ -74,8 +74,16 @@ impl Fixture {
     /// something in every column worth checking.
     fn entry_on(&self, key: &[u8], minor: i64, on: time::Date) -> Entry<doubleentry::Balanced, 2> {
         let dims = Dimensions::none()
-            .with_activity(ActivityId::new("Network").expect("valid"))
-            .with_segment(SegmentId::new("Electricity").expect("valid"));
+            .with(
+                Label::new("activity").expect("valid"),
+                Label::new("Network").expect("valid"),
+            )
+            .expect("fits")
+            .with(
+                Label::new("segment").expect("valid"),
+                Label::new("Electricity").expect("valid"),
+            )
+            .expect("fits");
         Entry::<Draft, 2>::new(
             EntryId::generate(),
             IdempotencyKey::new(key.to_vec()).expect("valid"),
@@ -121,19 +129,18 @@ impl Fixture {
     /// Seals March, which covers everything recorded so far.
     async fn seal_march(&mut self) -> Seal {
         let id = PeriodId::new("2026-03").expect("valid");
-        self.calendar
-            .define(
-                Period::new(id.clone(), date!(2026 - 03 - 01), date!(2026 - 03 - 31))
+        self.store
+            .define_period(
+                &Period::new(id.clone(), date!(2026 - 03 - 01), date!(2026 - 03 - 31))
                     .expect("valid range"),
             )
-            .expect("defines");
-        self.calendar
-            .transition(&id, PeriodState::Closing)
-            .expect("closes");
-        self.store
-            .seal_period(&id, &mut self.calendar)
             .await
-            .expect("seals")
+            .expect("defines");
+        self.store
+            .transition_period(&id, PeriodState::Closing)
+            .await
+            .expect("closes");
+        self.store.seal_period(&id).await.expect("seals")
     }
 }
 
@@ -286,24 +293,22 @@ async fn successive_periods_append_rather_than_replace() {
     // refuses to back-date into it.
     f.fill_on(5, date!(2026 - 04 - 10), "april").await;
     let april_id = PeriodId::new("2026-04").expect("valid");
-    f.calendar
-        .define(
-            Period::new(
+    f.store
+        .define_period(
+            &Period::new(
                 april_id.clone(),
                 date!(2026 - 04 - 01),
                 date!(2026 - 04 - 30),
             )
             .expect("valid range"),
         )
-        .expect("defines");
-    f.calendar
-        .transition(&april_id, PeriodState::Closing)
-        .expect("closes");
-    let april = f
-        .store
-        .seal_period(&april_id, &mut f.calendar)
         .await
-        .expect("seals");
+        .expect("defines");
+    f.store
+        .transition_period(&april_id, PeriodState::Closing)
+        .await
+        .expect("closes");
+    let april = f.store.seal_period(&april_id).await.expect("seals");
 
     let second = cold
         .compact(&f.store, &april, &catalog)

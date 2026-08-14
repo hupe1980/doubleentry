@@ -453,18 +453,32 @@ impl AccountRegistry {
                 *count = count.saturating_add(1);
             }
         }
-        // A newly registered account may already have descendants.
-        let existing_children = self
-            .index
-            .keys()
-            .filter(|p| p.is_under(&path) && **p != path)
-            .count();
+        // A newly registered account may already have descendants. Paths sort
+        // segment-wise, so every descendant is contiguous with `path` in the
+        // index and the scan stops at the first non-descendant — rather than
+        // walking the whole registry once per registration.
+        let existing_children = self.descendant_range(&path).count();
 
         self.accounts.push(account);
         self.child_count
             .push(u32::try_from(existing_children).unwrap_or(u32::MAX));
         self.index.insert(path, id);
         Ok(id)
+    }
+
+    /// Every strict descendant of `prefix` already in the index, in path order.
+    ///
+    /// Relies on the segment-wise `Ord` on [`AccountPath`]: a path under
+    /// `prefix` sorts after `prefix` and before the first path that is not under
+    /// it, so the descendants form one contiguous run.
+    fn descendant_range<'a>(
+        &'a self,
+        prefix: &'a AccountPath,
+    ) -> impl Iterator<Item = (&'a AccountPath, &'a AccountId)> {
+        self.index
+            .range(prefix.clone()..)
+            .skip_while(move |(path, _)| *path == prefix)
+            .take_while(move |(path, _)| path.is_under(prefix))
     }
 
     /// Convenience registration from a path string.
@@ -554,6 +568,40 @@ impl AccountRegistry {
             .collect()
     }
 
+    /// Restores one stored binding, at the handle it was issued.
+    ///
+    /// For a backend rehydrating a registry one record at a time. Unlike
+    /// [`AccountRegistry::register`], which issues the next free handle, this
+    /// insists the record land where it says it belongs — a binding restored at
+    /// a different position would repoint every posting row that names it.
+    ///
+    /// Restoring a record that is already present, unchanged, is a no-op, so a
+    /// backend may replay its whole account table on start-up.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AccountError::NotDense`] when the handle is not the next one,
+    /// and [`AccountError::AlreadyRegistered`] when it is already held by a
+    /// different account.
+    pub fn restore(&mut self, record: AccountRecord) -> Result<(), AccountError> {
+        let next = u32::try_from(self.accounts.len()).unwrap_or(u32::MAX);
+        if let Some(existing) = self.get(record.id) {
+            if *existing == record.account {
+                return Ok(());
+            }
+            return Err(AccountError::AlreadyRegistered {
+                path: existing.path.clone(),
+            });
+        }
+        if record.id.index() != next {
+            return Err(AccountError::NotDense {
+                expected: next,
+                found: record.id.index(),
+            });
+        }
+        self.register(record.account).map(|_| ())
+    }
+
     /// Rebuilds a registry from stored bindings.
     ///
     /// Restores each account at the handle it was issued rather than reissuing
@@ -572,17 +620,8 @@ impl AccountRegistry {
         records.sort_by_key(|r| r.id.index());
 
         let mut registry = Self::new();
-        for (position, record) in records.into_iter().enumerate() {
-            let expected = u32::try_from(position).unwrap_or(u32::MAX);
-            if record.id.index() != expected {
-                return Err(AccountError::NotDense {
-                    expected,
-                    found: record.id.index(),
-                });
-            }
-            // Registration assigns the next position, which is `expected` by
-            // construction, so the handle is restored rather than reissued.
-            registry.register(record.account)?;
+        for record in records {
+            registry.restore(record)?;
         }
         Ok(registry)
     }
@@ -607,11 +646,14 @@ impl AccountRegistry {
     }
 
     /// Handles of every account at or below `prefix`, in path order.
+    ///
+    /// Includes `prefix` itself when it is registered, so this is the set a
+    /// rollup over that node covers.
     #[must_use]
     pub fn descendants_of(&self, prefix: &AccountPath) -> Vec<AccountId> {
         self.index
-            .iter()
-            .filter(|(path, _)| path.is_under(prefix))
+            .range(prefix.clone()..)
+            .take_while(|(path, _)| path.is_under(prefix))
             .map(|(_, id)| *id)
             .collect()
     }

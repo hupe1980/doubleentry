@@ -111,6 +111,24 @@ pub enum ProofError {
     },
 }
 
+/// Persisted accumulator state does not describe a log of the claimed size.
+///
+/// Separate from [`ProofError`] because it is not a proof failure: it means the
+/// rows a backend read back are not the rows it wrote.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "accumulator state is not a valid cover of {size} leaves: \
+     expected subtree heights {expected:?}, found {found:?}"
+)]
+pub struct MalformedAccumulator {
+    /// Number of leaves the state claims to summarise.
+    pub size: u64,
+    /// The heights a log of that size must decompose into, largest first.
+    pub expected: Vec<u8>,
+    /// The heights actually supplied.
+    pub found: Vec<u8>,
+}
+
 /// Proof that a leaf sits at a given index under a given root.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -258,13 +276,48 @@ impl MerkleAccumulator {
         Self::default()
     }
 
+    /// The subtree heights a log of `size` leaves must decompose into, largest
+    /// first — one per set bit, from the most significant down.
+    fn cover_of(size: u64) -> Vec<u8> {
+        (0..u64::BITS)
+            .rev()
+            .filter(|bit| size & (1u64 << bit) != 0)
+            .filter_map(|bit| u8::try_from(bit).ok())
+            .collect()
+    }
+
     /// Restores an accumulator from persisted state.
     ///
     /// `subtrees` must be ordered largest-height first, as
     /// [`MerkleAccumulator::subtrees`] returns them.
-    #[must_use]
-    pub fn from_parts(subtrees: Vec<(u8, Hash)>, size: u64) -> Self {
-        Self { subtrees, size }
+    ///
+    /// The shape is checked rather than trusted. A log of `size` leaves has
+    /// exactly one perfect-subtree decomposition — one subtree per set bit in
+    /// `size` — so a row lost, duplicated, reordered, or written against a
+    /// different size is a shape error, and this catches it. It cannot catch a
+    /// node whose *hash* is wrong; that is what [`MerkleLog::verify_incremental_state`]
+    /// is for, and what recording the root alongside each entry lets a backend
+    /// cross-check cheaply.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MalformedAccumulator`] when the heights supplied are not the
+    /// decomposition `size` requires.
+    pub fn try_from_parts(
+        subtrees: Vec<(u8, Hash)>,
+        size: u64,
+    ) -> Result<Self, MalformedAccumulator> {
+        let expected = Self::cover_of(size);
+        let found: Vec<u8> = subtrees.iter().map(|(height, _)| *height).collect();
+        if found == expected {
+            Ok(Self { subtrees, size })
+        } else {
+            Err(MalformedAccumulator {
+                size,
+                expected,
+                found,
+            })
+        }
     }
 
     /// The perfect-subtree roots, largest first.
@@ -403,6 +456,25 @@ impl MerkleLog {
     #[must_use]
     pub fn accumulator(&self) -> &MerkleAccumulator {
         &self.accumulator
+    }
+
+    /// Drops every leaf from `len` onward and rebuilds the subtree state.
+    ///
+    /// Deliberately not public: a log that can be shortened is not append-only.
+    /// It exists so an in-memory journal can undo a batch that turned out to be
+    /// unacceptable partway through — leaves that were never committed to
+    /// anything, because the batch never returned. `O(n)`, and only on that
+    /// path.
+    pub(crate) fn truncate(&mut self, len: u64) {
+        let len = usize::try_from(len).unwrap_or(usize::MAX);
+        if len >= self.leaves.len() {
+            return;
+        }
+        self.leaves.truncate(len);
+        self.accumulator = MerkleAccumulator::new();
+        for leaf in &self.leaves {
+            self.accumulator.push(*leaf);
+        }
     }
 
     /// The current Merkle Tree Hash.
@@ -723,7 +795,9 @@ mod tests {
         }
 
         // Round-trip through the representation a backend would store.
-        let restored = MerkleAccumulator::from_parts(original.subtrees().to_vec(), original.size());
+        let restored =
+            MerkleAccumulator::try_from_parts(original.subtrees().to_vec(), original.size())
+                .expect("well-formed");
         assert_eq!(restored.root(), original.root());
 
         // And it keeps accumulating correctly from there.
@@ -734,6 +808,52 @@ mod tests {
             b.push(payload(i));
         }
         assert_eq!(a.root(), b.root());
+    }
+
+    #[test]
+    fn restoring_an_accumulator_checks_its_shape() {
+        let mut original = MerkleAccumulator::new();
+        for i in 0..37u64 {
+            original.push(payload(i));
+        }
+        let parts = original.subtrees().to_vec();
+
+        // 37 = 0b100101, so the cover is heights [5, 2, 0] and nothing else.
+        assert_eq!(
+            parts.iter().map(|(h, _)| *h).collect::<Vec<_>>(),
+            vec![5, 2, 0]
+        );
+
+        // A row lost between the database and the process.
+        let mut short = parts.clone();
+        short.pop();
+        assert!(matches!(
+            MerkleAccumulator::try_from_parts(short, 37),
+            Err(MalformedAccumulator { size: 37, .. })
+        ));
+
+        // Rows returned in the wrong order — a missing ORDER BY.
+        let mut shuffled = parts.clone();
+        shuffled.reverse();
+        assert!(MerkleAccumulator::try_from_parts(shuffled, 37).is_err());
+
+        // The right rows against the wrong size.
+        assert!(MerkleAccumulator::try_from_parts(parts, 36).is_err());
+
+        // And the empty state is well-formed at size zero only.
+        assert!(MerkleAccumulator::try_from_parts(Vec::new(), 0).is_ok());
+        assert!(MerkleAccumulator::try_from_parts(Vec::new(), 1).is_err());
+    }
+
+    #[test]
+    fn a_restored_accumulator_is_checked_at_every_size() {
+        let mut acc = MerkleAccumulator::new();
+        for i in 0..200u64 {
+            acc.push(payload(i));
+            let restored = MerkleAccumulator::try_from_parts(acc.subtrees().to_vec(), acc.size())
+                .expect("its own state must round-trip");
+            assert_eq!(restored.root(), acc.root());
+        }
     }
 
     #[test]

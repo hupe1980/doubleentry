@@ -217,11 +217,6 @@ CREATE TABLE IF NOT EXISTS postings (
     -- 'settled' | 'pending'. Pending reserves without moving.
     layer           TEXT        NOT NULL,
 
-    dim_activity    TEXT,
-    dim_segment     TEXT,
-    dim_cost_object TEXT,
-    dim_party       TEXT,
-
     PRIMARY KEY (entry_id, posting_index),
     FOREIGN KEY (entry_id) REFERENCES entries (entry_id),
     FOREIGN KEY (account_index) REFERENCES accounts (account_index),
@@ -234,7 +229,27 @@ CREATE TABLE IF NOT EXISTS postings (
 
 CREATE INDEX IF NOT EXISTS postings_account
     ON postings (account_index, currency, layer, entry_id);
-CREATE INDEX IF NOT EXISTS postings_activity ON postings (dim_activity) WHERE dim_activity IS NOT NULL;
+
+-- ── posting dimensions ──────────────────────────────────────────────────────
+--
+-- One row per axis, rather than a column per axis. The engine ships no axis
+-- names, so a column set would have to be either this crate's guess at yours or
+-- a schema change every time a new one is needed. A child table is also the only
+-- shape that indexes: `WHERE axis = 'activity' AND value = 'Network'` is an
+-- index scan here and a full scan over a JSON blob.
+
+CREATE TABLE IF NOT EXISTS posting_dimensions (
+    entry_id        UUID        NOT NULL,
+    posting_index   SMALLINT    NOT NULL,
+    axis            TEXT        NOT NULL,
+    value           TEXT        NOT NULL,
+
+    PRIMARY KEY (entry_id, posting_index, axis),
+    FOREIGN KEY (entry_id, posting_index) REFERENCES postings (entry_id, posting_index)
+);
+
+CREATE INDEX IF NOT EXISTS posting_dimensions_lookup
+    ON posting_dimensions (axis, value);
 
 -- Defence in depth. The engine will not produce an unbalanced entry, but
 -- application-level and database-level enforcement fail independently, and this
@@ -324,7 +339,6 @@ CREATE TABLE IF NOT EXISTS seals (
 );
 
 -- Exactly one seal may lack a predecessor.
--- Exactly one seal may lack a predecessor.
 CREATE UNIQUE INDEX IF NOT EXISTS seals_single_genesis ON seals ((prev_seal IS NULL))
     WHERE prev_seal IS NULL;
 
@@ -337,13 +351,19 @@ CREATE TABLE IF NOT EXISTS clearings (
     clearing_id     UUID        NOT NULL,
     account_index   INTEGER     NOT NULL,
     currency        CHAR(3)     NOT NULL,
+    -- A clearing relates postings within one layer. A reservation and a settled
+    -- movement are different claims on the same account, and netting one
+    -- against the other would report an open item closed while the money had
+    -- not moved.
+    layer           TEXT        NOT NULL,
     cleared_on      DATE        NOT NULL,
     -- Set when released. The withdrawn assignment stays on file: an assignment
     -- made and taken back is itself part of the audit trail.
     reset_on        DATE,
 
     PRIMARY KEY (clearing_id),
-    FOREIGN KEY (account_index) REFERENCES accounts (account_index)
+    FOREIGN KEY (account_index) REFERENCES accounts (account_index),
+    CONSTRAINT clearings_layer CHECK (layer IN ('settled', 'pending'))
 );
 
 CREATE TABLE IF NOT EXISTS clearing_items (

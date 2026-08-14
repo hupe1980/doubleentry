@@ -156,23 +156,31 @@ impl<const P: u8> Amount<P> {
     /// one major unit.
     pub const MAX_PRECISION: u8 = 18;
     /// Zero.
-    pub const ZERO: Self = Self(0);
+    pub const ZERO: Self = Self::from_minor(0);
     /// The largest representable amount.
-    pub const MAX: Self = Self(i64::MAX);
+    pub const MAX: Self = Self::from_minor(i64::MAX);
     /// The smallest representable amount.
-    pub const MIN: Self = Self(i64::MIN);
-
-    /// The number of minor units in one major unit, as `10^P`.
-    pub const SCALE: i64 = pow10(P);
+    pub const MIN: Self = Self::from_minor(i64::MIN);
 
     /// Rejects a scale the representation cannot carry.
     ///
-    /// Referenced by every constructor, so `Amount<19>` fails to compile rather
-    /// than saturating `SCALE` and corrupting every conversion.
+    /// `10^19` exceeds `i64::MAX`, so a larger scale could not represent even one
+    /// major unit. [`Amount::SCALE`] evaluates this, and every constructor and
+    /// conversion goes through `SCALE`, so `Amount<19>` fails to compile rather
+    /// than silently saturating and misreading every value by a factor of ten.
     const PRECISION_GUARD: () = assert!(
         P <= Self::MAX_PRECISION,
         "Amount<P> requires P <= 18; 10^19 exceeds i64::MAX"
     );
+
+    /// The number of minor units in one major unit, as `10^P`.
+    ///
+    /// Evaluating this evaluates the precision guard, which is why every path
+    /// that turns a number into an `Amount` reads it.
+    pub const SCALE: i64 = {
+        () = Self::PRECISION_GUARD;
+        pow10(P)
+    };
 
     /// Wraps a raw count of minor units at scale `P`.
     #[must_use]
@@ -393,7 +401,12 @@ impl<const P: u8> Amount<P> {
     }
 }
 
-/// `10^exp`, saturating at `i64::MAX`.
+/// `10^exp`.
+///
+/// The saturating arm is unreachable for every scale that compiles: the
+/// precision guard on [`Amount::SCALE`] rejects `P > 18` before this is
+/// evaluated. It exists because a `const fn` may not panic here, and returning a
+/// wrong number quietly is worse than returning a clamped one.
 const fn pow10(exp: u8) -> i64 {
     let mut acc: i64 = 1;
     let mut i = 0u8;

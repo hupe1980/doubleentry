@@ -36,6 +36,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::dimensions::Dimensions;
 use crate::merkle::MerkleAccumulator;
 use crate::storage::{Cursor, LedgerStore, StoredEntry};
 use crate::{Direction, Hash, Layer, LogIndex, Seal};
@@ -148,9 +149,14 @@ pub fn arrow_schema() -> ArrowSchema {
         Field::new("log_index", DataType::Int64, false),
         Field::new("entry_id", DataType::Utf8, false),
         Field::new("content_hash", DataType::Utf8, false),
+        // Lowercase hex: an idempotency key is arbitrary bytes, and it is part
+        // of the content hash, so the archive cannot recompute that hash
+        // without it.
+        Field::new("idempotency_key", DataType::Utf8, false),
         Field::new("booking_date", DataType::Date32, false),
         Field::new("value_date", DataType::Date32, false),
         Field::new("description", DataType::Utf8, false),
+        Field::new("kind", DataType::Utf8, true),
         // Iceberg's narrowest integer is 32-bit.
         Field::new("posting_index", DataType::Int32, false),
         Field::new("account_index", DataType::Int64, false),
@@ -158,14 +164,53 @@ pub fn arrow_schema() -> ArrowSchema {
         Field::new("amount_minor", DataType::Int64, false),
         Field::new("currency", DataType::Utf8, false),
         Field::new("layer", DataType::Utf8, false),
-        Field::new("activity", DataType::Utf8, true),
-        Field::new("segment", DataType::Utf8, true),
-        Field::new("cost_object", DataType::Utf8, true),
-        Field::new("party", DataType::Utf8, true),
+        // Axis names are the caller's, so the axes cannot be columns. A JSON
+        // object keeps the archive queryable — every engine that reads Iceberg
+        // has JSON functions — without this crate guessing at a schema.
+        Field::new("dimensions", DataType::Utf8, true),
         Field::new("provenance_actor", DataType::Utf8, true),
         Field::new("provenance_source", DataType::Utf8, true),
+        Field::new("provenance_correlation", DataType::Utf8, true),
+        Field::new("document_id", DataType::Utf8, true),
+        Field::new("document_content_hash", DataType::Utf8, true),
         Field::new("reverses", DataType::Utf8, true),
+        Field::new("original_booking_date", DataType::Date32, true),
     ])
+}
+
+/// Renders a posting's axes as a canonical JSON object.
+///
+/// Keys are already ordered and both keys and values are [`Label`]s — no control
+/// characters, so the only escaping a strict JSON reader needs is for `"` and
+/// `\`. Returns `None` for a posting with no axes, so the column reads as NULL
+/// rather than as an empty object.
+fn dimensions_json(dimensions: &Dimensions) -> Option<String> {
+    if dimensions.is_empty() {
+        return None;
+    }
+    let mut out = String::from("{");
+    for (i, (axis, value)) in dimensions.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        push_json_string(&mut out, axis.as_str());
+        out.push(':');
+        push_json_string(&mut out, value.as_str());
+    }
+    out.push('}');
+    Some(out)
+}
+
+fn push_json_string(out: &mut String, value: &str) {
+    out.push('"');
+    for c in value.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            other => out.push(other),
+        }
+    }
+    out.push('"');
 }
 
 /// The Iceberg schema a compacted period is written in.
@@ -249,7 +294,8 @@ fn encode_accumulator(accumulator: &MerkleAccumulator) -> String {
 /// Parses what [`encode_accumulator`] wrote.
 fn decode_accumulator(raw: &str, size: u64) -> Result<MerkleAccumulator, ColdTierError> {
     if raw.is_empty() {
-        return Ok(MerkleAccumulator::from_parts(Vec::new(), size));
+        return MerkleAccumulator::try_from_parts(Vec::new(), size)
+            .map_err(|e| ColdTierError::MalformedState(e.to_string()));
     }
     let mut subtrees = Vec::new();
     for part in raw.split(',') {
@@ -263,7 +309,8 @@ fn decode_accumulator(raw: &str, size: u64) -> Result<MerkleAccumulator, ColdTie
             .map_err(|e| ColdTierError::MalformedState(format!("accumulator node: {e}")))?;
         subtrees.push((height, node));
     }
-    Ok(MerkleAccumulator::from_parts(subtrees, size))
+    MerkleAccumulator::try_from_parts(subtrees, size)
+        .map_err(|e| ColdTierError::MalformedState(e.to_string()))
 }
 
 /// Writes sealed periods into an Iceberg table.
@@ -522,22 +569,25 @@ fn build_batch<const P: u8>(
     let mut log_index = Vec::new();
     let mut entry_id = Vec::new();
     let mut content_hash = Vec::new();
+    let mut idempotency_key = Vec::new();
     let mut booking_date = Vec::new();
     let mut value_date = Vec::new();
     let mut description = Vec::new();
+    let mut kind: Vec<Option<String>> = Vec::new();
     let mut posting_index = Vec::new();
     let mut account_index = Vec::new();
     let mut direction = Vec::new();
     let mut amount_minor = Vec::new();
     let mut currency = Vec::new();
     let mut layer = Vec::new();
-    let mut activity: Vec<Option<String>> = Vec::new();
-    let mut segment: Vec<Option<String>> = Vec::new();
-    let mut cost_object: Vec<Option<String>> = Vec::new();
-    let mut party: Vec<Option<String>> = Vec::new();
+    let mut dimensions: Vec<Option<String>> = Vec::new();
     let mut actor: Vec<Option<String>> = Vec::new();
     let mut source: Vec<Option<String>> = Vec::new();
+    let mut correlation: Vec<Option<String>> = Vec::new();
+    let mut document_id: Vec<Option<String>> = Vec::new();
+    let mut document_hash: Vec<Option<String>> = Vec::new();
     let mut reverses: Vec<Option<String>> = Vec::new();
+    let mut original_booking_date: Vec<Option<i32>> = Vec::new();
 
     for record in entries {
         let index: LogIndex = record.index.ok_or_else(|| ColdTierError::NotSequenced {
@@ -549,9 +599,11 @@ fn build_batch<const P: u8>(
             log_index.push(i64::try_from(index.get()).unwrap_or(i64::MAX));
             entry_id.push(entry.id().to_string());
             content_hash.push(record.content_hash.to_hex());
+            idempotency_key.push(entry.idempotency_key().to_hex());
             booking_date.push(date32(entry.booking_date()));
             value_date.push(date32(entry.value_date()));
             description.push(entry.description().as_str().to_owned());
+            kind.push(entry.kind().map(ToString::to_string));
             posting_index.push(i32::try_from(position).unwrap_or(i32::MAX));
             account_index.push(i64::from(posting.account.index()));
             direction.push(
@@ -570,25 +622,25 @@ fn build_batch<const P: u8>(
                 }
                 .to_owned(),
             );
-            activity.push(
-                posting
-                    .dimensions
-                    .activity
-                    .as_ref()
-                    .map(ToString::to_string),
-            );
-            segment.push(posting.dimensions.segment.as_ref().map(ToString::to_string));
-            cost_object.push(
-                posting
-                    .dimensions
-                    .cost_object
-                    .as_ref()
-                    .map(ToString::to_string),
-            );
-            party.push(posting.dimensions.party.as_ref().map(ToString::to_string));
+            dimensions.push(dimensions_json(&posting.dimensions));
             actor.push(entry.provenance().actor.as_ref().map(ToString::to_string));
             source.push(entry.provenance().source.as_ref().map(ToString::to_string));
+            correlation.push(
+                entry
+                    .provenance()
+                    .correlation
+                    .as_ref()
+                    .map(ToString::to_string),
+            );
+            document_id.push(entry.document().map(|d| d.id.to_string()));
+            document_hash.push(
+                entry
+                    .document()
+                    .and_then(|d| d.content_hash.as_ref())
+                    .map(Hash::to_hex),
+            );
             reverses.push(entry.reverses().map(|r| r.to_string()));
+            original_booking_date.push(entry.original_booking_date().map(date32));
         }
     }
 
@@ -598,22 +650,25 @@ fn build_batch<const P: u8>(
         Arc::new(Int64Array::from(log_index)),
         Arc::new(StringArray::from(entry_id)),
         Arc::new(StringArray::from(content_hash)),
+        Arc::new(StringArray::from(idempotency_key)),
         Arc::new(Date32Array::from(booking_date)),
         Arc::new(Date32Array::from(value_date)),
         Arc::new(StringArray::from(description)),
+        Arc::new(StringArray::from(kind)),
         Arc::new(Int32Array::from(posting_index)),
         Arc::new(Int64Array::from(account_index)),
         Arc::new(StringArray::from(direction)),
         Arc::new(Int64Array::from(amount_minor)),
         Arc::new(StringArray::from(currency)),
         Arc::new(StringArray::from(layer)),
-        Arc::new(StringArray::from(activity)),
-        Arc::new(StringArray::from(segment)),
-        Arc::new(StringArray::from(cost_object)),
-        Arc::new(StringArray::from(party)),
+        Arc::new(StringArray::from(dimensions)),
         Arc::new(StringArray::from(actor)),
         Arc::new(StringArray::from(source)),
+        Arc::new(StringArray::from(correlation)),
+        Arc::new(StringArray::from(document_id)),
+        Arc::new(StringArray::from(document_hash)),
         Arc::new(StringArray::from(reverses)),
+        Arc::new(Date32Array::from(original_booking_date)),
     ];
 
     let batch = RecordBatch::try_new(Arc::new(batch_schema()?), columns)?;
@@ -628,7 +683,73 @@ mod tests {
     fn the_schema_has_a_column_for_every_field_written() {
         // The batch builder and the schema must agree, or `try_new` fails at run
         // time on data already read out of the ledger.
-        assert_eq!(arrow_schema().fields().len(), 20);
+        assert_eq!(arrow_schema().fields().len(), 23);
+    }
+
+    #[test]
+    fn the_archive_carries_every_field_the_content_hash_covers() {
+        // The claim in this module's docs is that an auditor can verify the
+        // archive without this crate. That only holds if every field the entry
+        // hash is computed over is actually in the table.
+        let schema = arrow_schema();
+        let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        for required in [
+            "idempotency_key",
+            "booking_date",
+            "value_date",
+            "description",
+            "kind",
+            "posting_index",
+            "account_index",
+            "direction",
+            "amount_minor",
+            "currency",
+            "layer",
+            "dimensions",
+            "provenance_actor",
+            "provenance_source",
+            "provenance_correlation",
+            "document_id",
+            "document_content_hash",
+            "reverses",
+            "original_booking_date",
+        ] {
+            assert!(names.contains(&required), "{required} is not archived");
+        }
+    }
+
+    #[test]
+    fn dimensions_render_as_a_canonical_json_object() {
+        use crate::Label;
+        assert_eq!(dimensions_json(&Dimensions::none()), None);
+
+        let dims = Dimensions::none()
+            .with(
+                Label::new("segment").expect("valid"),
+                Label::new("Electricity").expect("valid"),
+            )
+            .expect("fits")
+            .with(
+                Label::new("activity").expect("valid"),
+                Label::new("Network").expect("valid"),
+            )
+            .expect("fits");
+        // Axis order, not insertion order.
+        assert_eq!(
+            dimensions_json(&dims).as_deref(),
+            Some(r#"{"activity":"Network","segment":"Electricity"}"#)
+        );
+
+        let quoted = Dimensions::none()
+            .with(
+                Label::new("note").expect("valid"),
+                Label::new(r#"a"b\c"#).expect("valid"),
+            )
+            .expect("fits");
+        assert_eq!(
+            dimensions_json(&quoted).as_deref(),
+            Some(r#"{"note":"a\"b\\c"}"#)
+        );
     }
 
     #[test]

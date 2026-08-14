@@ -1,10 +1,30 @@
 //! Period seals.
 //!
-//! Sealing a period commits to two things at once: **which entries** it contains
-//! and **what they add up to**. Both are Merkle roots, so a third party holding
-//! nothing but a seal can later be shown that a specific entry belonged to the
-//! period, or that a specific closing balance was the one reported — without
-//! being given the period's contents.
+//! Sealing a period commits to two things at once: **which entries** the log
+//! held when it closed, and **what they add up to**. Both are Merkle roots, so a
+//! third party holding nothing but a seal can later be shown a fact about the
+//! period without being given its contents:
+//!
+//! - Against [`Seal::tree_head`], an [`InclusionProof`]
+//!   that a specific entry was in the log the seal closed over.
+//! - Against [`Seal::trial_balance_root`], a [`BalanceProof`] that a specific
+//!   account held a specific balance in the closing trial balance.
+//!
+//! Both are `O(log n)` and reveal nothing else. That second one is the reason a
+//! seal commits to a Merkle root over the balances rather than to a flat digest
+//! of them: a digest can only be checked by whoever holds every balance, which
+//! is precisely the party an auditor is trying not to have to trust.
+//!
+//! # What "belongs to the period" means
+//!
+//! The tree head is the whole log at the moment of sealing, not the period's
+//! entries alone — entries are appended in recording order, not booking-date
+//! order, so a period's entries need not be contiguous. An inclusion proof
+//! therefore establishes *this entry was in the log the seal closed over*, and
+//! [`Seal::entry_count`] and [`Seal::index_span`] describe how much of that log
+//! the period accounts for. The closing balances are the stronger statement, and
+//! they are exact: they fold every entry booked on or before the period's last
+//! day and nothing else.
 //!
 //! Seals chain: each carries the hash of its predecessor. Removing or reordering
 //! a sealed period breaks every seal after it.
@@ -15,7 +35,7 @@
 use crate::balance::{Balance, BalanceKey, TrialBalance};
 use crate::canonical::{Canonical, CanonicalWriter};
 use crate::hash::{Hash, tag, tagged};
-use crate::merkle::{MerkleLog, TreeHead};
+use crate::merkle::{InclusionProof, MerkleLog, ProofError, TreeHead};
 use crate::period::{LedgerId, PeriodId};
 
 /// What a period turned out to contain.
@@ -172,27 +192,167 @@ impl Canonical for Seal {
 
 /// Merkle root over a trial balance.
 ///
-/// Each `(account, currency, layer) → (debits, credits)` row becomes one leaf,
-/// in the trial balance's own deterministic order, so the root is a pure
-/// function of the balances.
+/// Shorthand for [`TrialBalanceCommitment::of`] followed by
+/// [`TrialBalanceCommitment::root`]. Build the commitment instead when you also
+/// want to prove individual rows.
 #[must_use]
 pub fn trial_balance_root<const P: u8>(tb: &TrialBalance<P>) -> Hash {
-    let leaves: Vec<Hash> = tb
-        .iter()
-        .map(|(key, balance)| balance_leaf(key, balance, P))
-        .collect();
-    MerkleLog::from_leaves(leaves).root()
+    TrialBalanceCommitment::of(tb).root()
 }
 
-fn balance_leaf<const P: u8>(key: &BalanceKey, balance: &Balance<P>, scale: u8) -> Hash {
+/// The leaf a single trial-balance row hashes to.
+///
+/// One leaf per `(account, currency, layer) → (debits, credits)` row. Both gross
+/// totals are covered, not the net: two accounts that net to zero — one quiet,
+/// one with heavy offsetting turnover — must not produce the same commitment.
+/// The scale is covered too, so the same minor units at a different precision
+/// are a different balance rather than a coincidence.
+#[must_use]
+pub fn balance_leaf<const P: u8>(key: &BalanceKey, balance: &Balance<P>) -> Hash {
     let mut w = CanonicalWriter::new();
     w.u32(key.account.index());
     w.fixed(key.currency.as_bytes());
     w.u8(key.layer.discriminant());
-    w.u8(scale);
+    w.u8(P);
     w.i64(balance.debits.to_minor());
     w.i64(balance.credits.to_minor());
     tagged(tag::TRIAL_BALANCE_V1, &w.finish())
+}
+
+/// A Merkle commitment to a trial balance, able to prove individual rows.
+///
+/// A seal stores only [`Self::root`]. Rebuild the commitment from the same trial
+/// balance to answer a proof request; it is a pure function of the balances, so
+/// the rebuild is exact or the root does not match and nothing can be proven.
+///
+/// ```
+/// # use doubleentry::{Amount, BalanceKey, Currency, Layer, Posting, TrialBalance};
+/// # use doubleentry::account::AccountId;
+/// # use doubleentry::seal::TrialBalanceCommitment;
+/// # type Eur = Amount<2>;
+/// # let cash = AccountId::from_index(0);
+/// # let revenue = AccountId::from_index(1);
+/// let mut tb = TrialBalance::<2>::new();
+/// tb.apply(&Posting::debit(cash, Eur::parse("1190.00")?, Currency::EUR))?;
+/// tb.apply(&Posting::credit(revenue, Eur::parse("1190.00")?, Currency::EUR))?;
+///
+/// let commitment = TrialBalanceCommitment::of(&tb);
+/// let key = BalanceKey { account: cash, currency: Currency::EUR, layer: Layer::Settled };
+/// let proof = commitment.prove(&key).expect("cash is in the trial balance");
+///
+/// // An auditor holding only the seal's root and this one balance can check it.
+/// assert!(proof.verify(&commitment.root()));
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[derive(Debug, Clone)]
+pub struct TrialBalanceCommitment<const P: u8> {
+    rows: Vec<(BalanceKey, Balance<P>)>,
+    log: MerkleLog,
+}
+
+impl<const P: u8> TrialBalanceCommitment<P> {
+    /// Commits to a trial balance.
+    ///
+    /// Leaves follow the trial balance's own deterministic order, so the root is
+    /// a pure function of the balances and not of how they were accumulated.
+    #[must_use]
+    pub fn of(tb: &TrialBalance<P>) -> Self {
+        let rows: Vec<(BalanceKey, Balance<P>)> = tb.iter().map(|(k, b)| (*k, *b)).collect();
+        let leaves = rows.iter().map(|(k, b)| balance_leaf(k, b)).collect();
+        Self {
+            rows,
+            log: MerkleLog::from_leaves(leaves),
+        }
+    }
+
+    /// The root a seal records.
+    #[must_use]
+    pub fn root(&self) -> Hash {
+        self.log.root()
+    }
+
+    /// Number of rows committed to.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// True when the trial balance was empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// Proves that `key` held the balance this commitment recorded for it.
+    ///
+    /// Returns `None` when the key is absent. That is not the same as a balance
+    /// of zero: an account with no postings has no row, so there is nothing to
+    /// prove about it and a proof must not be manufactured.
+    #[must_use]
+    pub fn prove(&self, key: &BalanceKey) -> Option<BalanceProof<P>> {
+        let index = self.rows.iter().position(|(k, _)| k == key)?;
+        let (key, balance) = self.rows.get(index).copied()?;
+        let proof = self.log.inclusion_proof(index as u64).ok()?;
+        Some(BalanceProof {
+            key,
+            balance,
+            proof,
+        })
+    }
+
+    /// Proves every row, in commitment order.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProofError`] only if the log and the row list have diverged,
+    /// which would be a bug in this crate.
+    pub fn prove_all(&self) -> Result<Vec<BalanceProof<P>>, ProofError> {
+        self.rows
+            .iter()
+            .enumerate()
+            .map(|(index, (key, balance))| {
+                Ok(BalanceProof {
+                    key: *key,
+                    balance: *balance,
+                    proof: self.log.inclusion_proof(index as u64)?,
+                })
+            })
+            .collect()
+    }
+}
+
+/// Proof that one account's balance is the one a seal committed to.
+///
+/// Self-contained: it carries the claim as well as the path, so a verifier needs
+/// nothing but this and the root out of the seal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct BalanceProof<const P: u8> {
+    /// What the balance is for.
+    pub key: BalanceKey,
+    /// The balance being claimed.
+    pub balance: Balance<P>,
+    /// Path from the balance's leaf up to the trial-balance root.
+    pub proof: InclusionProof,
+}
+
+impl<const P: u8> BalanceProof<P> {
+    /// Verifies the claim against a [`Seal::trial_balance_root`].
+    ///
+    /// Returns `false` on any inconsistency rather than distinguishing failure
+    /// modes: a verifier cannot act differently on a malformed proof than on a
+    /// forged one.
+    #[must_use]
+    pub fn verify(&self, trial_balance_root: &Hash) -> bool {
+        self.proof
+            .verify(&balance_leaf(&self.key, &self.balance), trial_balance_root)
+    }
+
+    /// Verifies the claim against a whole seal.
+    #[must_use]
+    pub fn verify_against(&self, seal: &Seal) -> bool {
+        seal.is_self_consistent() && self.verify(&seal.trial_balance_root)
+    }
 }
 
 /// Failure verifying a chain of seals.
@@ -656,6 +816,96 @@ mod tests {
             tampered.verify(),
             Err(SealChainError::Tampered { .. })
         ));
+    }
+
+    #[test]
+    fn a_balance_can_be_proven_against_a_seal_alone() {
+        let trial = tb(&[(0, 119_000, 0), (1, 0, 119_000), (2, 500, 500)]);
+        let seal = Seal::build(
+            lid(),
+            pid("2026-03"),
+            PeriodCoverage::spanning(0, 3, 4),
+            head(4, 1),
+            &trial,
+            None,
+        );
+
+        let commitment = TrialBalanceCommitment::of(&trial);
+        assert_eq!(commitment.root(), seal.trial_balance_root);
+        assert_eq!(commitment.len(), 3);
+
+        // Every row proves, against nothing but the seal.
+        for proof in commitment.prove_all().expect("well-formed") {
+            assert!(proof.verify_against(&seal), "{:?} must prove", proof.key);
+        }
+    }
+
+    #[test]
+    fn a_restated_balance_does_not_prove() {
+        let trial = tb(&[(0, 119_000, 0), (1, 0, 119_000)]);
+        let seal = Seal::build(
+            lid(),
+            pid("p"),
+            PeriodCoverage::EMPTY,
+            head(2, 1),
+            &trial,
+            None,
+        );
+        let key = BalanceKey {
+            account: AccountId::from_index(0),
+            currency: Currency::EUR,
+            layer: Layer::Settled,
+        };
+        let mut proof = TrialBalanceCommitment::of(&trial)
+            .prove(&key)
+            .expect("row exists");
+        assert!(proof.verify_against(&seal));
+
+        // Claiming a different number under the same path.
+        proof.balance.debits = Eur::from_minor(119_001);
+        assert!(!proof.verify_against(&seal));
+
+        // Claiming the same number for a different account.
+        let mut retargeted = TrialBalanceCommitment::of(&trial)
+            .prove(&key)
+            .expect("row exists");
+        retargeted.key.account = AccountId::from_index(7);
+        assert!(!retargeted.verify_against(&seal));
+    }
+
+    #[test]
+    fn an_account_with_no_row_cannot_be_proven_to_be_zero() {
+        // Absence is not a zero balance, and a proof of it must not be invented.
+        let trial = tb(&[(0, 100, 0)]);
+        let absent = BalanceKey {
+            account: AccountId::from_index(9),
+            currency: Currency::EUR,
+            layer: Layer::Settled,
+        };
+        assert!(TrialBalanceCommitment::of(&trial).prove(&absent).is_none());
+    }
+
+    #[test]
+    fn a_proof_does_not_carry_across_seals() {
+        let march = tb(&[(0, 100, 0), (1, 0, 100)]);
+        let april = tb(&[(0, 250, 0), (1, 0, 250)]);
+        let march_seal = Seal::build(
+            lid(),
+            pid("2026-03"),
+            PeriodCoverage::EMPTY,
+            head(2, 1),
+            &march,
+            None,
+        );
+        let key = BalanceKey {
+            account: AccountId::from_index(0),
+            currency: Currency::EUR,
+            layer: Layer::Settled,
+        };
+        let april_proof = TrialBalanceCommitment::of(&april)
+            .prove(&key)
+            .expect("row exists");
+        assert!(!april_proof.verify_against(&march_seal));
     }
 
     #[test]

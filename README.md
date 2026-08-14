@@ -33,26 +33,21 @@ know this record wasn't changed after the fact?*
 ## 🚀 Quick start
 
 ```rust
-use doubleentry::account::AccountRegistry;
-use doubleentry::entry::{LedgerPolicy, SealContext};
-use doubleentry::period::{LedgerId, PeriodCalendar};
+use doubleentry::period::LedgerId;
 use doubleentry::{Amount, Currency, Entry, EntryId, IdempotencyKey, Journal};
 use time::macros::date;
 
 type Eur = Amount<2>;
 
-// Accounts are paths in a hierarchy you define. Only leaves are postable.
-let mut accounts = AccountRegistry::new();
-let cash    = accounts.register_path("Assets:Cash",  date!(2026-01-01))?;
-let revenue = accounts.register_path("Income:Sales", date!(2026-01-01))?;
-
-let calendar = PeriodCalendar::new();
-let policy   = LedgerPolicy::default();
-let ctx = SealContext { accounts: &accounts, calendar: &calendar, policy: &policy };
-
+// A journal is one entity's books: its accounts, its calendar, its policy, its
+// entries, and the Merkle log that commits to them.
 let mut journal = Journal::<2>::new(LedgerId::new("acme-gmbh")?);
 
-let recorded = journal.seal_and_record(
+// Accounts are paths in a hierarchy you define. Only leaves are postable.
+let cash    = journal.accounts_mut().register_path("Assets:Cash",  date!(2026-01-01))?;
+let revenue = journal.accounts_mut().register_path("Income:Sales", date!(2026-01-01))?;
+
+let recorded = journal.record(
     Entry::new(
         EntryId::generate(),
         IdempotencyKey::new(b"invoice-2026-0001".to_vec())?,
@@ -60,7 +55,6 @@ let recorded = journal.seal_and_record(
     )
     .debit(cash,     Eur::parse("1190.00")?, Currency::EUR)
     .credit(revenue, Eur::parse("1190.00")?, Currency::EUR),
-    &ctx,
 )?;
 
 // Prove the entry is committed to, without revealing any other entry.
@@ -69,6 +63,10 @@ let proof = journal.prove_inclusion(recorded.require_index()?)?;
 assert!(proof.verify(&recorded.content_hash, &head.root));
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
+
+`record` validates the draft against *this* journal's accounts, calendar and policy, then
+appends it. There is no separate context to build and no second object to keep in step — the
+things validation consults and the thing that stores the result are the same thing.
 
 ---
 
@@ -79,18 +77,13 @@ invariant and yields `Entry<Balanced, P>` — a type with private fields, no pub
 constructor, and marker types behind a sealed trait.
 
 ```rust
-# use doubleentry::{Amount, Currency, Entry, EntryId, IdempotencyKey, ValidationError};
-# use doubleentry::account::AccountRegistry;
-# use doubleentry::entry::{LedgerPolicy, SealContext};
-# use doubleentry::period::{LedgerId, PeriodCalendar};
+# use doubleentry::{Amount, Currency, Entry, EntryId, IdempotencyKey, Journal, ValidationError};
+# use doubleentry::period::LedgerId;
 # use time::macros::date;
 # type Eur = Amount<2>;
-# let mut accounts = AccountRegistry::new();
-# let cash = accounts.register_path("Assets:Cash", date!(2026-01-01))?;
-# let revenue = accounts.register_path("Income:Sales", date!(2026-01-01))?;
-# let calendar = PeriodCalendar::new();
-# let policy = LedgerPolicy::default();
-# let ctx = SealContext { accounts: &accounts, calendar: &calendar, policy: &policy };
+# let mut journal = Journal::<2>::new(LedgerId::new("acme-gmbh")?);
+# let cash = journal.accounts_mut().register_path("Assets:Cash", date!(2026-01-01))?;
+# let revenue = journal.accounts_mut().register_path("Income:Sales", date!(2026-01-01))?;
 let errors = Entry::new(
     EntryId::generate(),
     IdempotencyKey::new(b"k".to_vec())?,
@@ -98,7 +91,7 @@ let errors = Entry::new(
 )
 .debit(cash,     Eur::parse("100.00")?, Currency::EUR)
 .credit(revenue, Eur::parse("99.00")?,  Currency::EUR)
-.seal(&ctx)
+.seal(&journal.context())
 .unwrap_err();
 
 // Every violation is reported at once, not one round trip at a time.
@@ -207,6 +200,12 @@ is not a specification:
 | Key seen, content identical | **No-op**, returns the original outcome — a safe retry |
 | Key seen, content differs | **Conflict**, refused — never a silent overwrite, never a second entry |
 
+The key is resolved **before validation runs**, not after. Otherwise a retry of an entry
+accepted months ago would be refused today because its period has since been sealed or its
+account has closed — turning an at-least-once delivery path into a source of spurious errors
+exactly when the ledger is least able to act on them. A safe retry cannot trip a rule the
+original submission already passed.
+
 ---
 
 ## ↩️ Corrections
@@ -224,32 +223,26 @@ rules are enforced rather than documented:
 
 ```rust
 # use doubleentry::{Amount, Currency, Entry, EntryId, IdempotencyKey, Journal};
-# use doubleentry::account::AccountRegistry;
-# use doubleentry::entry::{LedgerPolicy, SealContext};
-# use doubleentry::period::{LedgerId, PeriodCalendar};
+# use doubleentry::period::LedgerId;
 # use time::macros::date;
 # type Eur = Amount<2>;
-# let mut accounts = AccountRegistry::new();
-# let cash = accounts.register_path("Assets:Cash", date!(2026-01-01))?;
-# let revenue = accounts.register_path("Income:Sales", date!(2026-01-01))?;
-# let calendar = PeriodCalendar::new();
-# let policy = LedgerPolicy::default();
-# let ctx = SealContext { accounts: &accounts, calendar: &calendar, policy: &policy };
 # let mut journal = Journal::<2>::new(LedgerId::new("acme-gmbh")?);
+# let cash = journal.accounts_mut().register_path("Assets:Cash", date!(2026-01-01))?;
+# let revenue = journal.accounts_mut().register_path("Income:Sales", date!(2026-01-01))?;
 # let original = Entry::new(EntryId::generate(), IdempotencyKey::new(b"o".to_vec())?, date!(2026-03-15))
 #     .debit(cash, Eur::parse("50.00")?, Currency::EUR)
 #     .credit(revenue, Eur::parse("50.00")?, Currency::EUR)
-#     .seal(&ctx)?;
-# journal.record(original.clone())?;
-let reversal = original.reverse(
+#     .seal(&journal.context())?;
+# let original_id = original.id();
+# journal.record_validated(original.clone())?;
+journal.record(original.reverse(
     EntryId::generate(),
     IdempotencyKey::new(b"reversal-of-o".to_vec())?,
     date!(2026-04-01),
-);
-journal.record(reversal.seal(&ctx)?)?;
+))?;
 
 // A second reversal of the same entry is refused.
-assert!(journal.reversal_of(original.id()).is_some());
+assert!(journal.reversal_of(original_id).is_some());
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
@@ -266,44 +259,30 @@ Nothing is mutated. Clearing records which postings offset which and by how much
 
 ```rust
 # use doubleentry::{Amount, BalanceKey, Currency, Entry, EntryId, IdempotencyKey, Journal, Layer};
-# use doubleentry::account::AccountRegistry;
-# use doubleentry::clearing::{ClearedItem, Clearing, ClearingId, PostingRef};
-# use doubleentry::entry::{LedgerPolicy, SealContext};
-# use doubleentry::period::{LedgerId, PeriodCalendar};
+# use doubleentry::clearing::{Clearing, ClearingId, PostingRef};
+# use doubleentry::period::LedgerId;
 # use time::macros::date;
 # type Eur = Amount<2>;
-# let mut accounts = AccountRegistry::new();
-# let receivable = accounts.register_path("Assets:Receivable", date!(2026-01-01))?;
-# let revenue = accounts.register_path("Income:Sales", date!(2026-01-01))?;
-# let calendar = PeriodCalendar::new();
-# let policy = LedgerPolicy::default();
-# let ctx = SealContext { accounts: &accounts, calendar: &calendar, policy: &policy };
 # let mut journal = Journal::<2>::new(LedgerId::new("acme-gmbh")?);
-# let invoice = Entry::new(EntryId::generate(), IdempotencyKey::new(b"inv".to_vec())?, date!(2026-03-01))
-#     .debit(receivable, Eur::parse("1000.00")?, Currency::EUR)
-#     .credit(revenue, Eur::parse("1000.00")?, Currency::EUR)
-#     .seal(&ctx)?;
-# let invoice_id = invoice.id();
-# journal.record(invoice)?;
-# let payment = Entry::new(EntryId::generate(), IdempotencyKey::new(b"pay".to_vec())?, date!(2026-03-20))
-#     .credit(receivable, Eur::parse("400.00")?, Currency::EUR)
-#     .debit(revenue, Eur::parse("400.00")?, Currency::EUR)
-#     .seal(&ctx)?;
-# let payment_id = payment.id();
-# journal.record(payment)?;
-// A payment of 400 against an invoice of 1000.
-journal.clear(Clearing {
-    id: ClearingId::generate(),
-    account: receivable,
-    currency: Currency::EUR,
-    cleared_on: date!(2026-03-20),
-    items: vec![
-        ClearedItem { posting: PostingRef::new(invoice_id, 0), applied: Eur::parse("400.00")? },
-        ClearedItem { posting: PostingRef::new(payment_id, 0), applied: Eur::parse("400.00")? },
-    ],
-})?;
-
+# let receivable = journal.accounts_mut().register_path("Assets:Receivable", date!(2026-01-01))?;
+# let revenue = journal.accounts_mut().register_path("Income:Sales", date!(2026-01-01))?;
+# let invoice = journal.record(
+#     Entry::new(EntryId::generate(), IdempotencyKey::new(b"inv".to_vec())?, date!(2026-03-01))
+#         .debit(receivable, Eur::parse("1000.00")?, Currency::EUR)
+#         .credit(revenue, Eur::parse("1000.00")?, Currency::EUR))?;
+# let payment = journal.record(
+#     Entry::new(EntryId::generate(), IdempotencyKey::new(b"pay".to_vec())?, date!(2026-03-20))
+#         .credit(receivable, Eur::parse("400.00")?, Currency::EUR)
+#         .debit(revenue, Eur::parse("400.00")?, Currency::EUR))?;
 let key = BalanceKey { account: receivable, currency: Currency::EUR, layer: Layer::Settled };
+
+// A payment of 400 against an invoice of 1000.
+journal.clear(
+    Clearing::new(ClearingId::generate(), key, date!(2026-03-20))
+        .apply(PostingRef::new(invoice.id, 0), Eur::parse("400.00")?)
+        .apply(PostingRef::new(payment.id, 0), Eur::parse("400.00")?),
+)?;
+
 let open = journal.open_items(&key)?;
 
 // The payment is fully applied; the invoice keeps its remainder open.
@@ -311,6 +290,11 @@ assert_eq!(open.len(), 1);
 assert_eq!(open[0].residual, Eur::parse("600.00")?);
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
+
+A clearing is scoped to one `(account, currency, layer)` — the same key a balance and an
+open-item list are reported against. A reservation and a settled movement are different claims
+on the same account, so they do not clear against each other: netting them would report an open
+item closed while the money had not moved.
 
 Applying less than the full amount leaves both sides open for the remainder — what a partial
 payment needs. Booking the shortfall as a fresh item instead is an ordinary entry your
@@ -327,25 +311,17 @@ A trial balance says where an account ended up and nothing about how it got ther
 
 ```rust
 # use doubleentry::{Amount, BalanceKey, Currency, Entry, EntryId, IdempotencyKey, Journal, Layer};
-# use doubleentry::account::AccountRegistry;
-# use doubleentry::entry::{LedgerPolicy, SealContext};
-# use doubleentry::period::{LedgerId, PeriodCalendar};
+# use doubleentry::period::LedgerId;
 # use time::macros::date;
 # type Eur = Amount<2>;
-# let mut accounts = AccountRegistry::new();
-# let cash = accounts.register_path("Assets:Cash", date!(2026-01-01))?;
-# let revenue = accounts.register_path("Income:Sales", date!(2026-01-01))?;
-# let calendar = PeriodCalendar::new();
-# let policy = LedgerPolicy::default();
-# let ctx = SealContext { accounts: &accounts, calendar: &calendar, policy: &policy };
 # let mut journal = Journal::<2>::new(LedgerId::new("acme-gmbh")?);
-# for (i, amt) in [("100.00", b"a"), ("250.00", b"b")].iter().enumerate() {
-#     let _ = i;
-#     journal.seal_and_record(
-#         Entry::new(EntryId::generate(), IdempotencyKey::new(amt.1.to_vec())?, date!(2026-03-15))
-#             .debit(cash, Eur::parse(amt.0)?, Currency::EUR)
-#             .credit(revenue, Eur::parse(amt.0)?, Currency::EUR),
-#         &ctx,
+# let cash = journal.accounts_mut().register_path("Assets:Cash", date!(2026-01-01))?;
+# let revenue = journal.accounts_mut().register_path("Income:Sales", date!(2026-01-01))?;
+# for (amount, key) in [("100.00", b"a"), ("250.00", b"b")] {
+#     journal.record(
+#         Entry::new(EntryId::generate(), IdempotencyKey::new(key.to_vec())?, date!(2026-03-15))
+#             .debit(cash, Eur::parse(amount)?, Currency::EUR)
+#             .credit(revenue, Eur::parse(amount)?, Currency::EUR),
 #     )?;
 # }
 let key = BalanceKey { account: cash, currency: Currency::EUR, layer: Layer::Settled };
@@ -355,6 +331,11 @@ assert_eq!(lines.len(), 2);
 assert_eq!(lines[1].running.debits, Eur::parse("350.00")?);
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
+
+Reading a statement, a balance or the current trial balance costs what the answer costs, not
+what the history costs: the journal maintains both as entries arrive. Reading a *historical*
+balance replays that account's postings up to the position asked for, which is linear in how
+much has moved through the account rather than in the size of the journal.
 
 ---
 
@@ -404,32 +385,23 @@ period breaks every seal after it.
 
 ```rust
 # use doubleentry::{Amount, Currency, Entry, EntryId, IdempotencyKey, Journal};
-# use doubleentry::account::AccountRegistry;
-# use doubleentry::entry::{LedgerPolicy, SealContext};
-# use doubleentry::period::{LedgerId, Period, PeriodCalendar, PeriodId, PeriodState};
+# use doubleentry::period::{LedgerId, Period, PeriodId, PeriodState};
 # use time::macros::date;
 # type Eur = Amount<2>;
-# let mut accounts = AccountRegistry::new();
-# let cash = accounts.register_path("Assets:Cash", date!(2026-01-01))?;
-# let revenue = accounts.register_path("Income:Sales", date!(2026-01-01))?;
-let mut calendar = PeriodCalendar::new();
-let march = PeriodId::new("2026-03")?;
-calendar.define(Period::new(march.clone(), date!(2026-03-01), date!(2026-03-31))?)?;
-
-# let policy = LedgerPolicy::default();
 # let mut journal = Journal::<2>::new(LedgerId::new("acme-gmbh")?);
-# {
-#     let ctx = SealContext { accounts: &accounts, calendar: &calendar, policy: &policy };
-#     journal.seal_and_record(
-#         Entry::new(EntryId::generate(), IdempotencyKey::new(b"e1".to_vec())?, date!(2026-03-15))
-#             .debit(cash, Eur::parse("10.00")?, Currency::EUR)
-#             .credit(revenue, Eur::parse("10.00")?, Currency::EUR),
-#         &ctx,
-#     )?;
-# }
+# let cash = journal.accounts_mut().register_path("Assets:Cash", date!(2026-01-01))?;
+# let revenue = journal.accounts_mut().register_path("Income:Sales", date!(2026-01-01))?;
+let march = PeriodId::new("2026-03")?;
+journal.define_period(Period::new(march.clone(), date!(2026-03-01), date!(2026-03-31))?)?;
+
+# journal.record(
+#     Entry::new(EntryId::generate(), IdempotencyKey::new(b"e1".to_vec())?, date!(2026-03-15))
+#         .debit(cash, Eur::parse("10.00")?, Currency::EUR)
+#         .credit(revenue, Eur::parse("10.00")?, Currency::EUR),
+# )?;
 // Stop postings first, so verification runs against a set that cannot grow.
-calendar.transition(&march, PeriodState::Closing)?;
-let seal = journal.seal_period(&march, &mut calendar)?;
+journal.transition_period(&march, PeriodState::Closing)?;
+let seal = journal.seal_period(&march)?;
 
 assert!(seal.is_self_consistent());
 assert!(journal.verify_seals().is_ok());
@@ -451,6 +423,49 @@ A sealed period is terminal — there is no reopening. A correction books into a
 later open period carrying the original date, which is the only treatment
 compatible with a log that has already been committed to.
 
+### Proving one balance, without disclosing the rest
+
+A seal commits to the closing trial balance as a **Merkle root**, not a flat digest, and that
+choice is what makes selective disclosure possible. A digest can only be checked by whoever
+holds every balance — which is precisely the party an auditor is trying not to have to trust.
+A root lets one row be proven in `O(log n)`, revealing nothing about the others.
+
+```rust
+# use doubleentry::{Amount, BalanceKey, Currency, Entry, EntryId, IdempotencyKey, Journal, Layer};
+# use doubleentry::period::{LedgerId, Period, PeriodId, PeriodState};
+# use doubleentry::seal::TrialBalanceCommitment;
+# use time::macros::date;
+# type Eur = Amount<2>;
+# let mut journal = Journal::<2>::new(LedgerId::new("acme-gmbh")?);
+# let cash = journal.accounts_mut().register_path("Assets:Cash", date!(2026-01-01))?;
+# let revenue = journal.accounts_mut().register_path("Income:Sales", date!(2026-01-01))?;
+# let march = PeriodId::new("2026-03")?;
+# journal.define_period(Period::new(march.clone(), date!(2026-03-01), date!(2026-03-31))?)?;
+# journal.record(
+#     Entry::new(EntryId::generate(), IdempotencyKey::new(b"e1".to_vec())?, date!(2026-03-15))
+#         .debit(cash, Eur::parse("1190.00")?, Currency::EUR)
+#         .credit(revenue, Eur::parse("1190.00")?, Currency::EUR))?;
+# journal.transition_period(&march, PeriodState::Closing)?;
+# let seal = journal.seal_period(&march)?;
+// Rebuild the commitment from the same closing balances the seal was built over.
+let closing = journal.trial_balance_through_date(date!(2026-03-31))?;
+let commitment = TrialBalanceCommitment::of(&closing);
+assert_eq!(commitment.root(), seal.trial_balance_root);
+
+let key = BalanceKey { account: cash, currency: Currency::EUR, layer: Layer::Settled };
+let proof = commitment.prove(&key).expect("cash was posted to");
+
+// The auditor holds the seal and this one proof. Nothing else.
+assert!(proof.verify_against(&seal));
+assert_eq!(proof.balance.debits, Eur::parse("1190.00")?);
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Both gross totals are in the leaf, not the net: two accounts that net to zero — one quiet, one
+with heavy offsetting turnover — must not produce the same commitment. An account with no
+postings has no row, so `prove` returns `None` for it rather than manufacturing a proof that it
+held zero; absence and a zero balance are different claims.
+
 ---
 
 ## 📌 Checkpoints and assertions
@@ -470,23 +485,16 @@ mechanism there is for catching silent divergence.
 ```rust
 # use doubleentry::{Amount, BalanceAssertion, BalanceKey, Currency, Entry, EntryId};
 # use doubleentry::{IdempotencyKey, Journal, Layer};
-# use doubleentry::account::AccountRegistry;
-# use doubleentry::entry::{LedgerPolicy, SealContext};
-# use doubleentry::period::{LedgerId, PeriodCalendar};
+# use doubleentry::period::LedgerId;
 # use time::macros::date;
 # type Eur = Amount<2>;
-# let mut accounts = AccountRegistry::new();
-# let cash = accounts.register_path("Assets:Cash", date!(2026-01-01))?;
-# let revenue = accounts.register_path("Income:Sales", date!(2026-01-01))?;
-# let calendar = PeriodCalendar::new();
-# let policy = LedgerPolicy::default();
-# let ctx = SealContext { accounts: &accounts, calendar: &calendar, policy: &policy };
 # let mut journal = Journal::<2>::new(LedgerId::new("acme-gmbh")?);
-# journal.seal_and_record(
+# let cash = journal.accounts_mut().register_path("Assets:Cash", date!(2026-01-01))?;
+# let revenue = journal.accounts_mut().register_path("Income:Sales", date!(2026-01-01))?;
+# journal.record(
 #     Entry::new(EntryId::generate(), IdempotencyKey::new(b"e1".to_vec())?, date!(2026-03-15))
 #         .debit(cash, Eur::parse("350.00")?, Currency::EUR)
 #         .credit(revenue, Eur::parse("350.00")?, Currency::EUR),
-#     &ctx,
 # )?;
 let key = BalanceKey { account: cash, currency: Currency::EUR, layer: Layer::Settled };
 
@@ -512,7 +520,11 @@ tamper-evident — a document swapped after the fact no longer matches the booki
 
 ```rust
 # use doubleentry::{DocumentRef, Hash};
-let invoice = DocumentRef::new("INV-2026-0001", Hash::from_bytes([0x33; 32]))?;
+// `Hash::digest` is the engine's own domain-separated construction, offered so a
+// caller does not have to invent one. Name your document type in the tag; the
+// `doubleentry/` namespace is reserved.
+let pdf: &[u8] = b"%PDF-1.7 ...";
+let invoice = DocumentRef::new("INV-2026-0001", Hash::digest(b"acme/invoice/v1", pdf))?;
 assert!(invoice.is_verifiable());
 
 // When the identifier is all you have — a reference off a message bus, a payment
@@ -532,24 +544,50 @@ as a hashed one.
 
 ## 🧭 Dimensions
 
-Postings carry typed tags orthogonal to the account path, so a trial balance can group by any
-axis without restructuring the tree. Encoding every axis into the path multiplies your account
-count and freezes your reporting dimensions at design time.
+Postings carry axes orthogonal to the account path, so a trial balance can group by any of them
+without restructuring the tree. Encoding an axis into the path instead —
+`Grid:Electricity:HV:Revenue` — multiplies your account count by the product of the axes and
+freezes your reporting dimensions at design time.
+
+**The axes are yours.** A `Dimensions` value is a small, ordered map from axis name to value,
+both `Label`s. The engine ships no axis names, because there is no set that is right for
+everyone: an energy utility separates by regulated activity, a fund administrator by mandate, a
+marketplace by counterparty. Naming four of them in the library would be a chart of accounts by
+another route — and would then have to be worked around by everyone whose fifth axis matters.
 
 ```rust
-# use doubleentry::{ActivityId, Dimensions, SegmentId};
+# use doubleentry::{Dimensions, Label};
 let dims = Dimensions::none()
-    .with_activity(ActivityId::new("Retail")?)
-    .with_segment(SegmentId::new("Hardware")?);
+    .with(Label::new("activity")?, Label::new("Retail")?)?
+    .with(Label::new("segment")?,  Label::new("Hardware")?)?;
+
+assert_eq!(dims.get("activity").map(Label::as_str), Some("Retail"));
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-Values are opaque to the engine: it stores them, folds them into the entry hash so they are
-covered by tamper evidence, and groups by them on request. It ships no vocabulary.
+What the engine does is bound them (8 axes, 64 characters each), order them deterministically so
+the entry hash does not depend on the order you set them in, fold them into that hash so they
+are covered by tamper evidence, and let a policy insist on the ones your books cannot be kept
+without:
 
-A ledger can require an activity on every posting, which is what you want where accounts must
-be kept separately per line of business — an unattributed posting is then rejected rather than
-landing outside every activity's accounts.
+```rust
+# use doubleentry::{Journal, Label};
+# use doubleentry::entry::LedgerPolicy;
+# use doubleentry::period::LedgerId;
+let journal = Journal::<2>::new(LedgerId::new("acme-gmbh")?)
+    .with_policy(LedgerPolicy::permissive().requiring(Label::new("activity")?));
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+That is what you want where accounts must be kept separately per line of business: an
+unattributed posting is rejected at the door rather than landing outside every grouping a report
+knows about. Discovering it later means restating. The engine checks presence, never the value —
+which values are legal is a question about your business, and one this crate has no way to
+answer.
+
+In SQL the axes are a child table keyed on the posting, one row per axis, indexed on
+`(axis, value)`. A column per axis would be either this crate's guess at yours or a schema change
+every time a new one is needed, and a JSON blob is a full scan.
 
 ---
 
@@ -576,22 +614,34 @@ contract executable: a backend either passes it or is not a backend.
 
 | Guarantee | Checked by |
 |---|---|
+| A fresh store is empty and commits to the empty root | `check_starts_empty` |
+| Indices are dense, ordered, gap-free | `check_append_assigns_dense_indices` |
 | Append-only; recorded entries never change | `check_reads_are_stable` |
-| Batches are atomic — all or nothing | `check_batch_is_atomic` |
 | Identical replay is a no-op | `check_idempotent_replay` |
 | Same key, different content is refused | `check_idempotency_conflict` |
-| Indices are dense, ordered, gap-free | `check_append_assigns_dense_indices` |
+| Batches are atomic — all or nothing | `check_batch_is_atomic` |
+| Paging visits every record exactly once | `check_pagination_covers_the_log` |
 | Balances agree with a fold over the log | `check_balances_match_the_log` |
 | Every record is provable; growth is append-only | `check_proofs_verify` |
 | Reversal: at most once, never of a reversal, must actually invert | `check_reversal_rules` |
 | Clearing: over-application, imbalance, duplicates, double reset | `check_clearing_rules` |
 | Residuals reflect exactly what was applied | `check_open_items_track_residuals` |
+| Account handles survive a restart, `kind` and `closed_on` included | `check_account_bindings_survive_a_restart` |
+| An entry's `kind` round-trips and reaches statement lines | `check_kind_survives_a_round_trip` |
+| Posting dimensions round-trip | `check_dimensions_survive_a_round_trip` |
+| `balance`, `trial_balance` and `balances` agree | `check_balances_agree_across_readers` |
+| Statement paging neither repeats nor skips a line | `check_statement_pages_do_not_repeat_or_skip` |
+| A checkpoint written is the checkpoint read, tree head included | `check_checkpoints_round_trip` |
+| Periods persist with their state; seals chain and verify | `check_period_lifecycle_and_seals` |
 
-This is not decoration. Extending the suite from nine checks to twelve immediately failed the
-PostgreSQL backend on two counts — a reversal could be reversed, and a clearing could be reset
-twice — because the schema's constraints cannot express relational rules like "the target is
-not itself a reversal" or "this `UPDATE` matched nothing." Both are fixed; the point is that a
-backend which looked correct was not, and only an executable contract said so.
+This is not decoration. Every extension of the suite has failed a backend that looked correct.
+Going from nine checks to twelve caught two in PostgreSQL — a reversal could be reversed, and a
+clearing could be reset twice — because the schema's constraints cannot express relational rules
+like "the target is not itself a reversal" or "this `UPDATE` matched nothing". Going from
+fourteen to nineteen caught another in both SQL backends: the first page of an account statement
+opened its running balance at the account's *closing* figure, because "everything before this
+page" had been computed as "everything", and no test had ever compared a paged statement against
+an unpaged one. All are fixed; the point is that only an executable contract said so.
 
 Reads are **cursor-paged rather than streamed**: a cursor maps onto
 `WHERE index > ? ORDER BY index LIMIT ?` in any SQL backend, survives a dropped connection,
@@ -653,6 +703,30 @@ rather than assuming it: if unqualified names would resolve somewhere else it re
 yourself, set `options=-c search_path=<schema>` on it and declare it with `.in_schema(...)`.
 
 SQLite needs none of this — one ledger per file already is the isolation.
+
+### The calendar lives in the store
+
+Periods are store state, not caller state. A sealed period held only in memory comes back
+**open** after a restart and starts accepting postings into books that have already been
+committed to — so `define_period`, `transition_period`, `periods` and `seal_period` are all on
+the trait, and sealing reads the period's state from storage rather than from an argument.
+
+```rust,ignore
+// Declare the calendar on every start-up; re-declaring an identical period is a no-op.
+for period in months_of(2026) {
+    store.define_period(&period).await?;
+}
+
+// Close, then seal. Stopping postings is a separate, earlier decision.
+store.transition_period(&march, PeriodState::Closing).await?;
+let seal = store.seal_period(&march).await?;
+
+// For local validation without a round trip per entry:
+let calendar = PeriodCalendar::from_periods(store.periods().await?)?;
+```
+
+Re-declaring the same identifier over a *different* range is an error: that would move the
+boundary of a period entries have already been booked into.
 
 ### Account handles outlive the process
 
@@ -836,9 +910,13 @@ snapshot log is append-only, and every write is an `append` operation, so a snap
 anything else is itself evidence.
 
 Rows are one per **posting**, with the owning entry's fields repeated and the `period` that
-archived them — a natural partition key. Two column types differ from the engine's, because
-Iceberg has neither unsigned nor 16-bit integers: `log_index` is `Int64` and `posting_index` is
-`Int32`.
+archived them — a natural partition key. The column set is deliberately *complete*: every field
+the content hash is computed over is archived, idempotency key and document reference included,
+so an auditor can recompute an entry's hash from the table alone rather than having to trust the
+`content_hash` column. Posting axes travel as a canonical JSON object in `dimensions`, because
+the axis names are yours and cannot be columns. Two column types differ from the engine's,
+because Iceberg has neither unsigned nor 16-bit integers: `log_index` is `Int64` and
+`posting_index` is `Int32`.
 
 ---
 
@@ -876,8 +954,12 @@ Beyond that:
   silently invalidates every hash ever written while leaving the suite green.
 - **Robustness.** No input, however malformed, may panic a parser or a deserialiser. A panic on
   hostile input is a denial of service in something meant to be a system of record.
-- **Conformance.** The storage contract, executable — run against both the in-memory and the
-  PostgreSQL backend.
+- **Cost.** A guard on the shape of the curve, not on wall-clock: appending four times as many
+  entries must not take sixteen times as long. Quadratic behaviour in a ledger fails no test —
+  it just makes the books slower the longer they are kept.
+- **Conformance.** The storage contract, executable — nineteen checks, run against the
+  in-memory, SQLite and PostgreSQL backends, and against PostgreSQL twice, once per sequencing
+  mode.
 - **Real databases.** SQLite runs in-process; the PostgreSQL tests start a throwaway container.
   Nothing is mocked: the constraints, the locking, the deferred triggers, and the behaviour
   under concurrent appends are the real ones, because those are exactly the parts that cannot
@@ -913,12 +995,12 @@ outside the program. Every validated type here therefore round-trips through its
 own constructor:
 
 ```rust
-# use doubleentry::{ActivityId, Amount, Currency};
+# use doubleentry::{Amount, Currency, Label};
 # type Eur = Amount<2>;
 # #[cfg(feature = "serde")] {
 // Values no constructor would accept do not survive a round trip.
 assert!(serde_json::from_str::<Currency>("\"eur\"").is_err());
-assert!(serde_json::from_str::<ActivityId>("\"\"").is_err());
+assert!(serde_json::from_str::<Label>("\"\"").is_err());
 
 // Money is a decimal string, never a raw scaled integer — the integer is
 // meaningless without knowing the scale.

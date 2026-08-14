@@ -31,7 +31,7 @@ use crate::account::{Account, AccountId, AccountKind, AccountPath, AccountRecord
 use crate::balance::{Balance, BalanceKey, TrialBalance};
 use crate::checkpoint::Checkpoint;
 use crate::clearing::{Clearing, ClearingError, ClearingId, OpenItem, PostingRef};
-use crate::dimensions::{ActivityId, CostObjectId, Dimensions, Label, PartyId, SegmentId};
+use crate::dimensions::{Dimensions, Label};
 use crate::entry::{
     Balanced, Description, DocumentRef, Draft, Entry, EntryId, IdempotencyKey, IntegrityError,
     Provenance,
@@ -39,11 +39,11 @@ use crate::entry::{
 use crate::hash::Hash;
 use crate::journal::{LogIndex, Recorded};
 use crate::merkle::{
-    ConsistencyProof, InclusionProof, MerkleAccumulator, MerkleLog, ProofError, TreeHead,
-    empty_root,
+    ConsistencyProof, InclusionProof, MalformedAccumulator, MerkleAccumulator, MerkleLog,
+    ProofError, TreeHead, empty_root,
 };
 use crate::money::{Amount, Currency, MoneyError};
-use crate::period::{LedgerId, PeriodCalendar, PeriodId, PeriodState};
+use crate::period::{LedgerId, Period, PeriodCalendar, PeriodId, PeriodState};
 use crate::posting::{Direction, Layer, Posting};
 use crate::seal::{PeriodCoverage, Seal, SealChain};
 use crate::storage::{Cursor, EntryBatch, LedgerStore, Page, StatementPage, StoredEntry};
@@ -123,6 +123,18 @@ pub enum SqliteError {
         /// The offending identifier.
         id: ClearingId,
     },
+    /// The persisted Merkle accumulator does not describe the stored log.
+    #[error(transparent)]
+    Accumulator(#[from] MalformedAccumulator),
+    /// The entry identifier is already used by a different entry.
+    #[error("entry {id} is already recorded")]
+    DuplicateId {
+        /// The offending identifier.
+        id: EntryId,
+    },
+    /// The calendar refused a period operation.
+    #[error(transparent)]
+    Period(#[from] crate::period::PeriodError),
     /// The database already holds a different ledger.
     #[error("this database holds ledger {found}, not {expected}")]
     WrongLedger {
@@ -196,29 +208,13 @@ impl<const P: u8> SqliteStore<P> {
         Ok(())
     }
 
-    /// Defines a period so it can later be sealed.
+    /// The calendar as the database holds it.
     ///
     /// # Errors
     ///
-    /// Returns any error the database raises.
-    pub async fn define_period(
-        &self,
-        id: &PeriodId,
-        starts_on: Date,
-        ends_on: Date,
-        state: PeriodState,
-    ) -> Result<(), SqliteError> {
-        sqlx::query(
-            "INSERT INTO periods (period_id, starts_on, ends_on, state) VALUES (?1, ?2, ?3, ?4) \
-             ON CONFLICT (period_id) DO UPDATE SET state = excluded.state",
-        )
-        .bind(id.as_str())
-        .bind(starts_on)
-        .bind(ends_on)
-        .bind(period_state_str(state))
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+    /// Returns any error the database raises, or a malformed row.
+    pub async fn calendar(&self) -> Result<PeriodCalendar, SqliteError> {
+        Ok(PeriodCalendar::from_periods(self.periods().await?)?)
     }
 
     async fn log(&self) -> Result<MerkleLog, SqliteError> {
@@ -248,14 +244,17 @@ impl<const P: u8> SqliteStore<P> {
             let node: Vec<u8> = row.try_get("node")?;
             subtrees.push((u8::try_from(height).unwrap_or(0), hash_from_bytes(&node)?));
         }
-        let size: i64 = sqlx::query("SELECT COUNT(*) AS n FROM entries")
-            .fetch_one(&mut **tx)
-            .await?
-            .try_get("n")?;
-        Ok(MerkleAccumulator::from_parts(
+        let size: i64 =
+            sqlx::query("SELECT COUNT(*) AS n FROM entries WHERE log_index IS NOT NULL")
+                .fetch_one(&mut **tx)
+                .await?
+                .try_get("n")?;
+        // Checked, not trusted: a row lost, duplicated or returned out of order
+        // would otherwise produce a plausible-looking wrong root.
+        Ok(MerkleAccumulator::try_from_parts(
             subtrees,
             u64::try_from(size).unwrap_or(0),
-        ))
+        )?)
     }
 
     async fn store_accumulator(
@@ -329,6 +328,23 @@ impl<const P: u8> SqliteStore<P> {
     ) -> Result<Recorded, SqliteError> {
         let content_hash = entry.content_hash();
 
+        // The primary key would refuse this anyway; catching it here turns a
+        // constraint violation into an error that names what went wrong. Scoped
+        // to a *different* idempotency key, so a genuine retry — same
+        // identifier, same key — still falls through to the replay path below
+        // rather than being reported as a clash with itself.
+        let clash: Option<i64> =
+            sqlx::query("SELECT 1 AS x FROM entries WHERE entry_id = ?1 AND idempotency_key <> ?2")
+                .bind(uuid_bytes(entry.id()))
+                .bind(entry.idempotency_key().as_bytes())
+                .fetch_optional(&mut **tx)
+                .await?
+                .map(|row| row.try_get("x"))
+                .transpose()?;
+        if clash.is_some() {
+            return Err(SqliteError::DuplicateId { id: entry.id() });
+        }
+
         if let Some(original) = entry.reverses() {
             Self::check_reversal(tx, entry, original).await?;
         }
@@ -398,25 +414,35 @@ impl<const P: u8> SqliteStore<P> {
 
         let assigned: i64 = row.try_get("log_index")?;
         for (position, posting) in entry.postings().iter().enumerate() {
+            let position = i64::try_from(position).unwrap_or(i64::MAX);
             sqlx::query(
                 "INSERT INTO postings ( \
                     entry_id, posting_index, account_index, direction, amount_minor, currency, \
-                    layer, dim_activity, dim_segment, dim_cost_object, dim_party \
-                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                    layer \
+                 ) VALUES (?1,?2,?3,?4,?5,?6,?7)",
             )
             .bind(uuid_bytes(entry.id()))
-            .bind(i64::try_from(position).unwrap_or(i64::MAX))
+            .bind(position)
             .bind(i64::from(posting.account.index()))
             .bind(direction_str(posting.direction))
             .bind(posting.amount.to_minor())
             .bind(posting.currency.code())
             .bind(layer_str(posting.layer))
-            .bind(posting.dimensions.activity.as_ref().map(|d| d.as_str()))
-            .bind(posting.dimensions.segment.as_ref().map(|d| d.as_str()))
-            .bind(posting.dimensions.cost_object.as_ref().map(|d| d.as_str()))
-            .bind(posting.dimensions.party.as_ref().map(|d| d.as_str()))
             .execute(&mut **tx)
             .await?;
+
+            for (axis, value) in posting.dimensions.iter() {
+                sqlx::query(
+                    "INSERT INTO posting_dimensions (entry_id, posting_index, axis, value) \
+                     VALUES (?1,?2,?3,?4)",
+                )
+                .bind(uuid_bytes(entry.id()))
+                .bind(position)
+                .bind(axis.as_str())
+                .bind(value.as_str())
+                .execute(&mut **tx)
+                .await?;
+            }
         }
 
         *next_index = next_index.saturating_add(1);
@@ -448,30 +474,50 @@ impl<const P: u8> SqliteStore<P> {
             .join(",");
         let sql = format!(
             "SELECT entry_id, posting_index, account_index, direction, amount_minor, currency, \
-             layer, dim_activity, dim_segment, dim_cost_object, dim_party \
+             layer \
              FROM postings WHERE entry_id IN ({placeholders}) ORDER BY entry_id, posting_index"
         );
         let mut query = sqlx::query(&sql);
         for id in ids {
             query = query.bind(id.clone());
         }
+
+        // One query for the axes too, rather than one per posting.
+        let dim_sql = format!(
+            "SELECT entry_id, posting_index, axis, value FROM posting_dimensions \
+             WHERE entry_id IN ({placeholders}) ORDER BY entry_id, posting_index, axis"
+        );
+        let mut dim_query = sqlx::query(&dim_sql);
+        for id in ids {
+            dim_query = dim_query.bind(id.clone());
+        }
+        let dimensions = dimensions_from(&dim_query.fetch_all(&self.pool).await?)?;
+
         for row in &query.fetch_all(&self.pool).await? {
             let entry_id: Vec<u8> = row.try_get("entry_id")?;
-            grouped
-                .entry(entry_id)
-                .or_default()
-                .push(build_posting::<P>(row)?);
+            let posting_index: i64 = row.try_get("posting_index")?;
+            let mut posting = build_posting::<P>(row)?;
+            if let Some(dims) = dimensions.get(&(entry_id.clone(), posting_index)) {
+                posting.dimensions = dims.clone();
+            }
+            grouped.entry(entry_id).or_default().push(posting);
         }
         Ok(grouped)
     }
 
+    /// Folds every *sequenced* entry booked on or before `end`.
+    ///
+    /// The `log_index IS NOT NULL` predicate is what keeps a seal honest: the
+    /// tree head it carries covers only sequenced entries, so a closing balance
+    /// that folded in unsequenced ones would commit to money the tree head does
+    /// not account for.
     async fn trial_balance_through_date(&self, end: Date) -> Result<TrialBalance<P>, SqliteError> {
         let rows = sqlx::query(
             "SELECT p.account_index, p.currency, p.layer, \
                COALESCE(SUM(CASE WHEN p.direction = 'D' THEN p.amount_minor END), 0) AS debits, \
                COALESCE(SUM(CASE WHEN p.direction = 'C' THEN p.amount_minor END), 0) AS credits \
              FROM postings p JOIN entries e ON e.entry_id = p.entry_id \
-             WHERE e.booking_date <= ?1 \
+             WHERE e.log_index IS NOT NULL AND e.booking_date <= ?1 \
              GROUP BY p.account_index, p.currency, p.layer \
              ORDER BY p.account_index, p.currency, p.layer",
         )
@@ -549,24 +595,6 @@ fn build_posting<const P: u8>(row: &sqlx::sqlite::SqliteRow) -> Result<Posting<P
         other => return Err(SqliteError::malformed(format!("layer {other:?}"))),
     };
 
-    let mut dimensions = Dimensions::none();
-    if let Some(v) = row.try_get::<Option<String>, _>("dim_activity")? {
-        dimensions.activity =
-            Some(ActivityId::new(v).map_err(|e| SqliteError::malformed(e.to_string()))?);
-    }
-    if let Some(v) = row.try_get::<Option<String>, _>("dim_segment")? {
-        dimensions.segment =
-            Some(SegmentId::new(v).map_err(|e| SqliteError::malformed(e.to_string()))?);
-    }
-    if let Some(v) = row.try_get::<Option<String>, _>("dim_cost_object")? {
-        dimensions.cost_object =
-            Some(CostObjectId::new(v).map_err(|e| SqliteError::malformed(e.to_string()))?);
-    }
-    if let Some(v) = row.try_get::<Option<String>, _>("dim_party")? {
-        dimensions.party =
-            Some(PartyId::new(v).map_err(|e| SqliteError::malformed(e.to_string()))?);
-    }
-
     Ok(Posting {
         account: AccountId::from_index(u32::try_from(account).unwrap_or(0)),
         direction,
@@ -574,8 +602,28 @@ fn build_posting<const P: u8>(row: &sqlx::sqlite::SqliteRow) -> Result<Posting<P
         currency: Currency::new(currency.trim())
             .map_err(|_| SqliteError::malformed(format!("currency {currency:?}")))?,
         layer,
-        dimensions,
+        dimensions: Dimensions::none(),
     })
+}
+
+/// `(entry_id, posting_index)` to the axes attached to that posting.
+type DimensionIndex = BTreeMap<(Vec<u8>, i64), Dimensions>;
+
+fn dimensions_from(rows: &[sqlx::sqlite::SqliteRow]) -> Result<DimensionIndex, SqliteError> {
+    let mut out: DimensionIndex = BTreeMap::new();
+    for row in rows {
+        let entry_id: Vec<u8> = row.try_get("entry_id")?;
+        let posting_index: i64 = row.try_get("posting_index")?;
+        let axis: String = row.try_get("axis")?;
+        let value: String = row.try_get("value")?;
+        let slot = out.entry((entry_id, posting_index)).or_default();
+        slot.set(
+            Label::new(axis).map_err(|e| SqliteError::malformed(e.to_string()))?,
+            Label::new(value).map_err(|e| SqliteError::malformed(e.to_string()))?,
+        )
+        .map_err(|e| SqliteError::malformed(e.to_string()))?;
+    }
+    Ok(out)
 }
 
 fn build_trial_balance<const P: u8>(
@@ -689,22 +737,49 @@ async fn load_postings_tx<const P: u8>(
     entry_id: Vec<u8>,
 ) -> Result<Vec<Posting<P>>, SqliteError> {
     let rows = sqlx::query(
-        "SELECT posting_index, account_index, direction, amount_minor, currency, layer, \
-         dim_activity, dim_segment, dim_cost_object, dim_party \
+        "SELECT posting_index, account_index, direction, amount_minor, currency, layer \
          FROM postings WHERE entry_id = ?1 ORDER BY posting_index",
     )
-    .bind(entry_id)
+    .bind(entry_id.clone())
     .fetch_all(&mut **tx)
     .await?;
-    rows.iter().map(build_posting::<P>).collect()
+    let dim_rows = sqlx::query(
+        "SELECT entry_id, posting_index, axis, value FROM posting_dimensions \
+         WHERE entry_id = ?1 ORDER BY posting_index, axis",
+    )
+    .bind(entry_id.clone())
+    .fetch_all(&mut **tx)
+    .await?;
+    let dimensions = dimensions_from(&dim_rows)?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let posting_index: i64 = row.try_get("posting_index")?;
+        let mut posting = build_posting::<P>(row)?;
+        if let Some(dims) = dimensions.get(&(entry_id.clone(), posting_index)) {
+            posting.dimensions = dims.clone();
+        }
+        out.push(posting);
+    }
+    Ok(out)
+}
+
+/// What a clearing needs to know about one posting: which side, which account,
+/// which currency, which layer, and how much of it is still open.
+struct PostingFacts<const P: u8> {
+    direction: Direction,
+    account: AccountId,
+    currency: Currency,
+    layer: Layer,
+    residual: Amount<P>,
 }
 
 async fn posting_facts<const P: u8>(
     tx: &mut Transaction<'_, Sqlite>,
     reference: PostingRef,
-) -> Result<(Direction, AccountId, Currency, Amount<P>), SqliteError> {
+) -> Result<PostingFacts<P>, SqliteError> {
     let row = sqlx::query(
-        "SELECT p.direction, p.account_index, p.currency, \
+        "SELECT p.direction, p.account_index, p.currency, p.layer, \
            p.amount_minor - COALESCE(( \
                SELECT SUM(ci.applied_minor) FROM clearing_items ci \
                JOIN clearings c ON c.clearing_id = ci.clearing_id \
@@ -722,18 +797,23 @@ async fn posting_facts<const P: u8>(
     let direction: String = row.try_get("direction")?;
     let account: i64 = row.try_get("account_index")?;
     let currency: String = row.try_get("currency")?;
+    let layer: String = row.try_get("layer")?;
     let residual: i64 = row.try_get("residual")?;
 
-    Ok((
-        match direction.as_str() {
+    Ok(PostingFacts {
+        direction: match direction.as_str() {
             "D" => Direction::Debit,
             _ => Direction::Credit,
         },
-        AccountId::from_index(u32::try_from(account).unwrap_or(0)),
-        Currency::new(currency.trim())
+        account: AccountId::from_index(u32::try_from(account).unwrap_or(0)),
+        currency: Currency::new(currency.trim())
             .map_err(|_| SqliteError::malformed(format!("currency {currency:?}")))?,
-        Amount::from_minor(residual),
-    ))
+        layer: match layer.as_str() {
+            "pending" => Layer::Pending,
+            _ => Layer::Settled,
+        },
+        residual: Amount::from_minor(residual),
+    })
 }
 
 impl<const P: u8> LedgerStore<P> for SqliteStore<P> {
@@ -933,12 +1013,55 @@ impl<const P: u8> LedgerStore<P> for SqliteStore<P> {
         Ok(self.log().await?.consistency_proof(old_size)?)
     }
 
-    async fn seal_period(
+    async fn define_period(&self, period: &Period) -> Result<(), Self::Error> {
+        // Non-overlap is not expressible in SQLite, so it is checked here
+        // against everything already stored — the same rule `PeriodCalendar`
+        // applies, run at the point of writing rather than trusted afterwards.
+        let mut calendar = self.calendar().await?;
+        calendar.ensure(period.clone())?;
+
+        sqlx::query(
+            "INSERT INTO periods (period_id, starts_on, ends_on, state) VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT (period_id) DO UPDATE SET \
+                starts_on = excluded.starts_on, \
+                ends_on   = excluded.ends_on, \
+                state     = excluded.state",
+        )
+        .bind(period.id.as_str())
+        .bind(period.start)
+        .bind(period.end)
+        .bind(period_state_str(period.state))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn transition_period(
         &self,
         period: &PeriodId,
-        calendar: &mut PeriodCalendar,
-    ) -> Result<Seal, Self::Error> {
-        let Some(definition) = calendar.get(period).cloned() else {
+        to: PeriodState,
+    ) -> Result<(), Self::Error> {
+        let mut calendar = self.calendar().await?;
+        calendar.transition(period, to)?;
+        sqlx::query("UPDATE periods SET state = ?2 WHERE period_id = ?1")
+            .bind(period.as_str())
+            .bind(period_state_str(to))
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn periods(&self) -> Result<Vec<Period>, Self::Error> {
+        let rows = sqlx::query(
+            "SELECT period_id, starts_on, ends_on, state FROM periods ORDER BY starts_on",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(period_row).collect()
+    }
+
+    async fn seal_period(&self, period: &PeriodId) -> Result<Seal, Self::Error> {
+        let Some(definition) = self.periods().await?.into_iter().find(|p| p.id == *period) else {
             return Err(SqliteError::UnknownPeriod {
                 period: period.clone(),
             });
@@ -950,9 +1073,13 @@ impl<const P: u8> LedgerStore<P> for SqliteStore<P> {
             });
         }
 
+        // Sequenced entries only. An entry with no position is not in the log
+        // the tree head commits to, so counting it here would have the seal
+        // claim coverage the head does not support.
         let span = sqlx::query(
             "SELECT MIN(log_index) AS first, MAX(log_index) AS last, COUNT(*) AS n \
-             FROM entries WHERE booking_date BETWEEN ?1 AND ?2",
+             FROM entries \
+             WHERE log_index IS NOT NULL AND booking_date BETWEEN ?1 AND ?2",
         )
         .bind(definition.start)
         .bind(definition.end)
@@ -1008,10 +1135,6 @@ impl<const P: u8> LedgerStore<P> for SqliteStore<P> {
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
-
-        calendar
-            .transition(period, PeriodState::Sealed)
-            .map_err(|e| SqliteError::malformed(e.to_string()))?;
         Ok(seal)
     }
 
@@ -1076,34 +1199,52 @@ impl<const P: u8> LedgerStore<P> for SqliteStore<P> {
 
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
 
+        // A repeated identifier is a caller mistake, not a database failure, so
+        // it is named rather than surfacing as a primary-key violation.
+        let taken: Option<i64> = sqlx::query("SELECT 1 AS x FROM clearings WHERE clearing_id = ?1")
+            .bind(clearing_bytes(clearing.id))
+            .fetch_optional(&mut *tx)
+            .await?
+            .map(|row| row.try_get("x"))
+            .transpose()?;
+        if taken.is_some() {
+            return Err(ClearingError::DuplicateId { id: clearing.id }.into());
+        }
+
         let mut sides = Balance::<P>::ZERO;
         for item in &clearing.items {
-            let (direction, account, currency, residual) =
-                posting_facts::<P>(&mut tx, item.posting).await?;
-            if account != clearing.account {
+            let facts = posting_facts::<P>(&mut tx, item.posting).await?;
+            if facts.account != clearing.account {
                 return Err(ClearingError::WrongAccount {
                     posting: item.posting,
                     expected: clearing.account,
                 }
                 .into());
             }
-            if currency != clearing.currency {
+            if facts.currency != clearing.currency {
                 return Err(ClearingError::WrongCurrency {
                     posting: item.posting,
                     expected: clearing.currency,
                 }
                 .into());
             }
-            if item.applied > residual {
+            if facts.layer != clearing.layer {
+                return Err(ClearingError::WrongLayer {
+                    posting: item.posting,
+                    expected: clearing.layer,
+                }
+                .into());
+            }
+            if item.applied > facts.residual {
                 return Err(ClearingError::OverApplied {
                     posting: item.posting,
                     requested_minor: item.applied.to_minor(),
-                    residual_minor: residual.to_minor(),
+                    residual_minor: facts.residual.to_minor(),
                     scale: P,
                 }
                 .into());
             }
-            sides.add(direction, item.applied)?;
+            sides.add(facts.direction, item.applied)?;
         }
         if !sides.is_balanced() {
             return Err(ClearingError::Unbalanced {
@@ -1115,12 +1256,13 @@ impl<const P: u8> LedgerStore<P> for SqliteStore<P> {
         }
 
         sqlx::query(
-            "INSERT INTO clearings (clearing_id, account_index, currency, cleared_on) \
-             VALUES (?1,?2,?3,?4)",
+            "INSERT INTO clearings (clearing_id, account_index, currency, layer, cleared_on) \
+             VALUES (?1,?2,?3,?4,?5)",
         )
         .bind(clearing_bytes(clearing.id))
         .bind(i64::from(clearing.account.index()))
         .bind(clearing.currency.code())
+        .bind(layer_str(clearing.layer))
         .bind(clearing.cleared_on)
         .execute(&mut *tx)
         .await?;
@@ -1245,15 +1387,22 @@ impl<const P: u8> LedgerStore<P> for SqliteStore<P> {
         let after = cursor
             .after
             .map_or(-1i64, |i| i64::try_from(i.get()).unwrap_or(i64::MAX));
-        let limit = i64::try_from(cursor.effective_limit()).unwrap_or(i64::MAX);
+        let limit = cursor.effective_limit();
 
-        // The running balance needs everything before the page, summed in the
-        // database rather than by reading the account's whole history.
-        let opening = self
-            .balance(key, cursor.after.map(|i| LogIndex::new(i.get())))
-            .await?;
+        // The running balance needs everything strictly before the page, summed
+        // in the database rather than by reading the account's whole history.
+        // Nothing precedes the first page — reading the account's full balance
+        // here would start every statement at its own closing figure.
+        let opening = match cursor.after {
+            Some(after) => self.balance(key, Some(after)).await?,
+            None => Balance::ZERO,
+        };
 
-        let rows = sqlx::query(
+        // One row past the page, so "is there more" is answered by the query
+        // rather than guessed from a full page — which would hand back a cursor
+        // that yields nothing.
+        let probe = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
+        let mut rows = sqlx::query(
             "SELECT e.log_index, e.entry_id, e.booking_date, e.kind, p.posting_index, \
                     p.direction, p.amount_minor \
              FROM postings p JOIN entries e ON e.entry_id = p.entry_id \
@@ -1265,9 +1414,11 @@ impl<const P: u8> LedgerStore<P> for SqliteStore<P> {
         .bind(key.currency.code())
         .bind(layer_str(key.layer))
         .bind(after)
-        .bind(limit)
+        .bind(probe)
         .fetch_all(&self.pool)
         .await?;
+        let has_more = rows.len() > limit;
+        rows.truncate(limit);
 
         let mut running = opening;
         let mut lines = Vec::with_capacity(rows.len());
@@ -1297,13 +1448,10 @@ impl<const P: u8> LedgerStore<P> for SqliteStore<P> {
             });
         }
 
-        let next = lines
-            .last()
-            .filter(|_| lines.len() >= cursor.effective_limit())
-            .map(|l| Cursor {
-                after: Some(l.index),
-                limit: cursor.limit,
-            });
+        let next = lines.last().filter(|_| has_more).map(|l| Cursor {
+            after: Some(l.index),
+            limit: cursor.limit,
+        });
         Ok(StatementPage { lines, next })
     }
 
@@ -1388,6 +1536,25 @@ fn kind_from_code(code: &str) -> Option<AccountKind> {
         "expense" => Some(AccountKind::Expense),
         _ => None,
     }
+}
+
+/// Rebuilds one period definition from its row.
+fn period_row(row: &sqlx::sqlite::SqliteRow) -> Result<Period, SqliteError> {
+    let id: String = row.try_get("period_id")?;
+    let state: String = row.try_get("state")?;
+    let mut period = Period::new(
+        PeriodId::new(id).map_err(|e| SqliteError::malformed(e.to_string()))?,
+        row.try_get("starts_on")?,
+        row.try_get("ends_on")?,
+    )
+    .map_err(|e| SqliteError::malformed(e.to_string()))?;
+    period.state = match state.as_str() {
+        "open" => PeriodState::Open,
+        "closing" => PeriodState::Closing,
+        "sealed" => PeriodState::Sealed,
+        other => return Err(SqliteError::malformed(format!("period state {other:?}"))),
+    };
+    Ok(period)
 }
 
 /// Rebuilds one handle-to-account binding from its row.

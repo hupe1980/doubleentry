@@ -6,8 +6,14 @@
 //! ledger ever written by this crate, while leaving the test suite green.
 //!
 //! These vectors are the tripwire. A change here is either a mistake, or a
-//! deliberate format revision that has to be accompanied by a new encoding
-//! version and a migration plan for existing seals.
+//! deliberate format revision.
+//!
+//! Before the first release, a deliberate revision means regenerating these
+//! values — `just golden-emit` prints them — because there are no ledgers in the
+//! world to be compatible with. After it, it means bumping the encoding version
+//! in the domain tag (`doubleentry/entry/v1`) as well, so old bytes are never
+//! silently reinterpreted under a new format, and writing down how existing
+//! seals migrate.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
@@ -20,13 +26,17 @@ use doubleentry::merkle::{MerkleLog, empty_root, leaf_hash};
 use doubleentry::period::{LedgerId, PeriodCalendar, PeriodId};
 use doubleentry::seal::{PeriodCoverage, Seal};
 use doubleentry::{
-    ActivityId, Amount, Balanced, Currency, Description, Dimensions, DocumentRef, Entry, EntryId,
-    Hash, IdempotencyKey, Posting, Provenance, SegmentId,
+    Amount, Balanced, Currency, Description, Dimensions, DocumentRef, Entry, EntryId, Hash,
+    IdempotencyKey, Label, Posting, Provenance,
 };
 use time::macros::date;
 use uuid::Uuid;
 
 type Eur = Amount<2>;
+
+fn label(s: &str) -> Label {
+    Label::new(s).expect("valid label")
+}
 
 /// A fixed leaf payload, derived without a clock or a random source.
 fn leaf(i: u64) -> Hash {
@@ -58,8 +68,10 @@ fn reference_entry() -> Entry<Balanced, 2> {
     };
 
     let dimensions = Dimensions::none()
-        .with_activity(ActivityId::new("Network").expect("valid"))
-        .with_segment(SegmentId::new("Electricity").expect("valid"));
+        .with(label("activity"), label("Network"))
+        .expect("fits")
+        .with(label("segment"), label("Electricity"))
+        .expect("fits");
 
     // A fixed identifier: excluded from the encoding, but pinned so the vector
     // is reproducible end to end.
@@ -98,13 +110,13 @@ fn canonical_encoding_of_the_reference_entry_is_unchanged() {
     let hex: String = encoded.iter().map(|b| format!("{b:02x}")).collect();
 
     let expected = concat!(
-        "0211000000676f6c64656e2d766563746f722d6b6579ea0700030fea070003110f000000",
-        "7265666572656e636520656e747279020000000000000000d8d001000000000045555200",
-        "01070000004e6574776f726b010b000000456c65637472696369747900000100000001d8",
-        "d0010000000000455552000000000000010700000061756469746f720106000000676f6c",
-        "64656e00010d000000494e562d323032362d303030310133333333333333333333333333",
-        "333333333333333333333333333333333333330122222222222222222222222222222222",
-        "01ea07000201"
+        "0211000000676f6c64656e2d766563746f722d6b6579ea0700030fea070003110f0000",
+        "007265666572656e636520656e747279020000000000000000d8d00100000000004555",
+        "520002000000080000006163746976697479070000004e6574776f726b070000007365",
+        "676d656e740b000000456c6563747269636974790100000001d8d00100000000004555",
+        "52000000000000010700000061756469746f720106000000676f6c64656e00010d0000",
+        "00494e562d323032362d30303031013333333333333333333333333333333333333333",
+        "333333333333333333333333012222222222222222222222222222222201ea07000201",
     );
     assert_eq!(
         hex, expected,
@@ -116,7 +128,7 @@ fn canonical_encoding_of_the_reference_entry_is_unchanged() {
 fn the_reference_entry_content_hash_is_unchanged() {
     assert_eq!(
         reference_entry().content_hash().to_hex(),
-        "f66e3336de6c252956600bba9b2e6ab78ec41c9130f8b95a036c6e896d4e8a50",
+        "0237cc80981925555b91e7553e5af80319dfb1bfb872472b7f1ec3caedaf34a3",
         "the entry content hash changed; see this file's module docs"
     );
 }

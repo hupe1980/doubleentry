@@ -20,7 +20,19 @@
 //!   party holding only a tree head can be given an `O(log n)` proof that an
 //!   entry is included, and an `O(log n)` proof that the log was only appended
 //!   to. Closing a period emits a [`Seal`] that commits to both its entries and
-//!   its closing balances, chained to the seal before it.
+//!   its closing balances, chained to the seal before it — and a single closing
+//!   balance can be proven against that seal with a [`BalanceProof`], without
+//!   handing over the rest of the trial balance.
+//!
+//! # Where to start
+//!
+//! A [`Journal`] is one entity's books: its accounts, its calendar, its policy,
+//! its entries, its Merkle log, its seals, its clearings. Register accounts on
+//! it, hand it drafts, and read balances, statements and proofs back out. When
+//! the books have to survive the process, put a [`LedgerStore`] behind it —
+//! [`MemoryStore`], `SqliteStore` or `PostgresStore` — and the semantics are the
+//! same, because the [`conformance`](storage::conformance) suite is what decides
+//! whether a backend is one.
 //!
 //! # Layout
 //!
@@ -28,17 +40,17 @@
 //! |---|---|
 //! | [`money`] | `Amount<P>` and `Currency` — exact scaled-integer arithmetic |
 //! | [`account`] | The account tree and what may be posted to |
-//! | [`dimensions`] | Typed tags orthogonal to the account path |
+//! | [`dimensions`] | `Label`, and the caller-named axes a posting is sliced by |
 //! | [`posting`] | `Direction`, `Layer`, and the atomic movement |
 //! | [`entry`] | The type-state entry and its validation |
 //! | [`balance`] | Gross-preserving balances and trial balances |
 //! | [`period`] | Period definitions and their lifecycle |
-//! | [`journal`] | Append-only journal, idempotency, corrections, statements |
+//! | [`journal`] | The books: accounts, calendar, entries, idempotency, corrections, statements |
 //! | [`clearing`] | Open-item matching and residual tracking |
 //! | [`closing`] | Year-end closing entries |
 //! | [`storage`] | Persistence traits, in-memory / SQLite / PostgreSQL backends, Iceberg cold tier, conformance suite |
 //! | [`merkle`] | The append-only log and its proofs |
-//! | [`seal`] | Period seals and the seal chain |
+//! | [`seal`] | Period seals, the seal chain, and balance proofs |
 //! | [`checkpoint`] | Balance checkpoints and external assertions |
 //! | [`canonical`] | The byte encoding everything is hashed from |
 //! | [`hash`] | Domain-separated digests |
@@ -100,24 +112,25 @@ pub use clearing::{
     PostingLookup, PostingRef,
 };
 pub use closing::{ClosingError, closing_postings};
-pub use dimensions::{
-    ActivityId, CostObjectId, DimensionError, Dimensions, Label, PartyId, SegmentId,
-};
+pub use dimensions::{DimensionError, Dimensions, Label};
 pub use entry::{
     Balanced, CurrencyPolicy, Description, DocumentRef, Draft, Entry, EntryFieldError, EntryId,
     IdempotencyKey, IntegrityError, LedgerPolicy, Provenance, SealContext, ValidationError,
     ValidationErrors,
 };
-pub use hash::{Hash, ParseHashError};
+pub use hash::{Hash, ParseHashError, RESERVED_DOMAIN_PREFIX};
 pub use journal::{Journal, JournalError, LogIndex, NotSequenced, Recorded};
 pub use merkle::{
-    ConsistencyProof, InclusionProof, MerkleAccumulator, MerkleLog, ProofError, TreeHead,
-    empty_root, leaf_hash,
+    ConsistencyProof, InclusionProof, MalformedAccumulator, MerkleAccumulator, MerkleLog,
+    ProofError, TreeHead, empty_root, leaf_hash,
 };
 pub use money::{Amount, Currency, MoneyError};
 pub use period::{LedgerId, Period, PeriodCalendar, PeriodError, PeriodId, PeriodState};
 pub use posting::{Direction, Layer, Posting};
-pub use seal::{PeriodCoverage, Seal, SealChain, SealChainError, trial_balance_root};
+pub use seal::{
+    BalanceProof, PeriodCoverage, Seal, SealChain, SealChainError, TrialBalanceCommitment,
+    balance_leaf, trial_balance_root,
+};
 pub use storage::{
     BatchError, Cursor, DynLedgerStore, EntryBatch, LedgerStore, MemoryStore, MemoryStoreError,
     Page, StatementLine, StatementPage, StoredEntry,

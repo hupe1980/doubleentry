@@ -42,7 +42,7 @@ use crate::hash::Hash;
 use crate::journal::{Journal, JournalError, LogIndex, NotSequenced, Recorded};
 use crate::merkle::{ConsistencyProof, InclusionProof, TreeHead};
 use crate::money::Currency;
-use crate::period::{LedgerId, PeriodCalendar, PeriodId};
+use crate::period::{LedgerId, Period, PeriodId, PeriodState};
 use crate::posting::Layer;
 use crate::seal::Seal;
 
@@ -233,7 +233,16 @@ impl<const P: u8> Page<P> {
 ///    the append or afterwards; if afterwards, [`LedgerStore::append`] returns
 ///    `index: None` until [`LedgerStore::sequence`] has run.
 /// 5. **Stable reads.** A record read twice returns the same bytes and the same
-///    content hash.
+///    content hash — every field of it, including the entry's `kind` and each
+///    posting's dimensions, because those are covered by that hash. A backend
+///    that drops one does not under-report; it makes the entry unreadable.
+/// 6. **Master data survives a restart.** An account comes back at the handle it
+///    was issued, and a period comes back in the state it was left in. Both are
+///    ledger state: a repointed handle rewrites which account history refers to,
+///    and a sealed period that reopens accepts postings into books already
+///    committed to.
+/// 7. **Seals chain.** [`LedgerStore::seals`] returns them in chain order, and
+///    what comes back reproduces a chain that verifies.
 ///
 /// # Sequencing
 ///
@@ -338,11 +347,46 @@ pub trait LedgerStore<const P: u8>: Send + Sync {
         old_size: u64,
     ) -> impl Future<Output = Result<ConsistencyProof, Self::Error>> + Send;
 
+    /// Defines an accounting period, or confirms one already defined.
+    ///
+    /// Periods live in the store because a sealed one has to stay sealed across
+    /// a restart. A calendar held only in the caller's memory would come back
+    /// open and start accepting postings into books that have been committed to.
+    ///
+    /// Re-defining an identical period is a no-op, so a caller may declare its
+    /// calendar on every start-up. Re-defining the same identifier over a
+    /// *different* range is an error: that moves the boundary of a period
+    /// entries have already been booked into.
+    fn define_period(
+        &self,
+        period: &Period,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    /// Moves a period through its lifecycle.
+    ///
+    /// Permitted transitions are `Open → Closing`, `Closing → Sealed`, and
+    /// `Closing → Open` to abandon a close that failed verification. Sealing is
+    /// [`LedgerStore::seal_period`]'s job, not this one's.
+    fn transition_period(
+        &self,
+        period: &PeriodId,
+        to: PeriodState,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    /// Every defined period with its persisted state, in start-date order.
+    ///
+    /// Feed this to [`PeriodCalendar::from_periods`](crate::PeriodCalendar::from_periods)
+    /// to rebuild a calendar for
+    /// local validation.
+    fn periods(&self) -> impl Future<Output = Result<Vec<Period>, Self::Error>> + Send;
+
     /// Seals a period, committing to its entries and closing balances.
+    ///
+    /// The period must be in [`PeriodState::Closing`]. On success it advances to
+    /// [`PeriodState::Sealed`] and the seal is appended to the chain.
     fn seal_period(
         &self,
         period: &PeriodId,
-        calendar: &mut PeriodCalendar,
     ) -> impl Future<Output = Result<Seal, Self::Error>> + Send;
 
     /// Every seal recorded, oldest first.
@@ -520,6 +564,12 @@ pub enum MemoryStoreError {
     /// The journal refused the operation.
     #[error(transparent)]
     Journal(#[from] JournalError),
+    /// An account binding could not be restored.
+    #[error(transparent)]
+    Account(#[from] crate::account::AccountError),
+    /// The calendar refused a period operation.
+    #[error(transparent)]
+    Period(#[from] crate::period::PeriodError),
     /// A proof could not be built.
     #[error(transparent)]
     Proof(#[from] crate::merkle::ProofError),
@@ -538,7 +588,6 @@ pub struct MemoryStore<const P: u8> {
     ledger: LedgerId,
     inner: Mutex<Journal<P>>,
     checkpoints: Mutex<BTreeMap<BalanceKey, Checkpoint<P>>>,
-    accounts: Mutex<BTreeMap<AccountId, AccountRecord>>,
 }
 
 impl<const P: u8> MemoryStore<P> {
@@ -549,7 +598,16 @@ impl<const P: u8> MemoryStore<P> {
             inner: Mutex::new(Journal::new(ledger.clone())),
             ledger,
             checkpoints: Mutex::new(BTreeMap::new()),
-            accounts: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// Wraps an existing journal, accounts, periods and all.
+    #[must_use]
+    pub fn from_journal(journal: Journal<P>) -> Self {
+        Self {
+            ledger: journal.ledger().clone(),
+            inner: Mutex::new(journal),
+            checkpoints: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -582,40 +640,32 @@ impl<const P: u8> LedgerStore<P> for MemoryStore<P> {
         &self.ledger
     }
 
-    async fn register_account(&self, record: &AccountRecord) -> Result<(), Self::Error> {
-        self.accounts
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .entry(record.id)
-            .or_insert_with(|| record.clone());
-        Ok(())
+    fn register_account(
+        &self,
+        record: &AccountRecord,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        let record = record.clone();
+        let result = self.with_mut(|journal| {
+            journal.accounts_mut().restore(record)?;
+            Ok(())
+        });
+        async move { result }
     }
 
-    async fn accounts(&self) -> Result<Vec<AccountRecord>, Self::Error> {
-        Ok(self
-            .accounts
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .values()
-            .cloned()
-            .collect())
+    fn accounts(&self) -> impl Future<Output = Result<Vec<AccountRecord>, Self::Error>> + Send {
+        let result = self.with(|journal| Ok(journal.account_records()));
+        async move { result }
     }
 
     fn append(
         &self,
         batch: &EntryBatch<P>,
     ) -> impl Future<Output = Result<Vec<Recorded>, Self::Error>> + Send {
-        let result = self.with_mut(|journal| {
-            // Atomicity: apply to a copy and adopt it only if every entry lands.
-            // A durable backend gets this from its transaction instead.
-            let mut staged = journal.clone();
-            let mut out = Vec::with_capacity(batch.len());
-            for entry in batch.entries() {
-                out.push(staged.record(entry.clone())?);
-            }
-            *journal = staged;
-            Ok(out)
-        });
+        // The journal applies the batch and undoes it exactly if any entry is
+        // refused. A durable backend gets the same guarantee from its
+        // transaction instead.
+        let result =
+            self.with_mut(|journal| Ok(journal.record_batch(batch.entries().iter().cloned())?));
         async move { result }
     }
 
@@ -624,11 +674,11 @@ impl<const P: u8> LedgerStore<P> for MemoryStore<P> {
         id: EntryId,
     ) -> impl Future<Output = Result<Option<StoredEntry<P>>, Self::Error>> + Send {
         let result = self.with(|journal| {
-            let found = journal.entries().iter().enumerate().find_map(|(i, e)| {
-                (e.id() == id).then(|| StoredEntry {
-                    index: Some(LogIndex::new(i as u64)),
-                    entry: e.clone(),
-                    content_hash: e.content_hash(),
+            let found = journal.index_of(id).and_then(|index| {
+                journal.at(index).map(|entry| StoredEntry {
+                    index: Some(index),
+                    entry: entry.clone(),
+                    content_hash: entry.content_hash(),
                 })
             });
             Ok(found)
@@ -707,12 +757,37 @@ impl<const P: u8> LedgerStore<P> for MemoryStore<P> {
         async move { result }
     }
 
+    fn define_period(
+        &self,
+        period: &Period,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        let period = period.clone();
+        let result = self.with_mut(|journal| {
+            journal.calendar_mut().ensure(period)?;
+            Ok(())
+        });
+        async move { result }
+    }
+
+    fn transition_period(
+        &self,
+        period: &PeriodId,
+        to: PeriodState,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        let result = self.with_mut(|journal| Ok(journal.transition_period(period, to)?));
+        async move { result }
+    }
+
+    fn periods(&self) -> impl Future<Output = Result<Vec<Period>, Self::Error>> + Send {
+        let result = self.with(|journal| Ok(journal.calendar().iter().cloned().collect()));
+        async move { result }
+    }
+
     fn seal_period(
         &self,
         period: &PeriodId,
-        calendar: &mut PeriodCalendar,
     ) -> impl Future<Output = Result<Seal, Self::Error>> + Send {
-        let result = self.with_mut(|journal| Ok(journal.seal_period(period, calendar)?));
+        let result = self.with_mut(|journal| Ok(journal.seal_period(period)?));
         async move { result }
     }
 

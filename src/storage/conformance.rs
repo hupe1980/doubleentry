@@ -29,12 +29,12 @@ use time::macros::date;
 
 use crate::account::{Account, AccountKind, AccountPath, AccountRegistry};
 use crate::balance::BalanceKey;
-use crate::clearing::{ClearedItem, Clearing, PostingRef};
+use crate::clearing::{Clearing, PostingRef};
 use crate::entry::{Draft, Entry, EntryId, IdempotencyKey, LedgerPolicy, SealContext};
 use crate::money::{Amount, Currency};
 use crate::period::PeriodCalendar;
 use crate::posting::Layer;
-use crate::storage::{Cursor, EntryBatch, LedgerStore};
+use crate::storage::{Cursor, EntryBatch, LedgerStore, MAX_PAGE_SIZE};
 use crate::{AccountId, Balanced};
 
 /// A ledger identifier for tests and examples.
@@ -336,21 +336,27 @@ impl Fixture {
         .ok()
     }
 
-    /// A clearing over the given postings.
-    fn clearing<const P: u8>(&self, items: &[(PostingRef, i64)]) -> Clearing<P> {
-        Clearing {
-            id: crate::clearing::ClearingId::generate(),
+    /// The settled EUR balance on the left account.
+    fn key(&self) -> BalanceKey {
+        BalanceKey {
             account: self.left,
             currency: Currency::EUR,
-            cleared_on: date!(2026 - 04 - 20),
-            items: items
-                .iter()
-                .map(|(posting, applied)| ClearedItem {
-                    posting: *posting,
-                    applied: Amount::<P>::from_minor(*applied),
-                })
-                .collect(),
+            layer: Layer::Settled,
         }
+    }
+
+    /// A clearing over the given postings.
+    fn clearing<const P: u8>(&self, items: &[(PostingRef, i64)]) -> Clearing<P> {
+        items.iter().fold(
+            Clearing::new(
+                crate::clearing::ClearingId::generate(),
+                self.key(),
+                date!(2026 - 04 - 20),
+            ),
+            |clearing, (posting, applied)| {
+                clearing.apply(*posting, Amount::<P>::from_minor(*applied))
+            },
+        )
     }
 
     fn entry_with_id<const P: u8>(
@@ -366,6 +372,36 @@ impl Fixture {
         )
         .debit(self.left, Amount::<P>::from_minor(minor), Currency::EUR)
         .credit(self.right, Amount::<P>::from_minor(minor), Currency::EUR)
+        .seal(&self.ctx())
+        .ok()
+    }
+
+    /// An entry whose postings carry dimensions.
+    fn dimensioned_entry<const P: u8>(&self, key: &[u8], minor: i64) -> Option<Entry<Balanced, P>> {
+        let dims = crate::dimensions::Dimensions::none()
+            .with(
+                crate::Label::new("activity").ok()?,
+                crate::Label::new("Network").ok()?,
+            )
+            .ok()?
+            .with(
+                crate::Label::new("segment").ok()?,
+                crate::Label::new("Electricity").ok()?,
+            )
+            .ok()?;
+        Entry::<Draft, P>::new(
+            EntryId::generate(),
+            IdempotencyKey::new(key.to_vec()).ok()?,
+            date!(2026 - 03 - 15),
+        )
+        .post(
+            crate::Posting::debit(self.left, Amount::<P>::from_minor(minor), Currency::EUR)
+                .with_dimensions(dims.clone()),
+        )
+        .post(
+            crate::Posting::credit(self.right, Amount::<P>::from_minor(minor), Currency::EUR)
+                .with_dimensions(dims),
+        )
         .seal(&self.ctx())
         .ok()
     }
@@ -410,7 +446,359 @@ pub async fn check_all<const P: u8, S: LedgerStore<P>>(store: &S) -> Report {
     checks.push(check_open_items_track_residuals(store).await);
     checks.push(check_account_bindings_survive_a_restart(store).await);
     checks.push(check_kind_survives_a_round_trip(store).await);
+    checks.push(check_dimensions_survive_a_round_trip(store).await);
+    checks.push(check_balances_agree_across_readers(store).await);
+    checks.push(check_statement_pages_do_not_repeat_or_skip(store).await);
+    checks.push(check_checkpoints_round_trip(store).await);
+    // Last: sealing changes what the calendar will accept, and every check
+    // above books into 2026-03.
+    checks.push(check_period_lifecycle_and_seals(store).await);
     Report { checks }
+}
+
+/// Posting dimensions survive a store round-trip.
+///
+/// Like `kind`, they are part of the content hash, so a backend that loses an
+/// axis makes every dimensioned entry unreadable rather than merely
+/// under-reported — [`get`](LedgerStore::get) rehydrates through
+/// `adopt_verified`, which recomputes the hash and refuses a mismatch.
+pub async fn check_dimensions_survive_a_round_trip<const P: u8, S: LedgerStore<P>>(
+    store: &S,
+) -> CheckResult {
+    const NAME: &str = "posting dimensions survive a round-trip";
+    let f = Fixture::new();
+    let Some(entry) = f.dimensioned_entry::<P>(b"dimensioned", 4242) else {
+        return CheckResult::fail(NAME, "fixture entry failed to seal");
+    };
+    let id = entry.id();
+    if let Err(e) = store.append(&EntryBatch::single(entry)).await {
+        return CheckResult::fail(NAME, format!("append failed: {e}"));
+    }
+    match store.get(id).await {
+        Ok(Some(record)) => {
+            let Some(posting) = record.entry.postings().first() else {
+                return CheckResult::fail(NAME, "the entry came back with no postings");
+            };
+            let axes: Vec<(String, String)> = posting
+                .dimensions
+                .iter()
+                .map(|(a, v)| (a.as_str().to_owned(), v.as_str().to_owned()))
+                .collect();
+            if axes
+                == vec![
+                    ("activity".to_owned(), "Network".to_owned()),
+                    ("segment".to_owned(), "Electricity".to_owned()),
+                ]
+            {
+                CheckResult::pass(NAME)
+            } else {
+                CheckResult::fail(NAME, format!("dimensions came back as {axes:?}"))
+            }
+        }
+        Ok(None) => CheckResult::fail(NAME, "a dimensioned entry was not found"),
+        Err(e) => CheckResult::fail(NAME, format!("get failed (hash mismatch?): {e}")),
+    }
+}
+
+/// The three ways to read a balance agree with one another.
+///
+/// [`balance`](LedgerStore::balance), [`trial_balance`](LedgerStore::trial_balance)
+/// and [`balances`](LedgerStore::balances) are three queries over the same
+/// definition. A backend that optimises one of them — a materialised total, a
+/// checkpoint short-circuit — and gets it subtly wrong shows no symptom until a
+/// report disagrees with an account statement.
+pub async fn check_balances_agree_across_readers<const P: u8, S: LedgerStore<P>>(
+    store: &S,
+) -> CheckResult {
+    if let Err(e) = drain_sequencing(store).await {
+        return CheckResult::fail("sequencing", e);
+    }
+    const NAME: &str = "balance readers agree";
+    let f = Fixture::new();
+    let key = f.key();
+
+    let single = match store.balance(key, None).await {
+        Ok(b) => b,
+        Err(e) => return CheckResult::fail(NAME, format!("balance failed: {e}")),
+    };
+    match store.trial_balance(None).await {
+        Ok(tb) if tb.get_or_zero(&key) == single => {}
+        Ok(tb) => {
+            return CheckResult::fail(
+                NAME,
+                format!(
+                    "trial_balance says {:?}, balance says {single:?}",
+                    tb.get_or_zero(&key)
+                ),
+            );
+        }
+        Err(e) => return CheckResult::fail(NAME, format!("trial_balance failed: {e}")),
+    }
+    match store
+        .balances(&[f.left, f.right], Currency::EUR, Layer::Settled, None)
+        .await
+    {
+        Ok(many) if many.get(&f.left).copied() == Some(single) => {}
+        Ok(many) => {
+            return CheckResult::fail(
+                NAME,
+                format!(
+                    "balances says {:?}, balance says {single:?}",
+                    many.get(&f.left)
+                ),
+            );
+        }
+        Err(e) => return CheckResult::fail(NAME, format!("balances failed: {e}")),
+    }
+
+    // An account nobody posted to is absent, not zero: the caller knows what it
+    // asked for, and inventing a row would hide a mis-typed handle.
+    match store
+        .balances(
+            &[AccountId::from_index(u32::MAX)],
+            Currency::EUR,
+            Layer::Settled,
+            None,
+        )
+        .await
+    {
+        Ok(empty) if empty.is_empty() => CheckResult::pass(NAME),
+        Ok(_) => CheckResult::fail(NAME, "an unposted account came back with a balance"),
+        Err(e) => CheckResult::fail(NAME, format!("balances failed: {e}")),
+    }
+}
+
+/// Paging a statement visits every line exactly once, with a running balance
+/// that carries across page boundaries.
+pub async fn check_statement_pages_do_not_repeat_or_skip<const P: u8, S: LedgerStore<P>>(
+    store: &S,
+) -> CheckResult {
+    if let Err(e) = drain_sequencing(store).await {
+        return CheckResult::fail("sequencing", e);
+    }
+    const NAME: &str = "statement pagination is exact";
+    let f = Fixture::new();
+    let key = f.key();
+
+    let whole = match store
+        .statement(key, Cursor::start().with_limit(MAX_PAGE_SIZE))
+        .await
+    {
+        Ok(page) => page.lines,
+        Err(e) => return CheckResult::fail(NAME, format!("statement failed: {e}")),
+    };
+    if whole.is_empty() {
+        return CheckResult::fail(NAME, "no statement lines to page over");
+    }
+
+    let mut paged = Vec::new();
+    let mut cursor = Some(Cursor::start().with_limit(1));
+    let mut guard = 0usize;
+    while let Some(c) = cursor {
+        guard = guard.saturating_add(1);
+        if guard > whole.len().saturating_add(8) {
+            return CheckResult::fail(NAME, "pagination did not terminate");
+        }
+        match store.statement(key, c).await {
+            Ok(page) => {
+                if page.lines.is_empty() && page.next.is_some() {
+                    return CheckResult::fail(NAME, "an empty page handed back another cursor");
+                }
+                paged.extend(page.lines);
+                cursor = page.next;
+            }
+            Err(e) => return CheckResult::fail(NAME, format!("statement failed: {e}")),
+        }
+    }
+
+    if paged == whole {
+        CheckResult::pass(NAME)
+    } else {
+        CheckResult::fail(
+            NAME,
+            format!(
+                "paging produced {} lines against {} in one page; \
+                 first divergence: {:?}",
+                paged.len(),
+                whole.len(),
+                paged.iter().zip(whole.iter()).find(|(a, b)| a != b)
+            ),
+        )
+    }
+}
+
+/// A checkpoint written is a checkpoint read.
+///
+/// A checkpoint is a cache for a definition, so it is only safe if what comes
+/// back is what went in — including the tree head that pins it to one history.
+/// A backend that drops the head returns a checkpoint that cannot be shown to be
+/// stale, which is worse than no checkpoint at all.
+pub async fn check_checkpoints_round_trip<const P: u8, S: LedgerStore<P>>(
+    store: &S,
+) -> CheckResult {
+    if let Err(e) = drain_sequencing(store).await {
+        return CheckResult::fail("sequencing", e);
+    }
+    const NAME: &str = "checkpoints round-trip";
+    let f = Fixture::new();
+    let key = f.key();
+
+    let (head, balance) = match (store.head().await, store.balance(key, None).await) {
+        (Ok(head), Ok(balance)) => (head, balance),
+        (Err(e), _) | (_, Err(e)) => return CheckResult::fail(NAME, format!("read failed: {e}")),
+    };
+    let through = head.size.checked_sub(1);
+    let checkpoint = crate::checkpoint::Checkpoint::new(key, through, balance, head);
+
+    if let Err(e) = store.save_checkpoint(&checkpoint).await {
+        return CheckResult::fail(NAME, format!("save_checkpoint failed: {e}"));
+    }
+    match store.load_checkpoint(key).await {
+        Ok(Some(loaded)) if loaded == checkpoint => {}
+        Ok(Some(loaded)) => {
+            return CheckResult::fail(
+                NAME,
+                format!("checkpoint came back as {loaded:?}, not {checkpoint:?}"),
+            );
+        }
+        Ok(None) => return CheckResult::fail(NAME, "a saved checkpoint was not found"),
+        Err(e) => return CheckResult::fail(NAME, format!("load_checkpoint failed: {e}")),
+    }
+
+    // A key never checkpointed reads as absent rather than as a zero.
+    let untouched = BalanceKey {
+        account: AccountId::from_index(u32::MAX),
+        currency: Currency::EUR,
+        layer: Layer::Pending,
+    };
+    match store.load_checkpoint(untouched).await {
+        Ok(None) => CheckResult::pass(NAME),
+        Ok(Some(_)) => CheckResult::fail(NAME, "a checkpoint appeared that was never saved"),
+        Err(e) => CheckResult::fail(NAME, format!("load_checkpoint failed: {e}")),
+    }
+}
+
+/// Periods persist, follow their lifecycle, and seal into a chain.
+///
+/// The calendar is store state, not caller state: a sealed period that came back
+/// open after a restart would accept postings into books already committed to.
+/// This check exercises the whole path — define, transition, seal, read back —
+/// and the refusals that guard it.
+pub async fn check_period_lifecycle_and_seals<const P: u8, S: LedgerStore<P>>(
+    store: &S,
+) -> CheckResult {
+    if let Err(e) = drain_sequencing(store).await {
+        return CheckResult::fail("sequencing", e);
+    }
+    const NAME: &str = "periods persist and seal into a chain";
+
+    let id = match crate::period::PeriodId::new("conformance-2026-03") {
+        Ok(id) => id,
+        Err(e) => return CheckResult::fail(NAME, format!("bad fixture identifier: {e}")),
+    };
+    let Ok(period) =
+        crate::period::Period::new(id.clone(), date!(2026 - 03 - 01), date!(2026 - 03 - 31))
+    else {
+        return CheckResult::fail(NAME, "bad fixture range");
+    };
+
+    if let Err(e) = store.define_period(&period).await {
+        return CheckResult::fail(NAME, format!("define_period failed: {e}"));
+    }
+    // Declaring the same period again is how a caller states its calendar on
+    // every start-up, so it must not be an error.
+    if let Err(e) = store.define_period(&period).await {
+        return CheckResult::fail(NAME, format!("re-defining an identical period failed: {e}"));
+    }
+
+    // Sealing an open period is refused: stopping postings is a separate,
+    // earlier decision, so verification runs against a set that cannot grow.
+    if store.seal_period(&id).await.is_ok() {
+        return CheckResult::fail(NAME, "an open period was sealed");
+    }
+    if store
+        .transition_period(&id, crate::period::PeriodState::Sealed)
+        .await
+        .is_ok()
+    {
+        return CheckResult::fail(NAME, "a period jumped straight from open to sealed");
+    }
+
+    if let Err(e) = store
+        .transition_period(&id, crate::period::PeriodState::Closing)
+        .await
+    {
+        return CheckResult::fail(NAME, format!("open to closing was refused: {e}"));
+    }
+    match store.periods().await {
+        Ok(periods) => {
+            let found = periods
+                .iter()
+                .find(|p| p.id == id)
+                .map(|p| (p.state, p.start, p.end));
+            if found
+                != Some((
+                    crate::period::PeriodState::Closing,
+                    date!(2026 - 03 - 01),
+                    date!(2026 - 03 - 31),
+                ))
+            {
+                return CheckResult::fail(NAME, format!("period read back as {found:?}"));
+            }
+        }
+        Err(e) => return CheckResult::fail(NAME, format!("periods failed: {e}")),
+    }
+
+    let seal = match store.seal_period(&id).await {
+        Ok(seal) => seal,
+        Err(e) => return CheckResult::fail(NAME, format!("seal_period failed: {e}")),
+    };
+    if !seal.is_self_consistent() {
+        return CheckResult::fail(NAME, "the seal does not hash its own contents");
+    }
+    if seal.ledger != *store.ledger() {
+        return CheckResult::fail(
+            NAME,
+            format!(
+                "the seal names ledger {}, not {}",
+                seal.ledger,
+                store.ledger()
+            ),
+        );
+    }
+    if store.seal_period(&id).await.is_ok() {
+        return CheckResult::fail(NAME, "a sealed period was sealed again");
+    }
+    match store.periods().await {
+        Ok(periods) => {
+            if periods.iter().find(|p| p.id == id).map(|p| p.state)
+                != Some(crate::period::PeriodState::Sealed)
+            {
+                return CheckResult::fail(NAME, "sealing did not advance the period's state");
+            }
+        }
+        Err(e) => return CheckResult::fail(NAME, format!("periods failed: {e}")),
+    }
+
+    // The stored chain must reproduce what was returned, and verify.
+    match store.seals().await {
+        Ok(stored) => {
+            if !stored.iter().any(|s| s.seal_hash == seal.seal_hash) {
+                return CheckResult::fail(NAME, "the seal was not read back");
+            }
+            let mut chain = crate::seal::SealChain::new();
+            for s in stored {
+                if let Err(e) = chain.push(s) {
+                    return CheckResult::fail(NAME, format!("seals do not chain in order: {e}"));
+                }
+            }
+            match chain.verify() {
+                Ok(()) => CheckResult::pass(NAME),
+                Err(e) => CheckResult::fail(NAME, format!("the seal chain does not verify: {e}")),
+            }
+        }
+        Err(e) => CheckResult::fail(NAME, format!("seals failed: {e}")),
+    }
 }
 
 /// An entry's `kind` label survives a store round-trip.
@@ -1240,7 +1628,7 @@ mod tests {
     fn the_memory_store_conforms() {
         let report = block_on(check_all(&MemoryStore::<2>::new(test_ledger())));
         report.assert_passed();
-        assert_eq!(report.checks.len(), 14);
+        assert_eq!(report.checks.len(), 19);
     }
 
     #[test]

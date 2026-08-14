@@ -210,9 +210,17 @@ impl Period {
 /// periods accepts any booking date. Dates outside every defined period are
 /// likewise unrestricted — only an explicitly closing or sealed period blocks a
 /// posting.
+///
+/// Periods are kept indexed by start date as well as by identifier. Every
+/// validated entry asks "what governs this booking date", and a calendar with a
+/// decade of daily or weekly periods would otherwise answer it by scanning.
 #[derive(Debug, Clone, Default)]
 pub struct PeriodCalendar {
     periods: BTreeMap<PeriodId, Period>,
+    /// Start date to identifier. Non-overlap makes this a total order on the
+    /// periods, so the period covering a date is the last one starting at or
+    /// before it — if that one reaches far enough.
+    by_start: BTreeMap<Date, PeriodId>,
 }
 
 impl PeriodCalendar {
@@ -222,25 +230,89 @@ impl PeriodCalendar {
         Self::default()
     }
 
+    /// Rebuilds a calendar from stored periods, states included.
+    ///
+    /// The state matters: a sealed period that comes back open would accept
+    /// postings into books that have already been committed to.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`PeriodCalendar::define`].
+    pub fn from_periods(periods: impl IntoIterator<Item = Period>) -> Result<Self, PeriodError> {
+        let mut calendar = Self::new();
+        for period in periods {
+            calendar.define(period)?;
+        }
+        Ok(calendar)
+    }
+
     /// Defines a new period.
+    ///
+    /// The period is stored with whatever state it carries, so a calendar
+    /// restored from a backend keeps its sealed periods sealed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PeriodError::Duplicate`] for a repeated identifier and
+    /// [`PeriodError::Overlap`] when the range meets one already defined — a
+    /// booking date has to resolve to exactly one period.
     pub fn define(&mut self, period: Period) -> Result<(), PeriodError> {
         if self.periods.contains_key(&period.id) {
             return Err(PeriodError::Duplicate { id: period.id });
         }
-        if let Some(existing) = self.periods.values().find(|p| p.overlaps(&period)) {
-            return Err(PeriodError::Overlap {
-                id: period.id.clone(),
-                existing: existing.id.clone(),
-            });
+        // With no overlaps among what is already defined, a new range can only
+        // collide with its two neighbours by start date.
+        let before = self
+            .by_start
+            .range(..=period.start)
+            .next_back()
+            .map(|(_, id)| id);
+        let after = self.by_start.range(period.start..).next().map(|(_, id)| id);
+        for neighbour in [before, after].into_iter().flatten() {
+            if let Some(existing) = self.periods.get(neighbour)
+                && existing.overlaps(&period)
+            {
+                return Err(PeriodError::Overlap {
+                    id: period.id.clone(),
+                    existing: existing.id.clone(),
+                });
+            }
         }
+
+        self.by_start.insert(period.start, period.id.clone());
         self.periods.insert(period.id.clone(), period);
         Ok(())
+    }
+
+    /// Defines a period unless an identical definition is already present.
+    ///
+    /// For a backend replaying its period table on start-up: re-reading a
+    /// definition it wrote itself must not be a duplicate-identifier error.
+    /// A *different* range under the same identifier still is, because that
+    /// would move the boundary of a period entries have already been booked
+    /// into.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PeriodError::Duplicate`] when the identifier is already used
+    /// for a different range, and [`PeriodError::Overlap`] as [`Self::define`]
+    /// does.
+    pub fn ensure(&mut self, period: Period) -> Result<(), PeriodError> {
+        match self.periods.get(&period.id) {
+            Some(existing) if existing.start == period.start && existing.end == period.end => {
+                self.periods.insert(period.id.clone(), period);
+                Ok(())
+            }
+            Some(_) => Err(PeriodError::Duplicate { id: period.id }),
+            None => self.define(period),
+        }
     }
 
     /// The period containing `date`, if any.
     #[must_use]
     pub fn period_on(&self, date: Date) -> Option<&Period> {
-        self.periods.values().find(|p| p.contains(date))
+        let (_, id) = self.by_start.range(..=date).next_back()?;
+        self.periods.get(id).filter(|p| p.contains(date))
     }
 
     /// The state governing `date`.
@@ -290,9 +362,9 @@ impl PeriodCalendar {
         Ok(())
     }
 
-    /// Every period, in identifier order.
+    /// Every period, in start-date order.
     pub fn iter(&self) -> impl Iterator<Item = &Period> {
-        self.periods.values()
+        self.by_start.values().filter_map(|id| self.periods.get(id))
     }
 
     /// Number of defined periods.
@@ -432,6 +504,107 @@ mod tests {
         c.transition(&pid("2026-03"), PeriodState::Closing)
             .expect("ok");
         assert!(!c.accepts(date!(2026 - 03 - 15)));
+    }
+
+    #[test]
+    fn overlap_is_caught_from_either_side() {
+        // The index only inspects the two neighbours by start date, so a range
+        // that straddles an existing one has to be caught from both directions.
+        let mut c = PeriodCalendar::new();
+        c.define(march()).expect("defines");
+
+        let starts_before = Period::new(
+            pid("straddle-left"),
+            date!(2026 - 02 - 15),
+            date!(2026 - 03 - 10),
+        )
+        .expect("valid range");
+        assert!(matches!(
+            c.define(starts_before),
+            Err(PeriodError::Overlap { .. })
+        ));
+
+        let starts_after = Period::new(
+            pid("straddle-right"),
+            date!(2026 - 03 - 20),
+            date!(2026 - 04 - 10),
+        )
+        .expect("valid range");
+        assert!(matches!(
+            c.define(starts_after),
+            Err(PeriodError::Overlap { .. })
+        ));
+
+        let swallows = Period::new(pid("swallow"), date!(2026 - 01 - 01), date!(2026 - 12 - 31))
+            .expect("valid range");
+        assert!(matches!(
+            c.define(swallows),
+            Err(PeriodError::Overlap { .. })
+        ));
+
+        let identical = Period::new(
+            pid("same-range"),
+            date!(2026 - 03 - 01),
+            date!(2026 - 03 - 31),
+        )
+        .expect("valid range");
+        assert!(matches!(
+            c.define(identical),
+            Err(PeriodError::Overlap { .. })
+        ));
+    }
+
+    #[test]
+    fn lookup_finds_the_right_period_among_many() {
+        let mut c = PeriodCalendar::new();
+        for month in 1u8..=12 {
+            let start = time::Date::from_calendar_date(
+                2026,
+                time::Month::try_from(month).expect("valid month"),
+                1,
+            )
+            .expect("valid date");
+            let end = start
+                .replace_day(start.month().length(2026))
+                .expect("valid date");
+            c.define(Period::new(pid(&format!("2026-{month:02}")), start, end).expect("valid"))
+                .expect("defines");
+        }
+        assert_eq!(c.len(), 12);
+        assert_eq!(
+            c.period_on(date!(2026 - 07 - 04)).map(|p| p.id.to_string()),
+            Some("2026-07".to_owned())
+        );
+        assert_eq!(
+            c.period_on(date!(2026 - 12 - 31)).map(|p| p.id.to_string()),
+            Some("2026-12".to_owned())
+        );
+        assert!(c.period_on(date!(2025 - 12 - 31)).is_none());
+        assert!(c.period_on(date!(2027 - 01 - 01)).is_none());
+
+        // Iteration follows the calendar, not the identifier spelling.
+        let order: Vec<String> = c.iter().map(|p| p.id.to_string()).collect();
+        assert_eq!(order.first().map(String::as_str), Some("2026-01"));
+        assert_eq!(order.last().map(String::as_str), Some("2026-12"));
+    }
+
+    #[test]
+    fn a_calendar_rebuilds_from_stored_periods_with_their_states() {
+        let mut original = PeriodCalendar::new();
+        original.define(march()).expect("defines");
+        original
+            .transition(&pid("2026-03"), PeriodState::Closing)
+            .expect("ok");
+        original
+            .transition(&pid("2026-03"), PeriodState::Sealed)
+            .expect("ok");
+
+        let restored = PeriodCalendar::from_periods(original.iter().cloned()).expect("rebuilds");
+        assert_eq!(
+            restored.state_on(date!(2026 - 03 - 15)),
+            PeriodState::Sealed
+        );
+        assert!(!restored.accepts(date!(2026 - 03 - 15)));
     }
 
     #[test]

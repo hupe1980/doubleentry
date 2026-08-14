@@ -110,13 +110,15 @@ fn canonical_encoding_of_the_reference_entry_is_unchanged() {
     let hex: String = encoded.iter().map(|b| format!("{b:02x}")).collect();
 
     let expected = concat!(
-        "0211000000676f6c64656e2d766563746f722d6b6579ea0700030fea070003110f0000",
-        "007265666572656e636520656e747279020000000000000000d8d00100000000004555",
-        "520002000000080000006163746976697479070000004e6574776f726b070000007365",
-        "676d656e740b000000456c6563747269636974790100000001d8d00100000000004555",
-        "52000000000000010700000061756469746f720106000000676f6c64656e00010d0000",
-        "00494e562d323032362d30303031013333333333333333333333333333333333333333",
-        "333333333333333333333333012222222222222222222222222222222201ea07000201",
+        "021100000000000000676f6c64656e2d766563746f722d6b6579ea070000030fea0700",
+        "0003110f000000000000007265666572656e636520656e747279020000000000000000",
+        "00000000d8d00100000000004555520002000000000000000800000000000000616374",
+        "697669747907000000000000004e6574776f726b07000000000000007365676d656e74",
+        "0b00000000000000456c6563747269636974790100000001d8d0010000000000455552",
+        "0000000000000000000001070000000000000061756469746f72010600000000000000",
+        "676f6c64656e00010d00000000000000494e562d323032362d30303031013333333333",
+        "3333333333333333333333333333333333333333333333333333330122222222222222",
+        "22222222222222222201ea0700000201",
     );
     assert_eq!(
         hex, expected,
@@ -128,7 +130,7 @@ fn canonical_encoding_of_the_reference_entry_is_unchanged() {
 fn the_reference_entry_content_hash_is_unchanged() {
     assert_eq!(
         reference_entry().content_hash().to_hex(),
-        "0237cc80981925555b91e7553e5af80319dfb1bfb872472b7f1ec3caedaf34a3",
+        "5bd373dc4d90adb1aa7e8c7f665fbf0a6eac43b6e8980272f93f41e17c8eac2c",
         "the entry content hash changed; see this file's module docs"
     );
 }
@@ -168,6 +170,9 @@ fn reference_seal() -> Seal {
             root: Hash::from_bytes([0x44; 32]),
         },
         &tb,
+        // The registry the balances above are keyed on. Pinned through the seal
+        // hash, so a change to the account-binding encoding shows up here too.
+        accounts.commitment(),
         Some(Hash::from_bytes([0x55; 32])),
     )
 }
@@ -179,7 +184,7 @@ fn the_reference_seal_hash_is_unchanged() {
     // issued, so it is pinned separately from the entry encoding.
     assert_eq!(
         reference_seal().seal_hash.to_hex(),
-        "98cde30eeb7387be890a575fa8e946e67f8ae3b7c0c3be9cb323d5bc9eac5714",
+        "dab0b142a3a3ee1347c1e7e292dcccfe57d73a8cf649596026f2eb9da4e9bdbb",
         "the seal hash changed; see this file's module docs"
     );
 }

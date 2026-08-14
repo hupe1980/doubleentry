@@ -9,7 +9,11 @@
 -- guess which omissions are deliberate.
 
 -- Foreign keys are off by default in SQLite, which would silently disable every
--- REFERENCES clause below.
+-- REFERENCES clause below. Note that `PRAGMA foreign_keys` is *per connection*,
+-- so setting it here — or anywhere else in a pooled application — configures one
+-- connection and leaves the rest with enforcement off. It belongs in how
+-- connections are opened. `SqliteStore::migrate` verifies it rather than setting
+-- it, and refuses a pool that does not enforce it.
 PRAGMA foreign_keys = ON;
 
 -- ── ledger identity ─────────────────────────────────────────────────────────
@@ -209,6 +213,11 @@ CREATE TABLE IF NOT EXISTS seals (
     tree_root           BLOB    NOT NULL,
     trial_balance_root  BLOB    NOT NULL,
 
+    -- Merkle root over the handle-to-account bindings in force at sealing. The
+    -- trial balance root is keyed on `account_index`; this is what says which
+    -- account each of those integers was. See `schema/postgres.sql`.
+    accounts_root       BLOB    NOT NULL,
+
     prev_seal           BLOB,
     seal_hash           BLOB    NOT NULL,
 
@@ -221,6 +230,7 @@ CREATE TABLE IF NOT EXISTS seals (
     CONSTRAINT seals_hash_widths CHECK (
         length(tree_root) = 32
         AND length(trial_balance_root) = 32
+        AND length(accounts_root) = 32
         AND length(seal_hash) = 32
         AND (prev_seal IS NULL OR length(prev_seal) = 32)
     ),

@@ -976,9 +976,13 @@ impl<const P: u8> Journal<P> {
     /// postings is a separate, earlier decision, so that verification runs
     /// against a set that can no longer grow underneath it.
     ///
-    /// On success the period advances to [`PeriodState::Sealed`] and the seal is
-    /// appended to the chain. The transition happens first, so a seal that the
-    /// chain refuses cannot leave a period marked sealed with nothing sealing it.
+    /// The seal commits to three things: the log's tree head, the period's
+    /// closing trial balance, and the account registry those balances are keyed
+    /// on — see [`Seal::accounts_root`] for why the last one is not optional.
+    ///
+    /// On success the period advances to [`PeriodState::Sealed`]. The seal is
+    /// appended to the chain *first*, so a seal the chain refuses cannot leave a
+    /// period marked sealed with nothing sealing it.
     ///
     /// # Errors
     ///
@@ -1007,6 +1011,9 @@ impl<const P: u8> Journal<P> {
             coverage,
             self.head(),
             &closing,
+            // The registry as it stands now: the same one the trial balance's
+            // handles were resolved against.
+            self.accounts.commitment(),
             self.seals.head(),
         );
 

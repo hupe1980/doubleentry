@@ -38,6 +38,19 @@ pub const MAX_DESCRIPTION_LEN: usize = 512;
 /// Maximum bytes in an idempotency key.
 pub const MAX_IDEMPOTENCY_KEY_LEN: usize = 128;
 
+/// Maximum number of postings one entry may carry.
+///
+/// Not an arbitrary bound. A posting is addressed by its position within its
+/// entry, and that position is narrowed twice on the way out of the engine: to a
+/// `u16` in [`PostingRef`](crate::PostingRef), and to a `SMALLINT` in the
+/// reference SQL schema. `i16::MAX` is the largest index both can carry, so an
+/// entry beyond it could not be referenced by a clearing, could not be written to
+/// a posting row, and could not appear correctly in a statement.
+///
+/// Enforced at validation rather than truncated at the boundary, because a
+/// truncated position is a posting silently pointing at the wrong movement.
+pub const MAX_POSTINGS: usize = i16::MAX as usize;
+
 /// Number of postings held inline before spilling to the heap.
 const INLINE_POSTINGS: usize = 4;
 
@@ -446,6 +459,12 @@ pub enum ValidationError {
         /// Number of postings supplied.
         count: usize,
     },
+    /// More postings than a posting position can address.
+    #[error("entry has {count} postings; at most {MAX_POSTINGS} can be addressed")]
+    TooManyPostings {
+        /// Number of postings supplied.
+        count: usize,
+    },
     /// A posting carried a zero amount.
     #[error("posting {index} has a zero amount")]
     ZeroAmount {
@@ -752,6 +771,11 @@ impl<const P: u8> Entry<Draft, P> {
 
         if self.postings.len() < 2 {
             errors.push(ValidationError::TooFewPostings {
+                count: self.postings.len(),
+            });
+        }
+        if self.postings.len() > MAX_POSTINGS {
+            errors.push(ValidationError::TooManyPostings {
                 count: self.postings.len(),
             });
         }
@@ -1694,6 +1718,46 @@ mod tests {
                 .credit(f.revenue, Eur::from_minor(1000), Currency::EUR)
                 .adopt_verified(hash)
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn the_posting_count_is_bounded_by_what_a_position_can_address() {
+        // A posting is addressed by a `u16` in `PostingRef` and a `SMALLINT` in
+        // the reference schema. Beyond `MAX_POSTINGS` those would truncate, and
+        // a truncated position is a clearing or a statement line silently
+        // pointing at the wrong movement — so validation refuses the entry.
+        let f = Fixture::new();
+        let mut draft = f.draft();
+        for _ in 0..=MAX_POSTINGS {
+            draft = draft.debit(f.cash, Eur::from_minor(1), Currency::EUR);
+        }
+        // Balance it, so `TooManyPostings` is the only thing left to report.
+        draft = draft.credit(
+            f.revenue,
+            Eur::from_minor(MAX_POSTINGS as i64 + 1),
+            Currency::EUR,
+        );
+
+        let err = draft.seal(&f.ctx()).expect_err("too many postings");
+        assert!(err.any(|e| matches!(e, ValidationError::TooManyPostings { .. })));
+    }
+
+    #[test]
+    fn an_entry_at_the_posting_bound_is_accepted() {
+        let f = Fixture::new();
+        let mut draft = f.draft();
+        for _ in 0..MAX_POSTINGS - 1 {
+            draft = draft.debit(f.cash, Eur::from_minor(1), Currency::EUR);
+        }
+        draft = draft.credit(
+            f.revenue,
+            Eur::from_minor(MAX_POSTINGS as i64 - 1),
+            Currency::EUR,
+        );
+        assert_eq!(
+            draft.seal(&f.ctx()).expect("at the bound").postings().len(),
+            MAX_POSTINGS
         );
     }
 

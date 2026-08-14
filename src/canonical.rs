@@ -8,11 +8,16 @@
 //!
 //! - Integers are little-endian, fixed width. No varints, no leading-zero
 //!   ambiguity.
-//! - Variable-length data carries a `u32` byte-length prefix, so no concatenation
+//! - Variable-length data carries a `u64` byte-length prefix, so no concatenation
 //!   of two fields can be reinterpreted as a different split.
 //! - `Option` is a `0x00` / `0x01` discriminant followed by the payload when set.
-//! - Sequences carry a `u32` element count and are written in the order the
+//! - Sequences carry a `u64` element count and are written in the order the
 //!   producer chose; the producer is responsible for that order being canonical.
+//!
+//! Lengths and counts are 64-bit rather than 32-bit so that no input can make
+//! one saturate. A saturating prefix is worse than no prefix: it makes two
+//! distinct values encode to the same bytes, which is exactly the collision the
+//! prefix is there to rule out.
 //!
 //! General-purpose serialisation formats are deliberately not used here. Their
 //! map ordering, integer widths, and string escaping are free to change between
@@ -63,6 +68,12 @@ impl CanonicalWriter {
         self
     }
 
+    /// Writes an `i32`.
+    pub fn i32(&mut self, v: i32) -> &mut Self {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+        self
+    }
+
     /// Writes an `i64`.
     pub fn i64(&mut self, v: i64) -> &mut Self {
         self.buf.extend_from_slice(&v.to_le_bytes());
@@ -83,12 +94,13 @@ impl CanonicalWriter {
 
     /// Writes a length-prefixed byte string.
     ///
-    /// Inputs longer than `u32::MAX` are truncated in the prefix only in
-    /// theory; no field in this crate approaches that bound, and the callers
-    /// that build entries enforce much smaller limits.
+    /// The prefix is a `u64`, so it is exact for any slice that can exist on a
+    /// 64-bit address space. A narrower prefix would have to decide what to do
+    /// when a length does not fit, and every answer to that is wrong: truncating
+    /// makes two different values encode identically, which is precisely the
+    /// collision a length prefix exists to prevent.
     pub fn bytes(&mut self, v: &[u8]) -> &mut Self {
-        let len = u32::try_from(v.len()).unwrap_or(u32::MAX);
-        self.u32(len);
+        self.u64(v.len() as u64);
         self.buf.extend_from_slice(v);
         self
     }
@@ -121,13 +133,16 @@ impl CanonicalWriter {
     }
 
     /// Writes a counted sequence.
+    ///
+    /// The count is a `u64` for the same reason [`CanonicalWriter::bytes`] uses
+    /// one: a count that saturates would let two sequences of different lengths
+    /// encode identically.
     pub fn seq<T>(
         &mut self,
         items: impl ExactSizeIterator<Item = T>,
         mut f: impl FnMut(&mut Self, T),
     ) -> &mut Self {
-        let len = u32::try_from(items.len()).unwrap_or(u32::MAX);
-        self.u32(len);
+        self.u64(items.len() as u64);
         for item in items {
             f(self, item);
         }
@@ -204,7 +219,7 @@ mod tests {
         w.seq([1u8, 2, 3].into_iter(), |w, v| {
             w.u8(v);
         });
-        assert_eq!(w.finish(), vec![3, 0, 0, 0, 1, 2, 3]);
+        assert_eq!(w.finish(), vec![3, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3]);
     }
 
     #[test]
@@ -213,7 +228,7 @@ mod tests {
         w.seq(core::iter::empty::<u8>(), |w, v| {
             w.u8(v);
         });
-        assert_eq!(w.finish(), vec![0, 0, 0, 0]);
+        assert_eq!(w.finish(), vec![0; 8]);
     }
 
     #[test]

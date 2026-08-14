@@ -98,7 +98,9 @@ pub fn closing_postings<const P: u8>(
             amount: magnitude,
             currency: key.currency,
             layer,
-            dimensions: Default::default(),
+            // Closing flattens an account's whole balance across every
+            // dimension it was sliced by, so there is no one slice to carry.
+            dimensions: crate::dimensions::Dimensions::none(),
         });
 
         // … and carry the net to equity.
@@ -125,7 +127,7 @@ pub fn closing_postings<const P: u8>(
             amount: magnitude,
             currency,
             layer,
-            dimensions: Default::default(),
+            dimensions: crate::dimensions::Dimensions::none(),
         });
     }
 

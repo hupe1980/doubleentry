@@ -19,10 +19,12 @@
 //! - **Verifiable.** Entries are leaves in an append-only Merkle log. A third
 //!   party holding only a tree head can be given an `O(log n)` proof that an
 //!   entry is included, and an `O(log n)` proof that the log was only appended
-//!   to. Closing a period emits a [`Seal`] that commits to both its entries and
-//!   its closing balances, chained to the seal before it — and a single closing
-//!   balance can be proven against that seal with a [`BalanceProof`], without
-//!   handing over the rest of the trial balance.
+//!   to. Closing a period emits a [`Seal`] that commits to its entries, its
+//!   closing balances, and the account registry those balances are keyed on,
+//!   chained to the seal before it — so a single closing balance can be proven
+//!   against that seal with a [`BalanceProof`], and *named* with an
+//!   [`AccountBindingProof`], without handing over the rest of the trial balance
+//!   or the rest of the chart of accounts.
 //!
 //! # Where to start
 //!
@@ -103,7 +105,10 @@ pub mod seal;
 mod serde_support;
 pub mod storage;
 
-pub use account::{Account, AccountError, AccountId, AccountKind, AccountPath, AccountRegistry};
+pub use account::{
+    Account, AccountBindingProof, AccountError, AccountId, AccountKind, AccountPath, AccountRecord,
+    AccountRegistry, account_binding_leaf,
+};
 pub use balance::{Balance, BalanceKey, TrialBalance};
 pub use canonical::{Canonical, CanonicalWriter};
 pub use checkpoint::{AssertionOutcome, BalanceAssertion, Checkpoint, CheckpointError};

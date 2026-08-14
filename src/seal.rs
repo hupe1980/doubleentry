@@ -1,19 +1,40 @@
 //! Period seals.
 //!
-//! Sealing a period commits to two things at once: **which entries** the log
-//! held when it closed, and **what they add up to**. Both are Merkle roots, so a
-//! third party holding nothing but a seal can later be shown a fact about the
-//! period without being given its contents:
+//! Sealing a period commits to three things at once: **which entries** the log
+//! held when it closed, **what they add up to**, and **which accounts those
+//! totals are for**. All three are Merkle roots, so a third party holding
+//! nothing but a seal can later be shown a fact about the period without being
+//! given its contents:
 //!
 //! - Against [`Seal::tree_head`], an [`InclusionProof`]
 //!   that a specific entry was in the log the seal closed over.
 //! - Against [`Seal::trial_balance_root`], a [`BalanceProof`] that a specific
 //!   account held a specific balance in the closing trial balance.
+//! - Against [`Seal::accounts_root`], an
+//!   [`AccountBindingProof`] that a specific
+//!   handle is a specific account path.
 //!
-//! Both are `O(log n)` and reveal nothing else. That second one is the reason a
+//! All three are `O(log n)` and reveal nothing else. The second is the reason a
 //! seal commits to a Merkle root over the balances rather than to a flat digest
 //! of them: a digest can only be checked by whoever holds every balance, which
 //! is precisely the party an auditor is trying not to have to trust.
+//!
+//! # Why the third root exists
+//!
+//! A trial-balance leaf names its account by handle — a dense integer, chosen so
+//! comparisons and lookups are cheap. On its own that makes a balance proof a
+//! statement about an integer: an auditor learns that handle `#7` held a
+//! balance and must take the operator's word for what `#7` is. Worse, nothing
+//! would stop the operator changing the answer afterwards. Re-registering the
+//! same paths in a different order renumbers every handle, and every seal, every
+//! balance proof and the whole chain would go on verifying byte for byte while
+//! each balance quietly referred to a different account — precisely the
+//! alteration a seal exists to expose.
+//!
+//! [`Seal::accounts_root`] closes both gaps at once. It pins the handle space to
+//! the paths it meant at the moment of sealing, and it lets a balance be
+//! *named*: [`BalanceProof::verify_naming`] checks a balance and its account
+//! binding against one seal, disclosing nothing about any other account.
 //!
 //! # What "belongs to the period" means
 //!
@@ -32,6 +53,7 @@
 //! What a seal detects is *alteration*, not *access*. Preventing writes is the
 //! storage layer's job; making a write recognisable afterwards is this one's.
 
+use crate::account::AccountBindingProof;
 use crate::balance::{Balance, BalanceKey, TrialBalance};
 use crate::canonical::{Canonical, CanonicalWriter};
 use crate::hash::{Hash, tag, tagged};
@@ -81,7 +103,7 @@ impl PeriodCoverage {
 
 /// A commitment to the closing state of one accounting period.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct Seal {
     /// The ledger whose books this seal covers.
     ///
@@ -111,7 +133,26 @@ pub struct Seal {
     /// The journal's tree head at the moment of sealing.
     pub tree_head: TreeHead,
     /// Merkle root over the period's closing trial balance.
+    ///
+    /// The rows it commits to are keyed on account *handles*, so it is only
+    /// meaningful together with [`Seal::accounts_root`], which says what those
+    /// handles were.
     pub trial_balance_root: Hash,
+    /// Merkle root over the handle-to-account bindings in force at sealing.
+    ///
+    /// A trial-balance leaf names an account by its handle — a dense integer,
+    /// cheap to compare and to index by, and meaningless on its own. Without
+    /// this field the handles would float: renumbering the registry after the
+    /// fact, or re-registering the same paths in a different order, would leave
+    /// every seal, every [`BalanceProof`] and the whole chain verifying exactly
+    /// as before, while every balance in them silently referred to a different
+    /// account. That is precisely the alteration a seal exists to make visible.
+    ///
+    /// It is also what makes selective disclosure complete. An
+    /// [`AccountBindingProof`](crate::account::AccountBindingProof) against this
+    /// root turns "handle `#7` held this balance" into "`Assets:Cash` held this
+    /// balance", without revealing any other account.
+    pub accounts_root: Hash,
     /// Hash of the preceding seal, or `None` for the first.
     pub prev_seal: Option<Hash>,
     /// Hash over every other field.
@@ -119,7 +160,12 @@ pub struct Seal {
 }
 
 impl Seal {
-    /// Builds a seal, computing both roots and the chaining hash.
+    /// Builds a seal, computing every root and the chaining hash.
+    ///
+    /// `accounts_root` is an [`AccountRegistry::commitment`](crate::AccountRegistry::commitment)
+    /// taken at the same moment as the trial balance. It has to be the registry
+    /// the balances were computed against, or the seal commits to handles it
+    /// does not explain.
     #[must_use]
     pub fn build<const P: u8>(
         ledger: LedgerId,
@@ -127,6 +173,7 @@ impl Seal {
         coverage: PeriodCoverage,
         tree_head: TreeHead,
         trial_balance: &TrialBalance<P>,
+        accounts_root: Hash,
         prev_seal: Option<Hash>,
     ) -> Self {
         let trial_balance_root = trial_balance_root(trial_balance);
@@ -138,6 +185,7 @@ impl Seal {
             entry_count: coverage.entry_count,
             tree_head,
             trial_balance_root,
+            accounts_root,
             prev_seal,
             seal_hash: Hash::from_bytes([0u8; 32]),
         };
@@ -169,6 +217,60 @@ impl Seal {
     }
 }
 
+/// Wire form of a seal.
+///
+/// Separate from [`Seal`] so deserialisation can re-check the seal hash before
+/// handing back a value. Every field is public and mutable, so a `Seal` read off
+/// a wire without that check would be a commitment that commits to nothing.
+#[cfg(feature = "serde")]
+#[derive(serde::Deserialize)]
+struct SealOwned {
+    ledger: LedgerId,
+    period: PeriodId,
+    first_index: Option<u64>,
+    last_index: Option<u64>,
+    entry_count: u64,
+    tree_head: TreeHead,
+    trial_balance_root: Hash,
+    accounts_root: Hash,
+    prev_seal: Option<Hash>,
+    seal_hash: Hash,
+}
+
+/// A deserialised seal is checked against its own hash before it is returned.
+///
+/// The same rule the rest of the crate follows: an invariant that holds for a
+/// constructed value must hold for one read back, or the type guarantees
+/// nothing. Here the invariant is the whole point of the type — `seal_hash` is
+/// what an auditor archives, and a `Seal` whose fields no longer hash to it is
+/// evidence of tampering, not a value to hand to a caller who may never think to
+/// call [`Seal::is_self_consistent`].
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for Seal {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let raw = SealOwned::deserialize(d)?;
+        let seal = Self {
+            ledger: raw.ledger,
+            period: raw.period,
+            first_index: raw.first_index,
+            last_index: raw.last_index,
+            entry_count: raw.entry_count,
+            tree_head: raw.tree_head,
+            trial_balance_root: raw.trial_balance_root,
+            accounts_root: raw.accounts_root,
+            prev_seal: raw.prev_seal,
+            seal_hash: raw.seal_hash,
+        };
+        if seal.is_self_consistent() {
+            Ok(seal)
+        } else {
+            Err(serde::de::Error::custom(
+                "seal does not match its own contents",
+            ))
+        }
+    }
+}
+
 impl Canonical for Seal {
     /// Encodes every field except `seal_hash`, which is derived from this.
     fn encode(&self, w: &mut CanonicalWriter) {
@@ -184,6 +286,7 @@ impl Canonical for Seal {
         w.u64(self.tree_head.size);
         w.fixed(self.tree_head.root.as_bytes());
         w.fixed(self.trial_balance_root.as_bytes());
+        w.fixed(self.accounts_root.as_bytes());
         w.option(self.prev_seal.as_ref(), |w, v| {
             w.fixed(v.as_bytes());
         });
@@ -349,9 +452,29 @@ impl<const P: u8> BalanceProof<P> {
     }
 
     /// Verifies the claim against a whole seal.
+    ///
+    /// Establishes what a *handle* held. To learn which account that handle is,
+    /// pair this with an
+    /// [`AccountBindingProof`](crate::account::AccountBindingProof) against the
+    /// same seal's [`accounts_root`](Seal::accounts_root) — or use
+    /// [`BalanceProof::verify_naming`], which checks both together.
     #[must_use]
     pub fn verify_against(&self, seal: &Seal) -> bool {
         seal.is_self_consistent() && self.verify(&seal.trial_balance_root)
+    }
+
+    /// Verifies the balance *and* the account it belongs to, against one seal.
+    ///
+    /// The complete claim an auditor wants: this account, this balance, this
+    /// period, checkable from a seal and two `O(log n)` paths, disclosing
+    /// nothing else. Fails unless the binding proof names the same handle the
+    /// balance is for — otherwise a genuine balance for one account could be
+    /// presented under another account's name.
+    #[must_use]
+    pub fn verify_naming(&self, binding: &AccountBindingProof, seal: &Seal) -> bool {
+        self.verify_against(seal)
+            && binding.id() == self.key.account
+            && binding.verify(&seal.accounts_root)
     }
 }
 
@@ -420,42 +543,43 @@ impl SealChain {
         self.seals.last()
     }
 
-    /// Appends a seal, checking that it chains to the current head.
-    pub fn push(&mut self, seal: Seal) -> Result<(), SealChainError> {
+    /// Every rule that relates a seal to the one before it.
+    ///
+    /// Shared by [`SealChain::push`] and [`SealChain::verify`] so that appending
+    /// and re-checking cannot drift apart — a chain that accepted a link it
+    /// would later reject, or the reverse, would be worse than either rule alone.
+    fn check_link(previous: Option<&Seal>, seal: &Seal) -> Result<(), SealChainError> {
+        let period = || seal.period.clone();
         if !seal.is_self_consistent() {
-            return Err(SealChainError::Tampered {
-                period: seal.period,
-            });
+            return Err(SealChainError::Tampered { period: period() });
         }
-        if let Some(prev) = self.seals.last()
+        if let Some(prev) = previous
             && prev.ledger != seal.ledger
         {
             return Err(SealChainError::ForeignLedger {
-                period: seal.period,
+                period: period(),
                 expected: prev.ledger.clone(),
-                found: seal.ledger,
+                found: seal.ledger.clone(),
             });
         }
-        match (self.seals.last(), seal.prev_seal) {
-            (None, None) => {}
+        match (previous, seal.prev_seal) {
+            (None, None) => Ok(()),
             (Some(prev), Some(reference)) => {
                 if prev.seal_hash != reference {
-                    return Err(SealChainError::BrokenChain {
-                        period: seal.period,
-                    });
+                    return Err(SealChainError::BrokenChain { period: period() });
                 }
                 if seal.tree_head.size < prev.tree_head.size {
-                    return Err(SealChainError::NonMonotonic {
-                        period: seal.period,
-                    });
+                    return Err(SealChainError::NonMonotonic { period: period() });
                 }
+                Ok(())
             }
-            _ => {
-                return Err(SealChainError::MisplacedGenesis {
-                    period: seal.period,
-                });
-            }
+            _ => Err(SealChainError::MisplacedGenesis { period: period() }),
         }
+    }
+
+    /// Appends a seal, checking that it chains to the current head.
+    pub fn push(&mut self, seal: Seal) -> Result<(), SealChainError> {
+        Self::check_link(self.seals.last(), &seal)?;
         self.seals.push(seal);
         Ok(())
     }
@@ -464,40 +588,7 @@ impl SealChain {
     pub fn verify(&self) -> Result<(), SealChainError> {
         let mut previous: Option<&Seal> = None;
         for seal in &self.seals {
-            if !seal.is_self_consistent() {
-                return Err(SealChainError::Tampered {
-                    period: seal.period.clone(),
-                });
-            }
-            if let Some(prev) = previous
-                && prev.ledger != seal.ledger
-            {
-                return Err(SealChainError::ForeignLedger {
-                    period: seal.period.clone(),
-                    expected: prev.ledger.clone(),
-                    found: seal.ledger.clone(),
-                });
-            }
-            match (previous, seal.prev_seal) {
-                (None, None) => {}
-                (Some(prev), Some(reference)) => {
-                    if prev.seal_hash != reference {
-                        return Err(SealChainError::BrokenChain {
-                            period: seal.period.clone(),
-                        });
-                    }
-                    if seal.tree_head.size < prev.tree_head.size {
-                        return Err(SealChainError::NonMonotonic {
-                            period: seal.period.clone(),
-                        });
-                    }
-                }
-                _ => {
-                    return Err(SealChainError::MisplacedGenesis {
-                        period: seal.period.clone(),
-                    });
-                }
-            }
+            Self::check_link(previous, seal)?;
             previous = Some(seal);
         }
         Ok(())
@@ -531,9 +622,10 @@ impl SealChain {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::account::AccountId;
+    use crate::account::{AccountId, AccountRegistry};
     use crate::money::{Amount, Currency};
     use crate::posting::{Direction, Layer};
+    use time::macros::date;
 
     type Eur = Amount<2>;
 
@@ -550,6 +642,24 @@ mod tests {
             size,
             root: Hash::from_bytes([byte; 32]),
         }
+    }
+
+    /// A registry commitment for the tests that do not exercise bindings.
+    ///
+    /// Fixed rather than derived: these tests are about the seal preimage and
+    /// the chain, and the binding proofs have their own tests below.
+    fn accounts_root() -> Hash {
+        Hash::from_bytes([0xa0; 32])
+    }
+
+    /// A registry with two accounts, and the commitment over it.
+    fn registry() -> AccountRegistry {
+        let mut r = AccountRegistry::new();
+        for path in ["Assets:Cash", "Income:Sales"] {
+            r.register_path(path, date!(2026 - 01 - 01))
+                .expect("registers");
+        }
+        r
     }
 
     fn tb(entries: &[(u32, i64, i64)]) -> TrialBalance<2> {
@@ -580,6 +690,7 @@ mod tests {
             PeriodCoverage::spanning(0, 9, 10),
             head(10, 1),
             &tb(&[(0, 100, 0)]),
+            accounts_root(),
             None,
         );
         assert!(seal.is_self_consistent());
@@ -594,6 +705,7 @@ mod tests {
             PeriodCoverage::spanning(0, 9, 10),
             head(10, 1),
             &tb(&[(0, 100, 0)]),
+            accounts_root(),
             None,
         );
 
@@ -618,6 +730,7 @@ mod tests {
             PeriodCoverage::spanning(0, 1, 0),
             head(2, 1),
             &tb(&[(0, 100, 0)]),
+            accounts_root(),
             None,
         );
         let b = Seal::build(
@@ -626,6 +739,7 @@ mod tests {
             PeriodCoverage::spanning(0, 1, 0),
             head(2, 1),
             &tb(&[(0, 101, 0)]),
+            accounts_root(),
             None,
         );
         assert_ne!(a.trial_balance_root, b.trial_balance_root);
@@ -640,6 +754,7 @@ mod tests {
             PeriodCoverage::EMPTY,
             head(0, 1),
             &tb(&[(0, 0, 0)]),
+            accounts_root(),
             None,
         );
         let busy = Seal::build(
@@ -648,6 +763,7 @@ mod tests {
             PeriodCoverage::EMPTY,
             head(0, 1),
             &tb(&[(0, 500, 500)]),
+            accounts_root(),
             None,
         );
         assert_ne!(quiet.trial_balance_root, busy.trial_balance_root);
@@ -662,6 +778,7 @@ mod tests {
             PeriodCoverage::spanning(0, 4, 0),
             head(5, 1),
             &tb(&[(0, 100, 0)]),
+            accounts_root(),
             None,
         );
         chain.push(first.clone()).expect("genesis");
@@ -672,6 +789,7 @@ mod tests {
             PeriodCoverage::spanning(5, 9, 5),
             head(10, 2),
             &tb(&[(0, 200, 0)]),
+            accounts_root(),
             Some(first.seal_hash),
         );
         chain.push(second).expect("chains");
@@ -693,6 +811,7 @@ mod tests {
             PeriodCoverage::spanning(0, 0, 1),
             head(1, 1),
             &tb(&[]),
+            accounts_root(),
             None,
         );
         chain.push(first).expect("genesis");
@@ -703,6 +822,7 @@ mod tests {
             PeriodCoverage::spanning(1, 1, 1),
             head(2, 2),
             &tb(&[]),
+            accounts_root(),
             Some(Hash::from_bytes([7u8; 32])),
         );
         assert!(matches!(
@@ -721,6 +841,7 @@ mod tests {
                 PeriodCoverage::EMPTY,
                 head(1, 1),
                 &tb(&[]),
+                accounts_root(),
                 None,
             ))
             .expect("genesis");
@@ -731,6 +852,7 @@ mod tests {
             PeriodCoverage::EMPTY,
             head(2, 2),
             &tb(&[]),
+            accounts_root(),
             None,
         );
         assert!(matches!(
@@ -748,6 +870,7 @@ mod tests {
             PeriodCoverage::EMPTY,
             head(1, 1),
             &tb(&[]),
+            accounts_root(),
             Some(Hash::from_bytes([3u8; 32])),
         );
         assert!(matches!(
@@ -765,6 +888,7 @@ mod tests {
             PeriodCoverage::spanning(0, 9, 10),
             head(10, 1),
             &tb(&[]),
+            accounts_root(),
             None,
         );
         chain.push(first.clone()).expect("genesis");
@@ -775,6 +899,7 @@ mod tests {
             PeriodCoverage::spanning(0, 4, 0),
             head(5, 2),
             &tb(&[]),
+            accounts_root(),
             Some(first.seal_hash),
         );
         assert!(matches!(
@@ -792,6 +917,7 @@ mod tests {
             PeriodCoverage::spanning(0, 4, 0),
             head(5, 1),
             &tb(&[(0, 100, 0)]),
+            accounts_root(),
             None,
         );
         chain.push(first.clone()).expect("genesis");
@@ -802,6 +928,7 @@ mod tests {
                 PeriodCoverage::spanning(5, 9, 5),
                 head(10, 2),
                 &tb(&[(0, 200, 0)]),
+                accounts_root(),
                 Some(first.seal_hash),
             ))
             .expect("chains");
@@ -827,6 +954,7 @@ mod tests {
             PeriodCoverage::spanning(0, 3, 4),
             head(4, 1),
             &trial,
+            accounts_root(),
             None,
         );
 
@@ -849,6 +977,7 @@ mod tests {
             PeriodCoverage::EMPTY,
             head(2, 1),
             &trial,
+            accounts_root(),
             None,
         );
         let key = BalanceKey {
@@ -895,6 +1024,7 @@ mod tests {
             PeriodCoverage::EMPTY,
             head(2, 1),
             &march,
+            accounts_root(),
             None,
         );
         let key = BalanceKey {
@@ -909,6 +1039,129 @@ mod tests {
     }
 
     #[test]
+    fn a_seal_binds_the_handles_its_balances_are_keyed_on() {
+        // Renumbering the registry must not leave the seal verifying. Before
+        // `accounts_root` it did: the trial balance root is keyed on handles, so
+        // re-registering the same paths in a different order produced a byte-
+        // identical seal that now meant something else entirely.
+        let trial = tb(&[(0, 100, 0), (1, 0, 100)]);
+        let seal = Seal::build(
+            lid(),
+            pid("2026-03"),
+            PeriodCoverage::spanning(0, 1, 2),
+            head(2, 1),
+            &trial,
+            registry().commitment(),
+            None,
+        );
+
+        let mut renumbered = AccountRegistry::new();
+        for path in ["Income:Sales", "Assets:Cash"] {
+            renumbered
+                .register_path(path, date!(2026 - 01 - 01))
+                .expect("registers");
+        }
+
+        // Same paths, same balances, same everything the old seal covered …
+        assert_eq!(trial_balance_root(&trial), seal.trial_balance_root);
+        // … but the handles they hang off are different, and the seal says so.
+        assert_ne!(renumbered.commitment(), seal.accounts_root);
+    }
+
+    #[test]
+    fn a_balance_proof_can_name_the_account_it_is_about() {
+        let accounts = registry();
+        let cash = accounts
+            .id_of(&crate::account::AccountPath::parse("Assets:Cash").expect("valid"))
+            .expect("registered");
+
+        let trial = tb(&[(cash.index(), 119_000, 0), (1, 0, 119_000)]);
+        let seal = Seal::build(
+            lid(),
+            pid("2026-03"),
+            PeriodCoverage::spanning(0, 1, 2),
+            head(2, 1),
+            &trial,
+            accounts.commitment(),
+            None,
+        );
+
+        let key = BalanceKey {
+            account: cash,
+            currency: Currency::EUR,
+            layer: Layer::Settled,
+        };
+        let balance = TrialBalanceCommitment::of(&trial)
+            .prove(&key)
+            .expect("row exists");
+        let binding = accounts.prove_binding(cash).expect("registered");
+
+        // The complete claim: this account, this balance, this seal.
+        assert!(balance.verify_naming(&binding, &seal));
+        assert_eq!(binding.account().path.to_string(), "Assets:Cash");
+
+        // A binding for a *different* handle must not launder a real balance
+        // under the wrong account's name.
+        let other = accounts
+            .prove_binding(AccountId::from_index(1))
+            .expect("registered");
+        assert!(!balance.verify_naming(&other, &seal));
+
+        // And a genuine binding proves nothing against a seal from a registry
+        // that never contained it.
+        let foreign = Seal::build(
+            lid(),
+            pid("2026-04"),
+            PeriodCoverage::EMPTY,
+            head(2, 1),
+            &trial,
+            accounts_root(),
+            None,
+        );
+        assert!(!balance.verify_naming(&binding, &foreign));
+    }
+
+    #[test]
+    fn a_binding_proof_cannot_be_replayed_at_another_handle() {
+        let accounts = registry();
+        let root = accounts.commitment();
+        let mut proof = accounts
+            .prove_binding(AccountId::from_index(0))
+            .expect("registered");
+        assert!(proof.verify(&root));
+
+        // Claiming the same account sits at a different position.
+        proof.record.id = AccountId::from_index(1);
+        assert!(!proof.verify(&root));
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn a_deserialised_seal_is_checked_against_its_own_hash() {
+        let seal = Seal::build(
+            lid(),
+            pid("p"),
+            PeriodCoverage::EMPTY,
+            head(1, 1),
+            &tb(&[(0, 100, 0)]),
+            accounts_root(),
+            None,
+        );
+        let json = serde_json::to_string(&seal).expect("serialises");
+        assert_eq!(
+            serde_json::from_str::<Seal>(&json).expect("round-trips"),
+            seal
+        );
+
+        // A field edited on the wire must not deserialise at all — a caller who
+        // never thinks to call `is_self_consistent` still cannot be handed a
+        // commitment that commits to nothing.
+        let forged = json.replace("\"entry_count\":0", "\"entry_count\":99");
+        assert_ne!(forged, json, "the test must actually alter the payload");
+        assert!(serde_json::from_str::<Seal>(&forged).is_err());
+    }
+
+    #[test]
     fn an_empty_period_seals_with_no_entries() {
         let seal = Seal::build(
             lid(),
@@ -916,6 +1169,7 @@ mod tests {
             PeriodCoverage::EMPTY,
             head(0, 1),
             &tb(&[]),
+            accounts_root(),
             None,
         );
         assert_eq!(seal.entry_count, 0);

@@ -20,7 +20,7 @@ use time::Date;
 
 use crate::canonical::{Canonical, CanonicalWriter};
 use crate::hash::{Hash, tag, tagged};
-use crate::merkle::MerkleLog;
+use crate::merkle::{InclusionProof, MerkleLog};
 
 /// Maximum number of characters in one path segment.
 pub const MAX_SEGMENT_LEN: usize = 64;
@@ -30,6 +30,14 @@ pub const MAX_DEPTH: usize = 16;
 
 /// The separator between path segments.
 pub const SEPARATOR: char = ':';
+
+/// Maximum number of accounts one registry may hold.
+///
+/// A handle is a `u32` position, so this is how many distinct ones exist. The
+/// bound is stated rather than left implicit because passing it must be an
+/// error: a registry that wrapped, saturated, or reused a handle would silently
+/// repoint every posting and every sealed balance that names it.
+pub const MAX_ACCOUNTS: usize = u32::MAX as usize;
 
 /// Failure constructing or registering an account.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -82,6 +90,13 @@ pub enum AccountError {
         /// The index actually present.
         found: u32,
     },
+    /// The registry has issued every handle its index space allows.
+    ///
+    /// Handles are `u32` positions written into every posting row and into every
+    /// trial-balance leaf a seal commits to, so reusing one would repoint
+    /// history. Refusing the registration is the only safe answer.
+    #[error("account registry is full: all {MAX_ACCOUNTS} handles have been issued")]
+    RegistryFull,
     /// The closing date preceded the opening date.
     #[error("account {path} closes on {closed} before it opens on {opened}")]
     ClosedBeforeOpened {
@@ -374,9 +389,15 @@ impl Canonical for Account {
     }
 }
 
+/// Encodes a date as year, month, day.
+///
+/// The year is a signed `i32`, which is the type [`Date::year`] returns and
+/// covers every date `time` can represent under any feature set. An earlier
+/// revision split it into a magnitude and a sign bit, which needed a clamp — and
+/// a clamp inside a hash preimage is a silent collision waiting for someone to
+/// enable a wider date range.
 pub(crate) fn encode_date(w: &mut CanonicalWriter, d: Date) {
-    w.u16(d.year().unsigned_abs().min(u32::from(u16::MAX)) as u16);
-    w.bool(d.year() < 0);
+    w.i32(d.year());
     w.u8(u8::from(d.month()));
     w.u8(d.day());
 }
@@ -401,6 +422,68 @@ impl Canonical for AccountRecord {
     fn encode(&self, w: &mut CanonicalWriter) {
         w.u32(self.id.index());
         self.account.encode(w);
+    }
+}
+
+/// The leaf one handle-to-account binding hashes to.
+///
+/// Covers the handle and the whole account — path, kind, and open window — so a
+/// registry that reopened a closed account, or moved a path to a different
+/// handle, produces a different commitment.
+#[must_use]
+pub fn account_binding_leaf(record: &AccountRecord) -> Hash {
+    let mut w = CanonicalWriter::new();
+    record.encode(&mut w);
+    tagged(tag::ACCOUNT_BINDING_V1, &w.finish())
+}
+
+/// Proof that a handle was issued to a particular account.
+///
+/// Self-contained: it carries the binding as well as the path, so a verifier
+/// needs nothing but this and an [`AccountRegistry::commitment`] — which a
+/// [`Seal`](crate::Seal) publishes as
+/// [`accounts_root`](crate::Seal::accounts_root).
+///
+/// This is what makes a sealed balance legible. A
+/// [`BalanceProof`](crate::BalanceProof) proves that handle `#7` held a
+/// balance; on its own that is a statement about an integer. Pairing it with
+/// this proof, against the same seal, turns it into a statement about
+/// `Assets:Cash` — without disclosing any other account, balance, or entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct AccountBindingProof {
+    /// The handle and the account it names.
+    pub record: AccountRecord,
+    /// Path from the binding's leaf up to the registry commitment.
+    pub proof: InclusionProof,
+}
+
+impl AccountBindingProof {
+    /// The handle being proven.
+    #[must_use]
+    pub fn id(&self) -> AccountId {
+        self.record.id
+    }
+
+    /// The account the handle names.
+    #[must_use]
+    pub fn account(&self) -> &Account {
+        &self.record.account
+    }
+
+    /// Verifies the binding against an [`AccountRegistry::commitment`].
+    ///
+    /// Returns `false` on any inconsistency rather than distinguishing failure
+    /// modes: a verifier cannot act differently on a malformed proof than on a
+    /// forged one.
+    #[must_use]
+    pub fn verify(&self, accounts_root: &Hash) -> bool {
+        // The handle *is* the leaf index, so a proof for one binding cannot be
+        // replayed at another position without failing here.
+        self.proof.leaf_index == u64::from(self.record.id.index())
+            && self
+                .proof
+                .verify(&account_binding_leaf(&self.record), accounts_root)
     }
 }
 
@@ -442,7 +525,9 @@ impl AccountRegistry {
             return Err(AccountError::AlreadyRegistered { path: account.path });
         }
 
-        let id = AccountId(u32::try_from(self.accounts.len()).unwrap_or(u32::MAX));
+        // Refused rather than saturated: a reused handle repoints history.
+        let id =
+            AccountId(u32::try_from(self.accounts.len()).map_err(|_| AccountError::RegistryFull)?);
         let path = account.path.clone();
 
         // Registering a child turns its registered ancestors into path nodes.
@@ -556,6 +641,9 @@ impl AccountRegistry {
     }
 
     /// Every account with its handle, in handle order.
+    ///
+    /// The index cast cannot saturate: [`AccountRegistry::register`] refuses to
+    /// issue a handle beyond [`MAX_ACCOUNTS`], so every position here fits.
     #[must_use]
     pub fn records(&self) -> Vec<AccountRecord> {
         self.accounts
@@ -626,23 +714,50 @@ impl AccountRegistry {
         Ok(registry)
     }
 
-    /// A hash over every handle-to-account binding.
+    /// A Merkle root over every handle-to-account binding, in handle order.
     ///
     /// Two registries agree on this only if they agree on every account *and*
     /// on the handle each was issued. Comparing a locally built registry
     /// against the stored one turns a silent repointing into a caught mismatch.
+    ///
+    /// A [`Seal`](crate::Seal) records this alongside its trial-balance root, so
+    /// the handles that root is keyed on are pinned to the paths they meant at
+    /// the moment of sealing. Without it, renumbering the registry afterwards
+    /// would leave every seal and every balance proof verifying while every
+    /// balance referred to a different account.
     #[must_use]
     pub fn commitment(&self) -> Hash {
-        let leaves: Vec<Hash> = self
-            .records()
-            .iter()
-            .map(|record| {
-                let mut w = CanonicalWriter::new();
-                record.encode(&mut w);
-                tagged(tag::ACCOUNT_BINDING_V1, &w.finish())
-            })
-            .collect();
-        MerkleLog::from_leaves(leaves).root()
+        self.binding_log().root()
+    }
+
+    /// The Merkle log the commitment is the root of.
+    ///
+    /// Leaves are in handle order, so a handle is its own leaf index — which is
+    /// what makes [`AccountRegistry::prove_binding`] a direct lookup.
+    fn binding_log(&self) -> MerkleLog {
+        MerkleLog::from_leaves(self.records().iter().map(account_binding_leaf).collect())
+    }
+
+    /// Proves which account a handle was issued to.
+    ///
+    /// The companion to a [`BalanceProof`](crate::BalanceProof). That proof
+    /// establishes what handle `#7` held; this one establishes that `#7` is
+    /// `Assets:Cash`. Together with a [`Seal`](crate::Seal) they make a closing
+    /// balance a self-describing claim, checkable by someone who holds neither
+    /// the trial balance nor the chart of accounts.
+    ///
+    /// Returns `None` when the handle is not registered.
+    #[must_use]
+    pub fn prove_binding(&self, id: AccountId) -> Option<AccountBindingProof> {
+        let record = AccountRecord {
+            id,
+            account: self.get(id)?.clone(),
+        };
+        let proof = self
+            .binding_log()
+            .inclusion_proof(u64::from(id.index()))
+            .ok()?;
+        Some(AccountBindingProof { record, proof })
     }
 
     /// Handles of every account at or below `prefix`, in path order.
@@ -831,6 +946,71 @@ mod tests {
         assert_eq!(AccountKind::Liability.normal_side(), Direction::Credit);
         assert_eq!(AccountKind::Equity.normal_side(), Direction::Credit);
         assert_eq!(AccountKind::Income.normal_side(), Direction::Credit);
+    }
+
+    #[test]
+    fn the_commitment_changes_when_a_handle_moves() {
+        // The property the whole binding commitment exists for: two registries
+        // holding the same paths, issued in different orders, are not the same
+        // registry — because every posting row and every sealed balance names
+        // an account by its handle.
+        let build = |paths: [&str; 2]| {
+            let mut r = reg();
+            for p in paths {
+                r.register_path(p, date!(2026 - 01 - 01))
+                    .expect("registers");
+            }
+            r
+        };
+        let forward = build(["Assets:Cash", "Income:Sales"]);
+        let swapped = build(["Income:Sales", "Assets:Cash"]);
+
+        assert_ne!(forward.commitment(), swapped.commitment());
+        // … and rebuilding the same order reproduces it exactly.
+        assert_eq!(
+            forward.commitment(),
+            build(["Assets:Cash", "Income:Sales"]).commitment()
+        );
+    }
+
+    #[test]
+    fn every_binding_proves_against_the_commitment() {
+        let mut r = reg();
+        for i in 0..17 {
+            r.register_path(&format!("Assets:A{i}"), date!(2026 - 01 - 01))
+                .expect("registers");
+        }
+        let root = r.commitment();
+        for (id, account) in r.iter() {
+            let proof = r.prove_binding(id).expect("registered");
+            assert!(proof.verify(&root), "binding for {id} must prove");
+            assert_eq!(proof.account().path, account.path);
+        }
+        assert!(r.prove_binding(AccountId::from_index(99)).is_none());
+    }
+
+    #[test]
+    fn a_binding_proof_does_not_survive_an_edit_to_the_account() {
+        let mut r = reg();
+        let id = r
+            .register_path("Assets:Cash", date!(2026 - 01 - 01))
+            .expect("registers");
+        r.register_path("Income:Sales", date!(2026 - 01 - 01))
+            .expect("registers");
+        let root = r.commitment();
+        let proof = r.prove_binding(id).expect("registered");
+        assert!(proof.verify(&root));
+
+        // Claiming a different path under the same handle.
+        let mut renamed = proof.clone();
+        renamed.record.account.path = AccountPath::parse("Assets:Slush").expect("valid");
+        assert!(!renamed.verify(&root));
+
+        // Claiming the account was open longer than it was.
+        let mut reopened = proof;
+        reopened.record.account.closed_on = None;
+        reopened.record.account.opened_on = date!(2020 - 01 - 01);
+        assert!(!reopened.verify(&root));
     }
 
     #[test]

@@ -63,6 +63,12 @@ pub const PROP_SEAL_HASH: &str = "doubleentry.seal_hash";
 pub const PROP_TREE_ROOT: &str = "doubleentry.tree_root";
 /// Snapshot summary key carrying the seal's trial-balance root, as lowercase hex.
 pub const PROP_TRIAL_BALANCE_ROOT: &str = "doubleentry.trial_balance_root";
+/// Snapshot summary key carrying the seal's account-bindings root, as lowercase hex.
+///
+/// The archived posting rows name their account by handle, exactly as the
+/// trial-balance root does. This is what says which account each of those
+/// integers was, so a reader working from the table alone can still tell.
+pub const PROP_ACCOUNTS_ROOT: &str = "doubleentry.accounts_root";
 /// Snapshot summary key carrying how many entries the period holds.
 pub const PROP_ENTRY_COUNT: &str = "doubleentry.entry_count";
 /// Snapshot summary key carrying the log size archived through, exclusive.
@@ -536,6 +542,9 @@ async fn write_snapshot<C: Catalog>(
             PROP_TRIAL_BALANCE_ROOT.to_owned(),
             seal.trial_balance_root.to_hex(),
         ),
+        // The archived rows name accounts by handle; this is what those handles
+        // meant when the period was sealed.
+        (PROP_ACCOUNTS_ROOT.to_owned(), seal.accounts_root.to_hex()),
         (PROP_ENTRY_COUNT.to_owned(), seal.entry_count.to_string()),
         // Where the next compaction resumes, and the commitment it resumes
         // from. Without these the archive could only be extended by re-reading

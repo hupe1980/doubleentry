@@ -123,9 +123,32 @@ impl fmt::Display for Currency {
 
 /// An exact monetary magnitude with `P` decimal places.
 ///
-/// The value is stored as an `i64` count of minor units at scale `P`. At `P = 2`
-/// the representable range spans roughly ±9.2 × 10¹⁶ minor units, which is ample
-/// for both individual postings and cumulative balances.
+/// The value is stored as an `i64` count of minor units at scale `P`.
+///
+/// # Range, and why it depends on `P`
+///
+/// The `i64` bounds the *minor units*, so raising the scale spends range on
+/// precision rather than on magnitude. At the scales real books are kept in this
+/// is not a constraint anyone meets; at the top of the permitted range it is
+/// severe, and it is easier to see as a table than to derive:
+///
+/// | `P` | Largest major-unit value |
+/// |---|---|
+/// | 0 | ~9.2 × 10¹⁸ |
+/// | 2 | ~9.2 × 10¹⁶ |
+/// | 4 | ~9.2 × 10¹⁴ |
+/// | 8 | ~9.2 × 10¹⁰ |
+/// | 18 | ~9.2 |
+///
+/// So `Amount<2>` covers roughly 92 quadrillion currency units — ample for both
+/// individual postings and cumulative balances — while `Amount<18>` compiles but
+/// cannot represent ten of anything. [`Amount::MAX_PRECISION`] is the point past
+/// which one major unit stops being representable at all, not a recommendation;
+/// pick the scale your currency is *booked* in, which
+/// [`Currency::minor_units`] will tell you for the codes it knows.
+///
+/// Overflow is never silent: every operation that can exceed the range returns
+/// [`MoneyError::Overflow`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct Amount<const P: u8>(i64);
 
@@ -153,7 +176,8 @@ impl<const P: u8> Amount<P> {
     /// Largest precision the `i64` representation can carry.
     ///
     /// `10^19` exceeds `i64::MAX`, so a scale above this cannot represent even
-    /// one major unit.
+    /// one major unit. Scales approaching it are legal but increasingly useless
+    /// — see the range table on [`Amount`].
     pub const MAX_PRECISION: u8 = 18;
     /// Zero.
     pub const ZERO: Self = Self::from_minor(0);
@@ -572,5 +596,15 @@ mod tests {
     #[test]
     fn zero_scale_displays_as_integer() {
         assert_eq!(Amount::<0>::from_minor(1234).to_string(), "1234");
+    }
+
+    #[test]
+    fn the_range_shrinks_as_the_scale_grows() {
+        // The documented table, checked. Raising the scale spends `i64` range on
+        // precision, so a high scale is legal and nearly empty — which is worth
+        // pinning, because it is the opposite of what "more precision" suggests.
+        assert!(Amount::<2>::from_major(92_000_000_000_000_000).is_ok());
+        assert!(Amount::<18>::from_major(9).is_ok());
+        assert_eq!(Amount::<18>::from_major(10), Err(MoneyError::Overflow));
     }
 }

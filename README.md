@@ -25,7 +25,7 @@ know this record wasn't changed after the fact?*
 | **Balanced by construction** | An entry reaches a persistable state only through validation, and the validated type has no other constructor |
 | **Exact** | Money is a scaled `i64` with compile-time precision. Every fallible operation returns `Result` — no floats, no panics, no wrapping |
 | **Deterministic** | No clock, no RNG, no hash-map iteration order. Identical inputs produce identical bytes |
-| **Verifiable** | Entries are leaves in an append-only Merkle log with `O(log n)` inclusion and consistency proofs; closed periods are sealed and chained |
+| **Verifiable** | Entries are leaves in an append-only Merkle log with `O(log n)` inclusion and consistency proofs; closed periods are sealed and chained, and a sealed balance can be proven *and named* without disclosing the rest of the books |
 | **Gross-preserving** | Balances carry debit *and* credit totals, so turnover survives netting |
 
 ---
@@ -379,9 +379,10 @@ assert_eq!(after.get_or_zero(&key).net()?, (Direction::Credit, Eur::parse("700.0
 
 ## 🧷 Period seals
 
-Closing a period commits to **which entries** it contains and **what they add up
-to** — both as Merkle roots. Seals chain, so removing or reordering a sealed
-period breaks every seal after it.
+Closing a period commits to **which entries** it contains, **what they add up
+to**, and **which accounts those totals are for** — all three as Merkle roots.
+Seals chain, so removing or reordering a sealed period breaks every seal after
+it.
 
 ```rust
 # use doubleentry::{Amount, Currency, Entry, EntryId, IdempotencyKey, Journal};
@@ -465,6 +466,55 @@ Both gross totals are in the leaf, not the net: two accounts that net to zero �
 with heavy offsetting turnover — must not produce the same commitment. An account with no
 postings has no row, so `prove` returns `None` for it rather than manufacturing a proof that it
 held zero; absence and a zero balance are different claims.
+
+### Naming the account, without disclosing the chart
+
+A trial-balance leaf names its account by **handle** — a dense integer, chosen so comparisons
+and lookups are cheap. On its own that makes the proof above a statement about an integer: the
+auditor learns handle `#0` held €1190.00 and has to take your word for what `#0` is.
+
+Worse, nothing would stop you changing the answer later. Re-registering the same paths in a
+different order renumbers every handle, and every seal, every balance proof and the whole chain
+would go on verifying byte for byte while each balance quietly referred to a different account —
+exactly the alteration a seal exists to expose.
+
+So a seal commits to the account registry too. `Seal::accounts_root` is a Merkle root over every
+handle-to-account binding, and `AccountRegistry::prove_binding` proves one of them:
+
+```rust
+# use doubleentry::{Amount, BalanceKey, Currency, Entry, EntryId, IdempotencyKey, Journal, Layer};
+# use doubleentry::period::{LedgerId, Period, PeriodId, PeriodState};
+# use doubleentry::seal::TrialBalanceCommitment;
+# use time::macros::date;
+# type Eur = Amount<2>;
+# let mut journal = Journal::<2>::new(LedgerId::new("acme-gmbh")?);
+# let cash = journal.accounts_mut().register_path("Assets:Cash", date!(2026-01-01))?;
+# let revenue = journal.accounts_mut().register_path("Income:Sales", date!(2026-01-01))?;
+# let march = PeriodId::new("2026-03")?;
+# journal.define_period(Period::new(march.clone(), date!(2026-03-01), date!(2026-03-31))?)?;
+# journal.record(
+#     Entry::new(EntryId::generate(), IdempotencyKey::new(b"e1".to_vec())?, date!(2026-03-15))
+#         .debit(cash, Eur::parse("1190.00")?, Currency::EUR)
+#         .credit(revenue, Eur::parse("1190.00")?, Currency::EUR))?;
+# journal.transition_period(&march, PeriodState::Closing)?;
+# let seal = journal.seal_period(&march)?;
+# let closing = journal.trial_balance_through_date(date!(2026-03-31))?;
+# let key = BalanceKey { account: cash, currency: Currency::EUR, layer: Layer::Settled };
+# let balance = TrialBalanceCommitment::of(&closing).prove(&key).expect("cash was posted to");
+let binding = journal.accounts().prove_binding(cash).expect("registered");
+
+// The complete claim: this account, this balance, this period — from the seal
+// and two O(log n) paths, disclosing nothing about any other account.
+assert!(balance.verify_naming(&binding, &seal));
+assert_eq!(binding.account().path.to_string(), "Assets:Cash");
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+`verify_naming` refuses a binding for a different handle than the balance is for, so a genuine
+balance cannot be presented under another account's name. The binding leaf covers the whole
+account — path, kind, and open window — so a registry that reopened a closed account or moved a
+path to a different handle produces a different `accounts_root`, and the seal that named the old
+one stops matching.
 
 ---
 
@@ -632,7 +682,7 @@ contract executable: a backend either passes it or is not a backend.
 | `balance`, `trial_balance` and `balances` agree | `check_balances_agree_across_readers` |
 | Statement paging neither repeats nor skips a line | `check_statement_pages_do_not_repeat_or_skip` |
 | A checkpoint written is the checkpoint read, tree head included | `check_checkpoints_round_trip` |
-| Periods persist with their state; seals chain and verify | `check_period_lifecycle_and_seals` |
+| Periods persist with their state; seals chain, bind their account handles, and verify | `check_period_lifecycle_and_seals` |
 
 This is not decoration. Every extension of the suite has failed a backend that looked correct.
 Going from nine checks to twelve caught two in PostgreSQL — a reversal could be reversed, and a

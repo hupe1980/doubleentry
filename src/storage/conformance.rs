@@ -780,6 +780,24 @@ pub async fn check_period_lifecycle_and_seals<const P: u8, S: LedgerStore<P>>(
         Err(e) => return CheckResult::fail(NAME, format!("periods failed: {e}")),
     }
 
+    // The seal must commit to the registry its balances are keyed on. A backend
+    // that computes the trial balance root but not this one leaves every account
+    // handle in it floating: renumbering the accounts table afterwards would
+    // keep the whole chain verifying while every balance meant something else.
+    match store.accounts().await {
+        Ok(records) => match AccountRegistry::from_records(records) {
+            Ok(registry) if registry.commitment() == seal.accounts_root => {}
+            Ok(_) => {
+                return CheckResult::fail(
+                    NAME,
+                    "the seal's accounts_root does not match the stored account bindings",
+                );
+            }
+            Err(e) => return CheckResult::fail(NAME, format!("registry would not rebuild: {e}")),
+        },
+        Err(e) => return CheckResult::fail(NAME, format!("accounts failed: {e}")),
+    }
+
     // The stored chain must reproduce what was returned, and verify.
     match store.seals().await {
         Ok(stored) => {

@@ -29,7 +29,9 @@ use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use time::Date;
 
-use crate::account::{Account, AccountId, AccountKind, AccountPath, AccountRecord};
+use crate::account::{
+    Account, AccountId, AccountKind, AccountPath, AccountRecord, AccountRegistry,
+};
 use crate::balance::{Balance, BalanceKey, TrialBalance};
 use crate::checkpoint::Checkpoint;
 use crate::clearing::{Clearing, ClearingId, OpenItem, PostingRef};
@@ -1332,6 +1334,12 @@ impl<const P: u8> LedgerStore<P> for PostgresStore<P> {
             },
             self.head().await?,
             &closing,
+            // Built from the stored bindings, not from a caller-supplied
+            // registry: the seal must commit to the handles this database
+            // actually resolved the balances against.
+            AccountRegistry::from_records(LedgerStore::<P>::accounts(self).await?)
+                .map_err(|e: crate::account::AccountError| PostgresError::malformed(e.to_string()))?
+                .commitment(),
             chain.head(),
         );
 
@@ -1339,8 +1347,8 @@ impl<const P: u8> LedgerStore<P> for PostgresStore<P> {
         sqlx::query(
             "INSERT INTO seals ( \
                 period_id, first_index, last_index, entry_count, tree_size, tree_root, \
-                trial_balance_root, prev_seal, seal_hash, chain_position \
-             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
+                trial_balance_root, accounts_root, prev_seal, seal_hash, chain_position \
+             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
         )
         .bind(seal.period.as_str())
         .bind(seal.first_index.map(|v| i64::try_from(v).unwrap_or(0)))
@@ -1349,6 +1357,7 @@ impl<const P: u8> LedgerStore<P> for PostgresStore<P> {
         .bind(i64::try_from(seal.tree_head.size).unwrap_or(0))
         .bind(seal.tree_head.root.as_bytes().as_slice())
         .bind(seal.trial_balance_root.as_bytes().as_slice())
+        .bind(seal.accounts_root.as_bytes().as_slice())
         .bind(seal.prev_seal.map(|h| h.as_bytes().to_vec()))
         .bind(seal.seal_hash.as_bytes().as_slice())
         .bind(position)
@@ -1365,7 +1374,8 @@ impl<const P: u8> LedgerStore<P> for PostgresStore<P> {
     async fn seals(&self) -> Result<Vec<Seal>, Self::Error> {
         let rows = sqlx::query(
             "SELECT period_id, first_index, last_index, entry_count, tree_size, tree_root, \
-             trial_balance_root, prev_seal, seal_hash FROM seals ORDER BY chain_position",
+             trial_balance_root, accounts_root, prev_seal, seal_hash \
+             FROM seals ORDER BY chain_position",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -1392,6 +1402,7 @@ impl<const P: u8> LedgerStore<P> for PostgresStore<P> {
                 trial_balance_root: hash_from_bytes(
                     &row.try_get::<Vec<u8>, _>("trial_balance_root")?,
                 )?,
+                accounts_root: hash_from_bytes(&row.try_get::<Vec<u8>, _>("accounts_root")?)?,
                 prev_seal: prev.as_deref().map(hash_from_bytes).transpose()?,
                 seal_hash: hash_from_bytes(&row.try_get::<Vec<u8>, _>("seal_hash")?)?,
             });

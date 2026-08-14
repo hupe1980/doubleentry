@@ -311,6 +311,15 @@ CREATE TABLE IF NOT EXISTS seals (
     tree_root           BYTEA       NOT NULL,
     trial_balance_root  BYTEA       NOT NULL,
 
+    -- Merkle root over the handle-to-account bindings in force at sealing.
+    --
+    -- The trial balance root above is keyed on `account_index`, a dense integer
+    -- that means nothing on its own. Without this column those handles float:
+    -- renumbering `accounts` afterwards would leave every seal and every balance
+    -- proof verifying unchanged while every balance referred to a different
+    -- account — the exact alteration a seal exists to expose.
+    accounts_root       BYTEA       NOT NULL,
+
     prev_seal           BYTEA,
     seal_hash           BYTEA       NOT NULL,
 
@@ -325,6 +334,7 @@ CREATE TABLE IF NOT EXISTS seals (
     CONSTRAINT seals_hash_widths CHECK (
         octet_length(tree_root) = 32
         AND octet_length(trial_balance_root) = 32
+        AND octet_length(accounts_root) = 32
         AND octet_length(seal_hash) = 32
         AND (prev_seal IS NULL OR octet_length(prev_seal) = 32)
     ),

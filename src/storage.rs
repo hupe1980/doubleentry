@@ -243,6 +243,12 @@ impl<const P: u8> Page<P> {
 ///    committed to.
 /// 7. **Seals chain.** [`LedgerStore::seals`] returns them in chain order, and
 ///    what comes back reproduces a chain that verifies.
+/// 8. **Seals bind their account handles.** A seal's
+///    [`accounts_root`](Seal::accounts_root) is the commitment over the account
+///    bindings the store itself holds. A backend that skips it leaves every
+///    handle in the trial-balance root floating, so renumbering the accounts
+///    table would keep the chain verifying while every balance in it referred to
+///    a different account.
 ///
 /// # Sequencing
 ///

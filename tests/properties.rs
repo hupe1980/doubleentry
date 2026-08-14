@@ -480,7 +480,7 @@ proptest! {
         tb.set(key, balance);
 
         let head = TreeHead { size, root: leaf(size) };
-        let seal = Seal::build(test_ledger(), PeriodId::new("p").expect("valid"), PeriodCoverage::spanning(0, size.saturating_sub(1), size), head, &tb, None);
+        let seal = Seal::build(test_ledger(), PeriodId::new("p").expect("valid"), PeriodCoverage::spanning(0, size.saturating_sub(1), size), head, &tb, leaf(7), None);
         prop_assert!(seal.is_self_consistent());
 
         let mut edited = seal.clone();

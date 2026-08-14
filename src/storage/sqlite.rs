@@ -27,7 +27,9 @@ use std::collections::BTreeMap;
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use time::Date;
 
-use crate::account::{Account, AccountId, AccountKind, AccountPath, AccountRecord};
+use crate::account::{
+    Account, AccountId, AccountKind, AccountPath, AccountRecord, AccountRegistry,
+};
 use crate::balance::{Balance, BalanceKey, TrialBalance};
 use crate::checkpoint::Checkpoint;
 use crate::clearing::{Clearing, ClearingError, ClearingId, OpenItem, PostingRef};
@@ -135,6 +137,9 @@ pub enum SqliteError {
     /// The calendar refused a period operation.
     #[error(transparent)]
     Period(#[from] crate::period::PeriodError),
+    /// The pool opens connections without foreign-key enforcement.
+    #[error(transparent)]
+    ForeignKeysDisabled(#[from] ForeignKeysDisabled),
     /// The database already holds a different ledger.
     #[error("this database holds ledger {found}, not {expected}")]
     WrongLedger {
@@ -150,6 +155,18 @@ impl SqliteError {
         Self::Malformed(what.into())
     }
 }
+
+/// The pool does not enforce foreign keys.
+///
+/// `PRAGMA foreign_keys` is per connection, so this is a property of how the
+/// pool opens them and cannot be repaired by the store. Build the pool with
+/// `SqliteConnectOptions::foreign_keys(true)` — which is `sqlx`'s default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "this pool opens connections with `PRAGMA foreign_keys = OFF`, which disables every \
+     REFERENCES clause in the schema; build it with SqliteConnectOptions::foreign_keys(true)"
+)]
+pub struct ForeignKeysDisabled;
 
 /// A ledger stored in SQLite.
 #[derive(Debug, Clone)]
@@ -171,17 +188,36 @@ impl<const P: u8> SqliteStore<P> {
         &self.pool
     }
 
-    /// Applies [`SCHEMA`] and sets the pragmas the schema relies on.
+    /// Applies [`SCHEMA`] and checks the settings it relies on.
+    ///
+    /// # Foreign keys are a property of the pool, not of this call
+    ///
+    /// `PRAGMA foreign_keys` is **per connection**. Issuing it here would set it
+    /// on whichever pooled connection happened to serve this call and leave
+    /// every other one with SQLite's default of `OFF` — silently disabling every
+    /// `REFERENCES` clause in the schema for most work the store does. It has to
+    /// be part of how connections are opened, which is why this verifies the
+    /// setting instead of trying to apply it.
+    ///
+    /// `sqlx` enables it by default, so a pool built the ordinary way already
+    /// satisfies this. A pool built with `SqliteConnectOptions::foreign_keys(false)`
+    /// does not, and is refused rather than run with a constraint set that is
+    /// present in the DDL and absent at run time.
+    ///
+    /// `journal_mode` is a property of the database file rather than the
+    /// connection, so setting it once is correct.
     ///
     /// # Errors
     ///
-    /// Returns any error the database raises.
+    /// Returns [`SqliteError::ForeignKeysDisabled`] when the pool does not
+    /// enforce foreign keys, and any error the database raises.
     pub async fn migrate(&self) -> Result<(), SqliteError> {
-        // WAL keeps readers from blocking the single writer; foreign keys are
-        // off by default and would silently disable every REFERENCES clause.
-        sqlx::raw_sql("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")
+        // WAL is durable in the file header; one connection setting it is enough
+        // and it keeps readers from blocking the single writer.
+        sqlx::raw_sql("PRAGMA journal_mode = WAL")
             .execute(&self.pool)
             .await?;
+        self.check_foreign_keys().await?;
         sqlx::raw_sql(SCHEMA).execute(&self.pool).await?;
         // One database, one ledger. Claim it on first use and refuse it
         // afterwards if it belongs to someone else — pointing two ledgers at one
@@ -206,6 +242,23 @@ impl<const P: u8> SqliteStore<P> {
             });
         }
         Ok(())
+    }
+
+    /// Confirms the pool opens connections with foreign keys enforced.
+    ///
+    /// Checked on a connection the pool hands out, not on one this call
+    /// configures — the question is what an arbitrary future connection will do,
+    /// and the only way to learn that is to ask one.
+    async fn check_foreign_keys(&self) -> Result<(), SqliteError> {
+        let enabled: i64 = sqlx::query("PRAGMA foreign_keys")
+            .fetch_one(&self.pool)
+            .await?
+            .try_get(0)?;
+        if enabled == 1 {
+            Ok(())
+        } else {
+            Err(ForeignKeysDisabled.into())
+        }
     }
 
     /// The calendar as the database holds it.
@@ -1108,6 +1161,12 @@ impl<const P: u8> LedgerStore<P> for SqliteStore<P> {
             },
             self.head().await?,
             &closing,
+            // Built from the stored bindings, not from a caller-supplied
+            // registry: the seal must commit to the handles this database
+            // actually resolved the balances against.
+            AccountRegistry::from_records(LedgerStore::<P>::accounts(self).await?)
+                .map_err(|e: crate::account::AccountError| SqliteError::malformed(e.to_string()))?
+                .commitment(),
             chain.head(),
         );
 
@@ -1115,8 +1174,8 @@ impl<const P: u8> LedgerStore<P> for SqliteStore<P> {
         sqlx::query(
             "INSERT INTO seals ( \
                 period_id, first_index, last_index, entry_count, tree_size, tree_root, \
-                trial_balance_root, prev_seal, seal_hash, chain_position \
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                trial_balance_root, accounts_root, prev_seal, seal_hash, chain_position \
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
         )
         .bind(seal.period.as_str())
         .bind(seal.first_index.map(|v| i64::try_from(v).unwrap_or(0)))
@@ -1125,6 +1184,7 @@ impl<const P: u8> LedgerStore<P> for SqliteStore<P> {
         .bind(i64::try_from(seal.tree_head.size).unwrap_or(0))
         .bind(seal.tree_head.root.as_bytes().as_slice())
         .bind(seal.trial_balance_root.as_bytes().as_slice())
+        .bind(seal.accounts_root.as_bytes().as_slice())
         .bind(seal.prev_seal.map(|h| h.as_bytes().to_vec()))
         .bind(seal.seal_hash.as_bytes().as_slice())
         .bind(position)
@@ -1141,7 +1201,8 @@ impl<const P: u8> LedgerStore<P> for SqliteStore<P> {
     async fn seals(&self) -> Result<Vec<Seal>, Self::Error> {
         let rows = sqlx::query(
             "SELECT period_id, first_index, last_index, entry_count, tree_size, tree_root, \
-             trial_balance_root, prev_seal, seal_hash FROM seals ORDER BY chain_position",
+             trial_balance_root, accounts_root, prev_seal, seal_hash \
+             FROM seals ORDER BY chain_position",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -1167,6 +1228,7 @@ impl<const P: u8> LedgerStore<P> for SqliteStore<P> {
                 trial_balance_root: hash_from_bytes(
                     &row.try_get::<Vec<u8>, _>("trial_balance_root")?,
                 )?,
+                accounts_root: hash_from_bytes(&row.try_get::<Vec<u8>, _>("accounts_root")?)?,
                 prev_seal: prev.as_deref().map(hash_from_bytes).transpose()?,
                 seal_hash: hash_from_bytes(&row.try_get::<Vec<u8>, _>("seal_hash")?)?,
             });

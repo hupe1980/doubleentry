@@ -115,6 +115,14 @@ doc:
 doc-open:
     RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features --open
 
+# 🌐 Build the site (needs `zola`); internal links are checked, not assumed
+site:
+    cd site && zola build && zola check
+
+# 🌐 Serve the site locally with live reload
+site-serve:
+    cd site && zola serve
+
 # 📦 Dry-run the crates.io package (catches bad metadata before tagging)
 package:
     # `--allow-dirty` is local convenience; CI runs this on a clean checkout.

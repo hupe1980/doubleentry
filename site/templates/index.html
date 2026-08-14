@@ -1,0 +1,122 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="hero">
+  <div class="wrap">
+    <p class="eyebrow">Rust · accounting · cryptographic audit</p>
+    <h1>Bookkeeping you can <em>prove</em>.</h1>
+    <p class="lede">
+      An immutable, tamper-evident double-entry bookkeeping engine. Entries are
+      balanced by construction, money is exact integer arithmetic, and every
+      closed period emits a seal a third party can verify — without being handed
+      your books.
+    </p>
+    <div class="cta">
+      <a class="btn btn-primary" href="{{ get_url(path='@/docs/getting-started.md') }}">Get started</a>
+      <a class="btn" href="{{ config.extra.api_docs }}" rel="noopener">API reference</a>
+    </div>
+    <p class="install"><code>cargo add doubleentry</code></p>
+  </div>
+</section>
+
+<section class="wrap band">
+  <h2 class="section-title">What it guarantees</h2>
+  <div class="grid">
+    <article class="card">
+      <h3>Balanced by construction</h3>
+      <p>
+        An entry reaches a persistable state only by passing validation, and the
+        validated type has no other constructor. Unbalanced data cannot reach
+        storage without a bug in the crate.
+      </p>
+    </article>
+    <article class="card">
+      <h3>Exact</h3>
+      <p>
+        Money is a scaled integer with compile-time precision. No floating point,
+        no wrapping, and every operation that can overflow returns a
+        <code>Result</code> instead of panicking.
+      </p>
+    </article>
+    <article class="card">
+      <h3>Deterministic</h3>
+      <p>
+        No clock, no random number generator, no hash-map iteration order.
+        Identical inputs produce identical bytes, hashes and orderings — which is
+        what makes replay and reproducible testing possible.
+      </p>
+    </article>
+    <article class="card">
+      <h3>Verifiable</h3>
+      <p>
+        Entries are leaves in an append-only Merkle log. An auditor holding only a
+        tree head can be given an <code>O(log n)</code> proof that an entry is
+        included, and that the log was only ever appended to.
+      </p>
+    </article>
+    <article class="card">
+      <h3>Gross-preserving</h3>
+      <p>
+        Balances carry debit <em>and</em> credit totals. An account showing zero
+        may have seen no activity or heavy offsetting turnover, and a net alone
+        cannot tell them apart.
+      </p>
+    </article>
+    <article class="card">
+      <h3>Yours to shape</h3>
+      <p>
+        No chart of accounts, no reporting engine, no opinion about your domain.
+        Accounts are paths in a hierarchy you define; reporting axes are named by
+        you and never interpreted.
+      </p>
+    </article>
+  </div>
+</section>
+
+<section class="wrap band prose">
+  {{ section.content | safe }}
+</section>
+
+<section class="wrap band">
+  <h2 class="section-title">The question an auditor actually asks</h2>
+  <p class="band-lede">
+    Not <em>“does this balance?”</em> — most systems manage that — but
+    <em>“how do I know this record wasn't changed after the fact?”</em>
+  </p>
+  <div class="grid grid-3">
+    <article class="card">
+      <h3>Inclusion</h3>
+      <p>This entry sits at this index under this root, in <code>O(log n)</code> hashes, revealing nothing else.</p>
+    </article>
+    <article class="card">
+      <h3>Consistency</h3>
+      <p>The earlier log is a <em>prefix</em> of the later one. Not merely linked — provably append-only.</p>
+    </article>
+    <article class="card">
+      <h3>Balance</h3>
+      <p>This account held this balance when the period closed, proven from the seal alone and named without disclosing the chart.</p>
+    </article>
+  </div>
+  <p class="band-note">
+    <a href="{{ get_url(path='@/docs/proofs.md') }}">How the proofs work →</a>
+  </p>
+</section>
+
+<section class="wrap band band-last">
+  <h2 class="section-title">Where to go next</h2>
+  <div class="grid grid-3">
+    <a class="card card-link" href="{{ get_url(path='@/docs/getting-started.md') }}">
+      <h3>Getting started</h3>
+      <p>Install the crate, record your first entry, and read a balance back.</p>
+    </a>
+    <a class="card card-link" href="{{ get_url(path='@/docs/periods-and-seals.md') }}">
+      <h3>Periods and seals</h3>
+      <p>Close a period, chain its seal, and prove one balance to an auditor.</p>
+    </a>
+    <a class="card card-link" href="{{ get_url(path='@/docs/persistence.md') }}">
+      <h3>Persistence</h3>
+      <p>SQLite and PostgreSQL backends, and the conformance suite that decides what counts as one.</p>
+    </a>
+  </div>
+</section>
+{% endblock %}

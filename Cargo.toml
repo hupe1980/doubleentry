@@ -13,6 +13,8 @@ keywords    = ["accounting", "ledger", "double-entry", "bookkeeping", "merkle"]
 categories  = ["finance", "data-structures", "cryptography"]
 license     = "MIT OR Apache-2.0"
 repository  = "https://github.com/hupe1980/doubleentry"
+homepage    = "https://hupe1980.github.io/doubleentry"
+documentation = "https://docs.rs/doubleentry"
 readme      = "README.md"
 
 # An allowlist, not a denylist. `.gitignore` does not govern what `cargo

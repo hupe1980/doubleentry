@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+{#- Title and description come from whichever of `page` or `section` is in
+    scope. There is no ambient `title` variable, so reading one would silently
+    fall back to the site default on every page — which is how a whole site ends
+    up sharing one <title>. The home section marks itself with `extra.home` so it
+    can use the tagline form instead of "Title · doubleentry". -#}
+{%- if page -%}
+  {%- set seo_title = page.title -%}
+  {%- set seo_desc = page.description -%}
+  {%- set is_article = true -%}
+  {%- set is_home = false -%}
+{%- elif section -%}
+  {%- set seo_title = section.title -%}
+  {%- set seo_desc = section.description -%}
+  {%- set is_article = false -%}
+  {%- set is_home = section.extra.home | default(value=false) -%}
+{%- else -%}
+  {%- set seo_title = config.title -%}
+  {%- set seo_desc = config.description -%}
+  {%- set is_article = false -%}
+  {%- set is_home = false -%}
+{%- endif -%}
+{%- if not seo_desc %}{% set seo_desc = config.description %}{% endif -%}
+{%- if not seo_title %}{% set seo_title = config.title %}{% endif -%}
+{%- set page_url = current_url | default(value=config.base_url) -%}
+
+<title>{% if is_home %}{{ config.title }} — {{ config.extra.tagline }}{% else %}{{ seo_title }} · {{ config.title }}{% endif %}</title>
+<meta name="description" content="{{ seo_desc }}">
+<link rel="canonical" href="{{ page_url }}">
+
+<meta property="og:type" content="{% if is_article %}article{% else %}website{% endif %}">
+<meta property="og:site_name" content="{{ config.title }}">
+<meta property="og:title" content="{{ seo_title }}">
+<meta property="og:description" content="{{ seo_desc }}">
+<meta property="og:url" content="{{ page_url }}">
+<meta property="og:image" content="{{ get_url(path='og.png') }}">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="{{ seo_title }}">
+<meta name="twitter:description" content="{{ seo_desc }}">
+<meta name="twitter:image" content="{{ get_url(path='og.png') }}">
+
+<link rel="alternate" type="application/atom+xml" title="{{ config.title }}" href="{{ get_url(path='atom.xml') }}">
+<link rel="icon" href="{{ get_url(path='favicon.svg') }}" type="image/svg+xml">
+
+{# Highlighting emits one stylesheet per theme, with disjoint class prefixes
+   (`.z-l-*` and `.z-d-*`) that both appear on every token. Light is loaded
+   unconditionally so a browser without `prefers-color-scheme` still gets a
+   readable block; dark is loaded after it and only in dark mode, where equal
+   specificity makes source order decide. #}
+<link rel="stylesheet" href="{{ get_url(path='giallo-light.css') }}">
+<link rel="stylesheet" href="{{ get_url(path='giallo-dark.css') }}" media="(prefers-color-scheme: dark)">
+<link rel="stylesheet" href="{{ get_url(path='style.css') }}">
+
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareSourceCode",
+  "name": "doubleentry",
+  "headline": {{ seo_title | json_encode | safe }},
+  "description": {{ seo_desc | json_encode | safe }},
+  "url": {{ page_url | json_encode | safe }},
+  "codeRepository": {{ config.extra.repo | json_encode | safe }},
+  "programmingLanguage": "Rust",
+  "license": "https://spdx.org/licenses/Apache-2.0.html",
+  "author": { "@type": "Person", "name": {{ config.extra.author | json_encode | safe }} },
+  "applicationCategory": "DeveloperApplication",
+  "keywords": "double-entry bookkeeping, accounting, ledger, Rust, Merkle tree, audit, tamper-evident, immutable ledger"
+}
+</script>
+</head>
+<body>
+
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="site-header">
+  <div class="wrap header-inner">
+    <a class="brand" href="{{ get_url(path='@/_index.md') }}">
+      <span class="brand-mark" aria-hidden="true">§</span>
+      <span class="brand-name">doubleentry</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary">
+      <a href="{{ get_url(path='@/docs/_index.md') }}">Docs</a>
+      <a href="{{ config.extra.api_docs }}" rel="noopener">API</a>
+      <a href="{{ config.extra.crate }}" rel="noopener">Crate</a>
+      <a class="nav-repo" href="{{ config.extra.repo }}" rel="noopener">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+{% block content %}{% endblock %}
+</main>
+
+<footer class="site-footer">
+  <div class="wrap footer-inner">
+    <p>
+      <strong>doubleentry</strong> — {{ config.extra.tagline }}<br>
+      Dual-licensed under
+      <a href="{{ config.extra.repo }}/blob/main/LICENSE-APACHE" rel="noopener">Apache-2.0</a> or
+      <a href="{{ config.extra.repo }}/blob/main/LICENSE-MIT" rel="noopener">MIT</a>.
+    </p>
+    <nav aria-label="Footer">
+      <a href="{{ get_url(path='@/docs/_index.md') }}">Documentation</a>
+      <a href="{{ config.extra.api_docs }}" rel="noopener">API reference</a>
+      <a href="{{ config.extra.repo }}" rel="noopener">Source</a>
+    </nav>
+  </div>
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="wrap doc-layout">
+  {% set nav_section = section %}
+  {% set nav_current = "" %}
+  {% include "_doc_nav.html" %}
+
+  <article class="doc prose">
+    <h1>{{ section.title }}</h1>
+    {{ section.content | safe }}
+
+    <h2 id="pages">Pages</h2>
+    <ol class="doc-index">
+      {% for p in section.pages %}
+      <li>
+        <a href="{{ p.permalink }}">{{ p.title }}</a>
+        {% if p.description %}<span>{{ p.description }}</span>{% endif %}
+      </li>
+      {% endfor %}
+    </ol>
+  </article>
+</div>
+{% endblock %}

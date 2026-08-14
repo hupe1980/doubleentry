@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+
+{% block content %}
+<section class="wrap band band-last" style="padding-block: clamp(3rem, 10vw, 7rem)">
+  <p class="eyebrow">404</p>
+  <h1 style="font-size: clamp(2rem, 5vw, 3rem); letter-spacing: -.025em; margin: .4rem 0 1rem">
+    This page is not in the ledger.
+  </h1>
+  <p class="band-lede">
+    Nothing was posted here. Try the documentation index, or the API reference.
+  </p>
+  <div class="cta">
+    <a class="btn btn-primary" href="{{ get_url(path='@/docs/_index.md') }}">Documentation</a>
+    <a class="btn" href="{{ get_url(path='@/_index.md') }}">Home</a>
+  </div>
+</section>
+{% endblock %}

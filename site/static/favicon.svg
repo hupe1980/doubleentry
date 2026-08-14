@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="doubleentry">
+  <rect width="64" height="64" rx="13" fill="#7a4a1e"/>
+  <!-- Two columns and a rule: the debit and credit sides of a ledger page. -->
+  <g stroke="#fff" stroke-width="5" stroke-linecap="round">
+    <path d="M14 20h36"/>
+    <path d="M32 20v30"/>
+    <path d="M14 34h12"/>
+    <path d="M38 42h12"/>
+  </g>
+</svg>

@@ -149,7 +149,7 @@ pub struct Seal {
     /// account. That is precisely the alteration a seal exists to make visible.
     ///
     /// It is also what makes selective disclosure complete. An
-    /// [`AccountBindingProof`](crate::account::AccountBindingProof) against this
+    /// [`AccountBindingProof`] against this
     /// root turns "handle `#7` held this balance" into "`Assets:Cash` held this
     /// balance", without revealing any other account.
     pub accounts_root: Hash,
@@ -455,7 +455,7 @@ impl<const P: u8> BalanceProof<P> {
     ///
     /// Establishes what a *handle* held. To learn which account that handle is,
     /// pair this with an
-    /// [`AccountBindingProof`](crate::account::AccountBindingProof) against the
+    /// [`AccountBindingProof`] against the
     /// same seal's [`accounts_root`](Seal::accounts_root) — or use
     /// [`BalanceProof::verify_naming`], which checks both together.
     #[must_use]

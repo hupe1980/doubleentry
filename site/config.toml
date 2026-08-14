@@ -1,0 +1,50 @@
+# Zola configuration for the doubleentry site.
+#
+# The site is two things: a landing page that says what the crate guarantees,
+# and a documentation set that explains how each guarantee is produced. API
+# reference lives on docs.rs and is linked, never duplicated — a second copy of
+# generated docs is a second copy to let rot.
+
+base_url = "https://hupe1980.github.io/doubleentry"
+title = "doubleentry"
+description = """\
+An immutable, tamper-evident double-entry bookkeeping engine for Rust. \
+Balanced by construction, exact integer money, and an append-only Merkle log \
+with inclusion, consistency and balance proofs."""
+
+default_language = "en"
+compile_sass = true
+build_search_index = true
+generate_feeds = true
+feed_filenames = ["atom.xml"]
+
+# Every internal link is checked at build time, so a renamed page fails CI
+# rather than shipping a 404.
+[link_checker]
+internal_level = "error"
+external_level = "warn"
+
+[markdown]
+smart_punctuation = false
+
+# Class-based highlighting emits a stylesheet per theme rather than inline styles
+# on every token, so the palette follows the reader's colour scheme instead of
+# being baked into the HTML. The two themes use disjoint class prefixes and both
+# appear on every token; `base.html` loads them so that source order decides.
+[markdown.highlighting]
+style = "class"
+light_theme = "ayu-light"
+dark_theme = "ayu-dark"
+
+[search]
+index_format = "elasticlunr_json"
+
+[extra]
+repo = "https://github.com/hupe1980/doubleentry"
+crate = "https://crates.io/crates/doubleentry"
+api_docs = "https://docs.rs/doubleentry"
+# Shown in the tagline and the structured data.
+tagline = "Bookkeeping you can prove."
+# Used for OpenGraph and Twitter cards.
+author = "hupe1980"
+og_image = "/og.png"

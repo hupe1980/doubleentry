@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630" role="img"
+     aria-label="doubleentry — bookkeeping you can prove">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1b1b18"/>
+      <stop offset="1" stop-color="#0f0f0c"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.15" cy="0.05" r="0.75">
+      <stop offset="0" stop-color="#7a4a1e" stop-opacity="0.55"/>
+      <stop offset="1" stop-color="#7a4a1e" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <rect width="1200" height="630" fill="url(#bg)"/>
+  <rect width="1200" height="630" fill="url(#glow)"/>
+
+  <!-- Merkle tree: the structure the whole crate is built around. -->
+  <g stroke="#e0a86a" stroke-opacity="0.5" stroke-width="2.5" fill="none">
+    <path d="M980 150 L900 250 M980 150 L1060 250"/>
+    <path d="M900 250 L860 350 M900 250 L940 350"/>
+    <path d="M1060 250 L1020 350 M1060 250 L1100 350"/>
+  </g>
+  <g fill="#e0a86a">
+    <circle cx="980" cy="150" r="11"/>
+    <circle cx="900" cy="250" r="8"/><circle cx="1060" cy="250" r="8"/>
+  </g>
+  <g fill="#e0a86a" fill-opacity="0.75">
+    <rect x="848" y="340" width="24" height="24" rx="4"/>
+    <rect x="928" y="340" width="24" height="24" rx="4"/>
+    <rect x="1008" y="340" width="24" height="24" rx="4"/>
+    <rect x="1088" y="340" width="24" height="24" rx="4"/>
+  </g>
+
+  <g font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+    <text x="90" y="150" fill="#8a8a80" font-size="26" letter-spacing="4">RUST · ACCOUNTING · CRYPTOGRAPHIC AUDIT</text>
+
+    <text x="90" y="268" fill="#ecebe4" font-size="92" font-weight="700" letter-spacing="-3">doubleentry</text>
+
+    <text x="90" y="356" fill="#e0a86a" font-size="54" font-weight="600" letter-spacing="-1">Bookkeeping you can prove.</text>
+
+    <text x="90" y="432" fill="#a8a79c" font-size="30">Immutable, tamper-evident double-entry bookkeeping.</text>
+    <text x="90" y="476" fill="#a8a79c" font-size="30">Balanced by construction. Exact integer money.</text>
+
+    <text x="90" y="556" fill="#7d7c72" font-size="25" font-family="ui-monospace, Menlo, Consolas, monospace">cargo add doubleentry</text>
+  </g>
+</svg>

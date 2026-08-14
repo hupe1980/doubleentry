@@ -1,0 +1,14 @@
+{# Docs sidebar.
+   Expects `nav_section` (the docs section) and `nav_current` (a permalink, or ""
+   on the section index) to be set by the including template. Zola 0.23 has no
+   template macros, so context is passed by assignment before the include. #}
+<nav class="doc-nav" aria-label="Documentation">
+  <p class="doc-nav-title">Documentation</p>
+  <ol>
+    {% for p in nav_section.pages %}
+    <li>
+      <a href="{{ p.permalink }}"{% if p.permalink == nav_current %} aria-current="page"{% endif %}>{{ p.title }}</a>
+    </li>
+    {% endfor %}
+  </ol>
+</nav>

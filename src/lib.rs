@@ -28,6 +28,9 @@
 //!
 //! # Where to start
 //!
+//! This page is the API reference. The guide — why each guarantee is built the
+//! way it is — lives at <https://hupe1980.github.io/doubleentry>.
+//!
 //! A [`Journal`] is one entity's books: its accounts, its calendar, its policy,
 //! its entries, its Merkle log, its seals, its clearings. Register accounts on
 //! it, hand it drafts, and read balances, statements and proofs back out. When

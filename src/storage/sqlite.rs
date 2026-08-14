@@ -21,6 +21,14 @@
 //! rests on [`PeriodCalendar`]; no per-table privileges, so append-only rests on
 //! the application. The engine's guarantees are unchanged — what is reduced is
 //! defence in depth against writers that are not the engine.
+//!
+//! # Foreign keys belong to the pool
+//!
+//! `PRAGMA foreign_keys` is per connection, and SQLite defaults it to `OFF`.
+//! Setting it from here would configure one pooled connection and leave the rest
+//! ignoring every `REFERENCES` clause in the schema, so [`SqliteStore::migrate`]
+//! *verifies* it instead and refuses a pool that does not enforce it. `sqlx`
+//! enables it by default, so an ordinary pool already passes.
 
 use std::collections::BTreeMap;
 

@@ -20,6 +20,10 @@ target
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
+# Zola build output and search index
+site/public/
+site/static/processed_images/
+
 # Custom
 CONCEPT.md
 .DS_Store

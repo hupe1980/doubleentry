@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="wrap doc-layout">
+  {% set nav_section = get_section(path="docs/_index.md") %}
+  {% set nav_current = page.permalink %}
+  {% include "_doc_nav.html" %}
+
+  <article class="doc prose">
+    <nav class="crumbs" aria-label="Breadcrumb">
+      <a href="{{ get_url(path='@/docs/_index.md') }}">Docs</a>
+      <span aria-hidden="true">/</span>
+      <span>{{ page.title }}</span>
+    </nav>
+
+    <h1>{{ page.title }}</h1>
+    {% if page.description %}<p class="doc-lede">{{ page.description }}</p>{% endif %}
+
+    {% if page.toc %}
+    <details class="toc">
+      <summary>On this page</summary>
+      <ol>
+        {% for h in page.toc %}
+        <li><a href="{{ h.permalink }}">{{ h.title }}</a></li>
+        {% endfor %}
+      </ol>
+    </details>
+    {% endif %}
+
+    {{ page.content | safe }}
+
+    <nav class="pager" aria-label="Pagination">
+      {% if page.lower %}<a class="prev" href="{{ page.lower.permalink }}">← {{ page.lower.title }}</a>{% endif %}
+      {% if page.higher %}<a class="next" href="{{ page.higher.permalink }}">{{ page.higher.title }} →</a>{% endif %}
+    </nav>
+  </article>
+</div>
+{% endblock %}

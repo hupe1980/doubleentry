@@ -38,11 +38,59 @@ link before it.
 let head  = journal.head();
 let proof = journal.prove_inclusion(recorded.require_index()?)?;
 
-assert!(proof.verify(&recorded.content_hash, &head.root));
+assert!(proof.verify(&recorded.content_hash, &head));
 ```
 
 The path is logarithmic in the log size: proving one entry out of 1024 costs ten
 hashes.
+
+### Verify against a head, never a bare root
+
+`verify` takes the whole tree head — size *and* root — and there is deliberately
+no root-only form. The difference is not cosmetic: a proof's `leaf_index` and
+`tree_size` *steer* the walk rather than being checked by it, and neighbouring
+pairs steer it identically. The proof for leaf 1 of a two-leaf log folds exactly
+the same way when relabelled as leaf 2 of three, so a bare-root check would
+accept it under either name.
+
+Nothing false about a real log follows — a root determines its own size, so short
+of a collision no three-leaf tree has a two-leaf tree's root. But a verifier that
+read the position back out of the proof would be reading a number the prover
+chose. Pinning the size to a published head leaves exactly one labelling that
+verifies, and costs one integer comparison.
+
+The same holds at both ends of a consistency proof:
+
+```rust
+assert!(proof.verify(&snapshot, &later));
+```
+
+This is why a seal stores `trial_balance` and `accounts` as heads rather than
+roots, and why `AccountRegistry::commitment()` returns one.
+
+The boundary: a head has to come from somewhere the verifier already trusts. Hand
+the walk a fabricated head that agrees with a forged proof and it is satisfied —
+that is what "published head" means, and why publishing one to an auditor or an
+append-only location is the step that makes any of this evidence.
+
+## Proving against an archived head
+
+A head published last quarter is the head an auditor actually holds. The log has
+grown since, and its current root says nothing about theirs — so the proof has to
+be built against *their* head:
+
+```rust
+let archived = journal.head_at(snapshot_size)?;
+let proof    = journal.prove_inclusion_at(index, snapshot_size)?;
+
+assert!(proof.verify(&entry.content_hash(), &archived));
+```
+
+`prove_consistency_between` is the same idea for two archived heads, neither of
+them current: one is shown to be a prefix of the other without either party
+learning the log's present size. Both are on `LedgerStore` as well, where
+`head_at` is a row lookup rather than a replay — every entry stores the root as
+of its own sequencing.
 
 ## Consistency
 
@@ -57,7 +105,7 @@ let snapshot = journal.head();
 let later = journal.head();
 
 let proof = journal.prove_consistency(snapshot.size)?;
-assert!(proof.verify(&snapshot.root, &later.root));
+assert!(proof.verify(&snapshot, &later));
 ```
 
 This is what makes a published tree head useful. Publishing a head — to an
@@ -132,7 +180,9 @@ with any equal-sized subtree already on the stack. Reading the current root is
 `O(log n)`.
 
 Historical roots and proofs are derived from the stored leaves and cost `O(n)`.
-They are audit-time operations, not write-path ones.
+They are audit-time operations, not write-path ones. The SQL backends are the
+exception for `head_at`, which is a single indexed row read: every entry stores
+the root as of its own sequencing, so a historical head never needs a replay.
 
 A durable backend persists only the subtree stack (`MerkleAccumulator`), which
 lets it answer "what is the root now" from `O(log n)` rows rather than rebuilding

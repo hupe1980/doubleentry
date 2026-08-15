@@ -4,10 +4,96 @@ Notable changes to `doubleentry`, in the format of
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioned per
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-**Nothing has been published to crates.io yet.** `v0.1.0` and `v0.2.0` are
-development tags; `0.3.0` is the first release intended to reach the registry.
+**Nothing has been published to crates.io yet.** `v0.1.0` through `v0.3.0` are
+development tags; `0.4.0` is the first release intended to reach the registry.
 Until 1.0 every release may break, and this one does — the reasoning is in each
 entry, because a breaking change without a reason is just churn.
+
+## [0.4.0] — 2026-08-15
+
+### ⚠️ Hashes and schema changed
+
+A seal now commits to a **tree head** — a size *and* a root — everywhere it
+previously committed to a bare root. That changes the seal preimage, so the
+reference seal vector moved:
+
+| Vector | before | after |
+|---|---|---|
+| Reference seal hash | `ab58bc1a…` | `7f6f0218…` |
+
+The entry hash, the account-binding commitment and every Merkle constant are
+**unchanged**. The `seals` table gains `trial_balance_size` and `accounts_size`;
+apply `schema/sqlite.sql` or `schema/postgres.sql` as they now stand. Nothing is
+published to crates.io, so there is no migration and no ledger in the world to
+be compatible with.
+
+### Changed
+
+- **Proofs verify against a `TreeHead`, never a bare root.**
+  `InclusionProof::verify` now takes `&TreeHead` in place of `&Hash`, and
+  `ConsistencyProof::verify` takes two. There is deliberately no root-only form
+  left to reach for.
+
+  The reason is a real defect, not tidiness. `leaf_index` and `tree_size` *steer*
+  the walk rather than being checked by it, and neighbouring pairs steer it
+  identically — so against a bare root a genuine proof for leaf 1 of a two-leaf
+  log is accepted **unchanged** as a proof for leaf 2 of three, a position that
+  log does not have. Rewriting the index alone fails and rewriting it past
+  `tree_size` is refused; it is rewriting both together that aliases. Consistency
+  proofs alias the same way in `new_size`. No false claim about a real log
+  follows — a root determines its own size — but a verifier reading the position
+  back was reading a number the prover chose. Pinning the size to a head the
+  verifier already trusts leaves exactly one labelling that verifies, and costs
+  one integer comparison.
+- **`Seal::trial_balance_root` → `Seal::trial_balance`** and
+  **`Seal::accounts_root` → `Seal::accounts`**, both now `TreeHead`. A seal is
+  what a `BalanceProof` and an `AccountBindingProof` are checked against, so it
+  has to carry the half that was missing.
+- **`AccountRegistry::commitment` returns `TreeHead`**, and
+  **`trial_balance_root` is now `trial_balance_head`**. `TrialBalanceCommitment`
+  gains `head()` beside `root()`.
+- `BalanceProof::verify` and `AccountBindingProof::verify` take the
+  corresponding head.
+
+### Added
+
+- **Proofs against an archived head.** `MerkleLog::inclusion_proof_at`,
+  `consistency_proof_between`, and `head_at`, mirrored on `Journal` as
+  `prove_inclusion_at` / `prove_consistency_between` / `head_at` and on
+  `LedgerStore` as all three. An auditor archives a head and comes back later;
+  the log has grown and its current root proves nothing about the head they
+  hold, so a proof against the present log was no use to them. The general
+  consistency form relates two archived heads without either party learning the
+  log's present size.
+- **`LedgerStore::head_at`** is an indexed row read on both SQL backends, not a
+  replay: every entry already stores the root as of its own sequencing. The
+  conformance suite checks every historical head against a rebuilt log, which is
+  precisely where a stored column and a replay could drift apart.
+- Iceberg snapshots carry `doubleentry.trial_balance_size` and
+  `doubleentry.accounts_size`, so a reader working from the table alone has both
+  halves of each sealed head.
+
+### Tests
+
+- Exhaustive **proof-deformation** coverage for both proof types: every sibling
+  insertion, deletion, duplication, adjacent swap and truncation point over
+  every leaf of every log shape up to 24, plus property tests. The suite
+  previously altered a path *value* but never its *length*, so padding and
+  truncation went unexercised on the verifier that rejects them.
+- The `leaf_index >= tree_size` range guard is now covered. It is load-bearing:
+  without it a genuine proof for leaf 0 of eight verifies while claiming index
+  8, the surplus index bits shifting off the top of the walk.
+- The `old_size > new_size` guard is now covered, and is load-bearing twice
+  over: it refuses a log shown to shrink, and it stands between a `new_size` of
+  zero and an underflow in a module that turns the checked-arithmetic lint off.
+  Handing the two heads over in the wrong order reaches it.
+- Equal-size consistency proofs are checked negatively as well as positively —
+  with no path to walk, the equality of the two roots is the entire check.
+- **Golden vectors for proof paths**, inclusion and consistency, at six
+  `(index, size)` and six `(old, new)` pairs. Sibling ordering within a path can
+  be changed without moving any root, which would invalidate every proof ever
+  handed out while leaving the root vectors green. RFC 6962 publishes proof
+  vectors for the same reason.
 
 ## [0.3.0] — 2026-08-14
 
@@ -173,6 +259,7 @@ the seal chain, open-item clearing, closing entries, the `LedgerStore` contract
 with its conformance suite, and the in-memory, SQLite, PostgreSQL and Iceberg
 backends.
 
+[0.4.0]: https://github.com/hupe1980/doubleentry/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/hupe1980/doubleentry/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/hupe1980/doubleentry/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/hupe1980/doubleentry/releases/tag/v0.1.0

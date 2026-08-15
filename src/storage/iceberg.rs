@@ -63,12 +63,22 @@ pub const PROP_SEAL_HASH: &str = "doubleentry.seal_hash";
 pub const PROP_TREE_ROOT: &str = "doubleentry.tree_root";
 /// Snapshot summary key carrying the seal's trial-balance root, as lowercase hex.
 pub const PROP_TRIAL_BALANCE_ROOT: &str = "doubleentry.trial_balance_root";
+/// Snapshot summary key carrying the trial-balance row count.
+///
+/// The size half of the sealed head. A balance proof is checked against both
+/// halves, so a reader working from the table alone needs this to check one.
+pub const PROP_TRIAL_BALANCE_SIZE: &str = "doubleentry.trial_balance_size";
 /// Snapshot summary key carrying the seal's account-bindings root, as lowercase hex.
 ///
 /// The archived posting rows name their account by handle, exactly as the
 /// trial-balance root does. This is what says which account each of those
 /// integers was, so a reader working from the table alone can still tell.
 pub const PROP_ACCOUNTS_ROOT: &str = "doubleentry.accounts_root";
+/// Snapshot summary key carrying how many handles the registry had issued.
+///
+/// The size half of the sealed account-bindings head, needed for the same reason
+/// as [`PROP_TRIAL_BALANCE_SIZE`].
+pub const PROP_ACCOUNTS_SIZE: &str = "doubleentry.accounts_size";
 /// Snapshot summary key carrying how many entries the period holds.
 pub const PROP_ENTRY_COUNT: &str = "doubleentry.entry_count";
 /// Snapshot summary key carrying the log size archived through, exclusive.
@@ -540,11 +550,19 @@ async fn write_snapshot<C: Catalog>(
         (PROP_TREE_ROOT.to_owned(), seal.tree_head.root.to_hex()),
         (
             PROP_TRIAL_BALANCE_ROOT.to_owned(),
-            seal.trial_balance_root.to_hex(),
+            seal.trial_balance.root.to_hex(),
+        ),
+        (
+            PROP_TRIAL_BALANCE_SIZE.to_owned(),
+            seal.trial_balance.size.to_string(),
         ),
         // The archived rows name accounts by handle; this is what those handles
         // meant when the period was sealed.
-        (PROP_ACCOUNTS_ROOT.to_owned(), seal.accounts_root.to_hex()),
+        (PROP_ACCOUNTS_ROOT.to_owned(), seal.accounts.root.to_hex()),
+        (
+            PROP_ACCOUNTS_SIZE.to_owned(),
+            seal.accounts.size.to_string(),
+        ),
         (PROP_ENTRY_COUNT.to_owned(), seal.entry_count.to_string()),
         // Where the next compaction resumes, and the commitment it resumes
         // from. Without these the archive could only be extended by re-reading

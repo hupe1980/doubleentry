@@ -402,7 +402,7 @@ impl World {
                 .prove_inclusion(doubleentry::LogIndex::new(i as u64))
                 .expect("in range");
             assert!(
-                proof.verify(&entry.content_hash(), &head.root),
+                proof.verify(&entry.content_hash(), &head),
                 "entry {i} became unprovable"
             );
         }

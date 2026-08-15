@@ -42,7 +42,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Prove the entry is committed to, without revealing any other entry.
     let head  = journal.head();
     let proof = journal.prove_inclusion(recorded.require_index()?)?;
-    assert!(proof.verify(&recorded.content_hash, &head.root));
+    assert!(proof.verify(&recorded.content_hash, &head));
 
     Ok(())
 }

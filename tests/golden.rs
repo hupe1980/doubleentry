@@ -184,7 +184,7 @@ fn the_reference_seal_hash_is_unchanged() {
     // issued, so it is pinned separately from the entry encoding.
     assert_eq!(
         reference_seal().seal_hash.to_hex(),
-        "ab58bc1acffe46e432bf8959af14aaa64281622a67d41a7d8ce53a534b8207d9",
+        "7f6f02186c80a35d38d94a0e68d1f2077d704c9adf5e4bc12560cc0edb1e053b",
         "the seal hash changed; see this file's module docs"
     );
 }
@@ -207,7 +207,7 @@ fn the_account_binding_commitment_is_unchanged() {
     // encoding — a field added, reordered, or dropped — moves every seal ever
     // issued, and the seal vector alone would not say which half moved.
     assert_eq!(
-        reference_registry().commitment().to_hex(),
+        reference_registry().commitment().root.to_hex(),
         "65ca7c50e7235ac82ea3eef1acd66e1d90abe8dc2527617bfe81e234a1416a5a",
         "the account binding commitment changed; see this file\'s module docs"
     );
@@ -271,6 +271,79 @@ fn merkle_roots_for_known_sizes_are_unchanged() {
     }
 }
 
+/// The (index, size) pairs the proof vectors below are pinned at.
+///
+/// Chosen to cover both sides of a split and both shapes of tree: a perfect
+/// power of two, and the ragged sizes where the right-hand subtree is shorter
+/// than the left.
+const PROOF_CASES: [(u64, u64); 6] = [(0, 1), (0, 2), (1, 2), (2, 5), (4, 5), (3, 8)];
+
+/// The (old, new) size pairs the consistency vectors are pinned at.
+const CONSISTENCY_CASES: [(u64, u64); 6] = [(1, 2), (1, 3), (2, 5), (3, 5), (4, 8), (6, 8)];
+
+fn path_hex(path: &[Hash]) -> String {
+    path.iter().map(Hash::to_hex).collect::<Vec<_>>().join(",")
+}
+
+#[test]
+fn inclusion_proof_paths_are_unchanged() {
+    // The roots above do not pin these. Sibling *ordering* within a path, and
+    // the choice of which subtree is hashed first, can be changed without moving
+    // any root — and would silently invalidate every proof ever handed out while
+    // leaving `merkle_roots_for_known_sizes_are_unchanged` green. RFC 6962
+    // publishes proof vectors for the same reason.
+    let expected = [
+        "",
+        "7d2122b894a233239c5de911e07b30a0bbb667204efd5a32255a3c2b31cece9a",
+        "db5c7a5ad0a6c6654868caba0dafda6a794f4278cb5c4573728dc645d31dd632",
+        "c07ac0cab3da8178725a6d3006f43dd17ec3814841d1c3c1ff9aabd90be3cfe1,b8581ec29a5787add8ade15bdbb4f3e2412222c6600b1195f659dd82d43d25d4,18eaa5dfce2841d7b05dc6d03d0a1ec1fa89a9abfe7cc6d2d6348819fe2236f3",
+        "c8fdd4a2a60ada5bad1bd77a1a1407370e53db996cd109c3b578f21ee0040ffc",
+        "006f1d29e778d4bdb9569829beb868c27764f1e718141e43c10b7de691be5536,b8581ec29a5787add8ade15bdbb4f3e2412222c6600b1195f659dd82d43d25d4,43de91ecf42fde753cc9f45b556d6b75eafd6db2a16c54c871a4237267d81550",
+    ];
+    let log = MerkleLog::from_leaves((0..8u64).map(leaf).collect());
+    for ((index, size), want) in PROOF_CASES.iter().zip(expected.iter()) {
+        let proof = log.inclusion_proof_at(*index, *size).expect("in range");
+        assert_eq!(
+            path_hex(&proof.path),
+            *want,
+            "inclusion path changed for leaf {index} of {size}"
+        );
+        // A vector that does not verify is a vector transcribed wrong.
+        assert!(
+            proof.verify(&leaf(*index), &log.head_at(*size).expect("in range")),
+            "pinned inclusion proof for leaf {index} of {size} does not verify"
+        );
+    }
+}
+
+#[test]
+fn consistency_proof_paths_are_unchanged() {
+    let expected = [
+        "7d2122b894a233239c5de911e07b30a0bbb667204efd5a32255a3c2b31cece9a",
+        "7d2122b894a233239c5de911e07b30a0bbb667204efd5a32255a3c2b31cece9a,006f1d29e778d4bdb9569829beb868c27764f1e718141e43c10b7de691be5536",
+        "90c8784125097b93c6fad57be10970c4d937e8e70171d23215c5a31372dfeb71,18eaa5dfce2841d7b05dc6d03d0a1ec1fa89a9abfe7cc6d2d6348819fe2236f3",
+        "006f1d29e778d4bdb9569829beb868c27764f1e718141e43c10b7de691be5536,c07ac0cab3da8178725a6d3006f43dd17ec3814841d1c3c1ff9aabd90be3cfe1,b8581ec29a5787add8ade15bdbb4f3e2412222c6600b1195f659dd82d43d25d4,18eaa5dfce2841d7b05dc6d03d0a1ec1fa89a9abfe7cc6d2d6348819fe2236f3",
+        "43de91ecf42fde753cc9f45b556d6b75eafd6db2a16c54c871a4237267d81550",
+        "1fac1f67c7c2d7300ebc23ff3c54c4d4aea92b6a1bd72c705f17d7dbc08a1464,6b5600bb9556a72db14772cfb9abce2aefa159ecc7c576e9192bb61668811706,c8fdd4a2a60ada5bad1bd77a1a1407370e53db996cd109c3b578f21ee0040ffc",
+    ];
+    let log = MerkleLog::from_leaves((0..8u64).map(leaf).collect());
+    for ((old, new), want) in CONSISTENCY_CASES.iter().zip(expected.iter()) {
+        let proof = log.consistency_proof_between(*old, *new).expect("in range");
+        assert_eq!(
+            path_hex(&proof.path),
+            *want,
+            "consistency path changed from {old} to {new}"
+        );
+        assert!(
+            proof.verify(
+                &log.head_at(*old).expect("in range"),
+                &log.head_at(*new).expect("in range")
+            ),
+            "pinned consistency proof from {old} to {new} does not verify"
+        );
+    }
+}
+
 #[test]
 fn money_formatting_is_unchanged() {
     // The decimal string is what gets serialised and what a scale-2 amount
@@ -296,12 +369,21 @@ fn emit_vectors() {
     println!("SEAL_HASH={}", reference_seal().seal_hash.to_hex());
     println!(
         "ACCOUNTS_ROOT={}",
-        reference_registry().commitment().to_hex()
+        reference_registry().commitment().root.to_hex()
     );
     println!("EMPTY_ROOT={}", empty_root().to_hex());
     println!("LEAF_ZERO={}", leaf_hash(&leaf(0)).to_hex());
     for size in [1u64, 2, 3, 4, 5, 8] {
         let log = MerkleLog::from_leaves((0..size).map(leaf).collect());
         println!("ROOT_{size}={}", log.root().to_hex());
+    }
+    let log = MerkleLog::from_leaves((0..8u64).map(leaf).collect());
+    for (index, size) in PROOF_CASES {
+        let proof = log.inclusion_proof_at(index, size).expect("in range");
+        println!("INCLUSION_{index}_OF_{size}={}", path_hex(&proof.path));
+    }
+    for (old, new) in CONSISTENCY_CASES {
+        let proof = log.consistency_proof_between(old, new).expect("in range");
+        println!("CONSISTENCY_{old}_TO_{new}={}", path_hex(&proof.path));
     }
 }

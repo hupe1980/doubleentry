@@ -319,15 +319,27 @@ CREATE TABLE IF NOT EXISTS seals (
 
     tree_size           BIGINT      NOT NULL,
     tree_root           BYTEA       NOT NULL,
+
+    -- Merkle head over the period's closing trial balance: the number of balance
+    -- rows and the root over them.
+    --
+    -- The size is stored because a proof is verified against the whole head, not
+    -- the root alone. A proof's own index and size fields steer its walk rather
+    -- than being checked by it, and neighbouring pairs steer it identically — so
+    -- against a bare root a genuine proof for row 1 of two is accepted unchanged
+    -- as a proof for row 2 of three. Pinning the size to the sealed head leaves
+    -- exactly one labelling that verifies.
+    trial_balance_size  BIGINT      NOT NULL,
     trial_balance_root  BYTEA       NOT NULL,
 
-    -- Merkle root over the handle-to-account bindings in force at sealing.
+    -- Merkle head over the handle-to-account bindings in force at sealing.
     --
-    -- The trial balance root above is keyed on `account_index`, a dense integer
-    -- that means nothing on its own. Without this column those handles float:
+    -- The trial balance above is keyed on `account_index`, a dense integer that
+    -- means nothing on its own. Without these columns those handles float:
     -- renumbering `accounts` afterwards would leave every seal and every balance
     -- proof verifying unchanged while every balance referred to a different
     -- account — the exact alteration a seal exists to expose.
+    accounts_size       BIGINT      NOT NULL,
     accounts_root       BYTEA       NOT NULL,
 
     prev_seal           BYTEA,
@@ -347,6 +359,9 @@ CREATE TABLE IF NOT EXISTS seals (
         AND octet_length(accounts_root) = 32
         AND octet_length(seal_hash) = 32
         AND (prev_seal IS NULL OR octet_length(prev_seal) = 32)
+    ),
+    CONSTRAINT seals_sizes CHECK (
+        tree_size >= 0 AND trial_balance_size >= 0 AND accounts_size >= 0
     ),
     CONSTRAINT seals_span CHECK (
         (first_index IS NULL) = (last_index IS NULL)

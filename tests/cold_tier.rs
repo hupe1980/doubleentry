@@ -220,7 +220,7 @@ async fn a_sealed_period_is_archived_and_carries_its_seal() {
     );
     assert_eq!(
         summary.get(PROP_TRIAL_BALANCE_ROOT).map(String::as_str),
-        Some(seal.trial_balance_root.to_hex().as_str())
+        Some(seal.trial_balance.root.to_hex().as_str())
     );
     assert_eq!(
         summary.get(PROP_ENTRY_COUNT).map(String::as_str),

@@ -40,13 +40,17 @@ assert!(journal.verify_seals().is_ok());
 
 ## What a seal commits to
 
-Three Merkle roots, and each answers a different question:
+Three Merkle heads, and each answers a different question:
 
-| Root | Claim |
+| Head | Claim |
 |---|---|
 | `tree_head` | Which entries the log held when the period closed |
-| `trial_balance_root` | What they add up to, per account, currency and layer |
-| `accounts_root` | Which account each of those handles actually is |
+| `trial_balance` | What they add up to, per account, currency and layer |
+| `accounts` | Which account each of those handles actually is |
+
+Each is a **head** — a size and a root — not a bare root. A proof is checked
+against both halves, because a proof's own index and size fields steer its walk
+rather than being checked by it. See [Proofs](@/docs/proofs.md#verify-against-a-head-never-a-bare-root).
 
 Plus `prev_seal`, which chains it to the seal before. Removing or reordering a
 sealed period breaks every seal after it.
@@ -93,7 +97,7 @@ use doubleentry::seal::TrialBalanceCommitment;
 // Rebuild the commitment from the same closing balances the seal was built over.
 let closing    = journal.trial_balance_through_date(date!(2026-03-31))?;
 let commitment = TrialBalanceCommitment::of(&closing);
-assert_eq!(commitment.root(), seal.trial_balance_root);
+assert_eq!(commitment.head(), seal.trial_balance);
 
 let proof = commitment.prove(&cash_key).expect("cash was posted to");
 
@@ -135,7 +139,7 @@ assert_eq!(binding.account().path.to_string(), "Assets:Cash");
 so a genuine balance cannot be presented under another account's name. The
 binding leaf covers the whole account — path, kind and open window — so a
 registry that reopened a closed account or moved a path to a different handle
-produces a different `accounts_root`, and the seal that named the old one stops
+produces a different `accounts` head, and the seal that named the old one stops
 matching.
 
 ## The chain

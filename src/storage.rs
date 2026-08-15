@@ -244,7 +244,7 @@ impl<const P: u8> Page<P> {
 /// 7. **Seals chain.** [`LedgerStore::seals`] returns them in chain order, and
 ///    what comes back reproduces a chain that verifies.
 /// 8. **Seals bind their account handles.** A seal's
-///    [`accounts_root`](Seal::accounts_root) is the commitment over the account
+///    [`accounts`](Seal::accounts) is the commitment over the account
 ///    bindings the store itself holds. A backend that skips it leaves every
 ///    handle in the trial-balance root floating, so renumbering the accounts
 ///    table would keep the chain verifying while every balance in it referred to
@@ -348,16 +348,44 @@ pub trait LedgerStore<const P: u8>: Send + Sync {
         size: Option<u64>,
     ) -> impl Future<Output = Result<TrialBalance<P>, Self::Error>> + Send;
 
+    /// The tree head as of an earlier size.
+    ///
+    /// What an auditor checks an archived head against, and what the historical
+    /// proofs below are verified under.
+    fn head_at(&self, size: u64) -> impl Future<Output = Result<TreeHead, Self::Error>> + Send;
+
     /// Proves an entry is committed to by the current head.
     fn prove_inclusion(
         &self,
         index: LogIndex,
     ) -> impl Future<Output = Result<InclusionProof, Self::Error>> + Send;
 
+    /// Proves an entry was committed to by the head at `size`.
+    ///
+    /// An auditor archives a head and comes back later. By then the log has
+    /// grown and its current root proves nothing about the head they hold, so a
+    /// proof against the present log is no use to them. This answers the
+    /// question they can actually ask.
+    fn prove_inclusion_at(
+        &self,
+        index: LogIndex,
+        size: u64,
+    ) -> impl Future<Output = Result<InclusionProof, Self::Error>> + Send;
+
     /// Proves the log at `old_size` is a prefix of the current log.
     fn prove_consistency(
         &self,
         old_size: u64,
+    ) -> impl Future<Output = Result<ConsistencyProof, Self::Error>> + Send;
+
+    /// Proves the log at `old_size` is a prefix of the log at `new_size`.
+    ///
+    /// The general form, for two auditors holding different archived heads and
+    /// neither holding the current one.
+    fn prove_consistency_between(
+        &self,
+        old_size: u64,
+        new_size: u64,
     ) -> impl Future<Output = Result<ConsistencyProof, Self::Error>> + Send;
 
     /// Defines an accounting period, or confirms one already defined.
@@ -732,6 +760,11 @@ impl<const P: u8> LedgerStore<P> for MemoryStore<P> {
         async move { result }
     }
 
+    fn head_at(&self, size: u64) -> impl Future<Output = Result<TreeHead, Self::Error>> + Send {
+        let result = self.with(|journal| Ok(journal.head_at(size)?));
+        async move { result }
+    }
+
     fn len(&self) -> impl Future<Output = Result<u64, Self::Error>> + Send {
         let result = self.with(|journal| Ok(journal.len() as u64));
         async move { result }
@@ -759,6 +792,25 @@ impl<const P: u8> LedgerStore<P> for MemoryStore<P> {
         index: LogIndex,
     ) -> impl Future<Output = Result<InclusionProof, Self::Error>> + Send {
         let result = self.with(|journal| Ok(journal.prove_inclusion(index)?));
+        async move { result }
+    }
+
+    fn prove_inclusion_at(
+        &self,
+        index: LogIndex,
+        size: u64,
+    ) -> impl Future<Output = Result<InclusionProof, Self::Error>> + Send {
+        let result = self.with(|journal| Ok(journal.prove_inclusion_at(index, size)?));
+        async move { result }
+    }
+
+    fn prove_consistency_between(
+        &self,
+        old_size: u64,
+        new_size: u64,
+    ) -> impl Future<Output = Result<ConsistencyProof, Self::Error>> + Send {
+        let result =
+            self.with(|journal| Ok(journal.prove_consistency_between(old_size, new_size)?));
         async move { result }
     }
 

@@ -119,7 +119,7 @@ proptest! {
         prop_assume!(i < n);
         let log = log_of(n);
         let proof = log.inclusion_proof(i).expect("in range");
-        prop_assert!(proof.verify(&leaf(i), &log.root()));
+        prop_assert!(proof.verify(&leaf(i), &log.head()));
     }
 
     /// An inclusion proof does not verify against a leaf it was not built for.
@@ -128,7 +128,83 @@ proptest! {
         prop_assume!(i < n && j < n && i != j);
         let log = log_of(n);
         let proof = log.inclusion_proof(i).expect("in range");
-        prop_assert!(!proof.verify(&leaf(j), &log.root()));
+        prop_assert!(!proof.verify(&leaf(j), &log.head()));
+    }
+
+    /// A proof path with a sibling added or removed never verifies, whatever the
+    /// added hash is and wherever the cut falls.
+    #[test]
+    fn inclusion_proofs_reject_deformed_paths(
+        n in 1u64..60,
+        i in 0u64..60,
+        at in 0usize..8,
+        junk in 0u64..1000,
+    ) {
+        prop_assume!(i < n);
+        let log = log_of(n);
+        let proof = log.inclusion_proof(i).expect("in range");
+        let at = at % (proof.path.len() + 1);
+
+        let mut padded = proof.clone();
+        padded.path.insert(at, leaf(junk));
+        prop_assert!(!padded.verify(&leaf(i), &log.head()));
+
+        // Padding with a hash the tree genuinely contains, rather than a made-up
+        // one, must fail for the same reason.
+        let mut duplicated = proof.clone();
+        if let Some(&real) = proof.path.get(at.min(proof.path.len().saturating_sub(1))) {
+            duplicated.path.insert(at, real);
+            prop_assert!(!duplicated.verify(&leaf(i), &log.head()));
+        }
+
+        let mut truncated = proof.clone();
+        if at < truncated.path.len() {
+            truncated.path.remove(at);
+            prop_assert!(!truncated.verify(&leaf(i), &log.head()));
+        }
+    }
+
+    /// Only one (index, size) labelling verifies under a given head — the true
+    /// one. Verification takes the whole head for exactly this reason: against a
+    /// bare root the labels would be unauthenticated.
+    #[test]
+    fn inclusion_proofs_are_labelled_uniquely_under_a_head(
+        n in 1u64..40,
+        i in 0u64..40,
+        index in 0u64..48,
+        size in 1u64..48,
+    ) {
+        prop_assume!(i < n && index < size);
+        let log = log_of(n);
+        let head = log.head();
+        let mut proof = log.inclusion_proof(i).expect("in range");
+        proof.leaf_index = index;
+        proof.tree_size = size;
+        prop_assert_eq!(
+            proof.verify(&leaf(i), &head),
+            index == i && size == n
+        );
+    }
+
+    /// A consistency proof verifies between exactly one pair of heads.
+    #[test]
+    fn consistency_proofs_are_bound_to_both_heads(
+        n in 1u64..40,
+        m in 0u64..40,
+        old_size in 0u64..48,
+        new_size in 0u64..48,
+    ) {
+        prop_assume!(m <= n);
+        let log = log_of(n);
+        let old_head = log.head_at(m).expect("in range");
+        let new_head = log.head();
+        let mut proof = log.consistency_proof(m).expect("in range");
+        proof.old_size = old_size;
+        proof.new_size = new_size;
+        prop_assert_eq!(
+            proof.verify(&old_head, &new_head),
+            old_size == m && new_size == n
+        );
     }
 
     /// Any prefix of the log is provably a prefix of the whole.
@@ -136,9 +212,9 @@ proptest! {
     fn consistency_proofs_always_verify(n in 1u64..80, m in 0u64..80) {
         prop_assume!(m <= n);
         let log = log_of(n);
-        let old_root = log.root_at(m).expect("in range");
+        let old_head = log.head_at(m).expect("in range");
         let proof = log.consistency_proof(m).expect("in range");
-        prop_assert!(proof.verify(&old_root, &log.root()));
+        prop_assert!(proof.verify(&old_head, &log.head()));
     }
 
     /// Rewriting any already-committed leaf changes the root.
@@ -340,7 +416,7 @@ proptest! {
             let proof = j
                 .prove_inclusion(doubleentry::LogIndex::from(i as u64))
                 .expect("in range");
-            prop_assert!(proof.verify(&entry.content_hash(), &head.root));
+            prop_assert!(proof.verify(&entry.content_hash(), &head));
         }
     }
 
@@ -479,7 +555,7 @@ proptest! {
         tb.set(key, balance);
 
         let head = TreeHead { size, root: leaf(size) };
-        let seal = Seal::build(test_ledger(), PeriodId::new("p").expect("valid"), PeriodCoverage::spanning(0, size.saturating_sub(1), size), head, &tb, leaf(7), None);
+        let seal = Seal::build(test_ledger(), PeriodId::new("p").expect("valid"), PeriodCoverage::spanning(0, size.saturating_sub(1), size), head, &tb, TreeHead { size: 1, root: leaf(7) }, None);
         prop_assert!(seal.is_self_consistent());
 
         let mut edited = seal.clone();
@@ -487,15 +563,15 @@ proptest! {
         prop_assert!(!edited.is_self_consistent());
 
         let mut restated = seal;
-        restated.trial_balance_root = leaf(999_999);
+        restated.trial_balance.root = leaf(999_999);
         prop_assert!(!restated.is_self_consistent());
     }
 
     /// A seal's trial-balance root distinguishes any change in gross totals,
     /// including ones that leave every net untouched.
     #[test]
-    fn the_trial_balance_root_sees_gross_movement(volume in 1i64..1_000_000) {
-        use doubleentry::seal::trial_balance_root;
+    fn the_trial_balance_head_sees_gross_movement(volume in 1i64..1_000_000) {
+        use doubleentry::seal::trial_balance_head;
         use doubleentry::{Balance, BalanceKey, TrialBalance};
 
         let key = BalanceKey {
@@ -518,7 +594,7 @@ proptest! {
             quiet.get(&key).expect("set").signed_net().expect("ok"),
             busy.get(&key).expect("set").signed_net().expect("ok")
         );
-        prop_assert_ne!(trial_balance_root(&quiet), trial_balance_root(&busy));
+        prop_assert_ne!(trial_balance_head(&quiet), trial_balance_head(&busy));
     }
 
     /// A checkpoint taken at any point re-derives from the journal.

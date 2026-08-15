@@ -34,8 +34,11 @@ A backend must guarantee all of the following:
 8. **Seals chain.** `seals()` returns them in chain order, and what comes back
    reproduces a chain that verifies — against the store's *own* ledger, so the
    first seal is checked as strictly as the last.
-9. **Seals bind their account handles.** A seal's `accounts_root` is the
+9. **Seals bind their account handles.** A seal's `accounts` head is the
    commitment over the bindings the store itself holds.
+10. **Archived heads stay checkable.** `head_at`, `prove_inclusion_at` and
+   `prove_consistency_between` answer for a head published in the past, not
+   only the current one.
 
 ## Why a conformance suite ships with the library {#conformance}
 
@@ -181,7 +184,7 @@ let registry = AccountRegistry::from_records(store.accounts().await?)?;
 ```
 
 `AccountRegistry::commitment()` is a cheap way to assert a locally built registry
-matches the stored one — and it is the same value a seal's `accounts_root`
+matches the stored one — and it is the same `TreeHead` a seal's `accounts` field
 carries.
 
 **SQLite foreign keys belong to the pool.** `PRAGMA foreign_keys` is *per

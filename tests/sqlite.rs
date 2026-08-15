@@ -395,7 +395,7 @@ async fn all_three_backends_agree() {
             .prove_inclusion(record.require_index().expect("sequenced"))
             .await
             .expect("proves");
-        assert!(proof.verify(&record.content_hash, &head.root));
+        assert!(proof.verify(&record.content_hash, &head));
     }
 }
 
@@ -461,7 +461,7 @@ async fn two_ledgers_share_nothing() {
         .prove_inclusion(LogIndex::new(0))
         .await
         .expect("proves");
-    assert!(proof.verify(&hash, &head_a.root));
+    assert!(proof.verify(&hash, &head_a));
 }
 
 /// A seal is evidence about one entity's books, or it is not evidence.
@@ -480,7 +480,7 @@ async fn a_seal_names_the_books_it_covers() {
 
     // Everything a seal commits to besides the ledger is identical ...
     assert_eq!(seal_a.tree_head, seal_b.tree_head);
-    assert_eq!(seal_a.trial_balance_root, seal_b.trial_balance_root);
+    assert_eq!(seal_a.trial_balance, seal_b.trial_balance);
     assert_eq!(seal_a.entry_count, seal_b.entry_count);
 
     // ... and yet the seals are distinguishable, because they name their books.

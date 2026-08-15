@@ -8,7 +8,7 @@ weight = 1
 
 ```toml
 [dependencies]
-doubleentry = "0.3"
+doubleentry = "0.4"
 time = { version = "0.3", features = ["macros"] }
 ```
 
@@ -103,7 +103,7 @@ not optional.
 let head  = journal.head();
 let proof = journal.prove_inclusion(recorded.require_index()?)?;
 
-assert!(proof.verify(&recorded.content_hash, &head.root));
+assert!(proof.verify(&recorded.content_hash, &head));
 ```
 
 That is the whole loop: record, read, prove. Everything else on this site is

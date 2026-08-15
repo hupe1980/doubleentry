@@ -28,7 +28,7 @@ use time::Date;
 use crate::balance::Balance;
 use crate::canonical::{Canonical, CanonicalWriter};
 use crate::hash::{Hash, tag, tagged};
-use crate::merkle::{InclusionProof, MerkleLog};
+use crate::merkle::{InclusionProof, MerkleLog, TreeHead};
 
 /// Maximum number of characters in one path segment.
 pub const MAX_SEGMENT_LEN: usize = 64;
@@ -538,7 +538,7 @@ pub fn account_binding_leaf(record: &AccountRecord) -> Hash {
 /// Self-contained: it carries the binding as well as the path, so a verifier
 /// needs nothing but this and an [`AccountRegistry::commitment`] — which a
 /// [`Seal`](crate::Seal) publishes as
-/// [`accounts_root`](crate::Seal::accounts_root).
+/// [`accounts`](crate::Seal::accounts).
 ///
 /// This is what makes a sealed balance legible. A
 /// [`BalanceProof`](crate::BalanceProof) proves that handle `#7` held a
@@ -573,13 +573,13 @@ impl AccountBindingProof {
     /// modes: a verifier cannot act differently on a malformed proof than on a
     /// forged one.
     #[must_use]
-    pub fn verify(&self, accounts_root: &Hash) -> bool {
+    pub fn verify(&self, accounts: &TreeHead) -> bool {
         // The handle *is* the leaf index, so a proof for one binding cannot be
         // replayed at another position without failing here.
         self.proof.leaf_index == u64::from(self.record.id.index())
             && self
                 .proof
-                .verify(&account_binding_leaf(&self.record), accounts_root)
+                .verify(&account_binding_leaf(&self.record), accounts)
     }
 }
 
@@ -858,20 +858,27 @@ impl AccountRegistry {
         Ok(registry)
     }
 
-    /// A Merkle root over every handle-to-account binding, in handle order.
+    /// A Merkle head over every handle-to-account binding, in handle order.
     ///
     /// Two registries agree on this only if they agree on every account *and*
     /// on the handle each was issued. Comparing a locally built registry
     /// against the stored one turns a silent repointing into a caught mismatch.
     ///
-    /// A [`Seal`](crate::Seal) records this alongside its trial-balance root, so
-    /// the handles that root is keyed on are pinned to the paths they meant at
+    /// A [`Seal`](crate::Seal) records this alongside its trial-balance head, so
+    /// the handles that head is keyed on are pinned to the paths they meant at
     /// the moment of sealing. Without it, renumbering the registry afterwards
     /// would leave every seal and every balance proof verifying while every
     /// balance referred to a different account.
+    ///
+    /// A head and not a bare root, because the size is half of what an
+    /// [`AccountBindingProof`] is checked against — see
+    /// [`InclusionProof::verify`](crate::merkle::InclusionProof::verify). It
+    /// also states how many handles the registry had issued, which is the number
+    /// a verifier needs to know that a handle it was shown is one the registry
+    /// had actually reached.
     #[must_use]
-    pub fn commitment(&self) -> Hash {
-        self.binding_log().root()
+    pub fn commitment(&self) -> TreeHead {
+        self.binding_log().head()
     }
 
     /// The Merkle log the commitment is the root of.

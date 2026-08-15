@@ -738,10 +738,7 @@ impl<const P: u8> Journal<P> {
     ///
     /// Returns [`ProofError::SizeOutOfRange`] for a size beyond the log.
     pub fn head_at(&self, size: u64) -> Result<TreeHead, ProofError> {
-        Ok(TreeHead {
-            size,
-            root: self.log.root_at(size)?,
-        })
+        self.log.head_at(size)
     }
 
     /// Proves that the entry at `index` is committed to by the current head.
@@ -753,6 +750,27 @@ impl<const P: u8> Journal<P> {
         self.log.inclusion_proof(index.get())
     }
 
+    /// Proves that the entry at `index` was committed to by the head at `size`.
+    ///
+    /// What an auditor holding an archived head can actually check. Their head
+    /// is not the current one, and the current root says nothing about it, so a
+    /// proof against the present log is no use to them. Pair the result with
+    /// [`head_at`](Self::head_at), or with the head they archived — the two must
+    /// agree, and [`InclusionProof::verify`] is what says so.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProofError::SizeOutOfRange`] for a size beyond the log, and
+    /// [`ProofError::IndexOutOfRange`] for an entry the log had not yet reached
+    /// at that size.
+    pub fn prove_inclusion_at(
+        &self,
+        index: LogIndex,
+        size: u64,
+    ) -> Result<InclusionProof, ProofError> {
+        self.log.inclusion_proof_at(index.get(), size)
+    }
+
     /// Proves that the log at `old_size` is a prefix of the current log.
     ///
     /// # Errors
@@ -760,6 +778,24 @@ impl<const P: u8> Journal<P> {
     /// Returns [`ProofError::SizeOutOfRange`] for a size beyond the log.
     pub fn prove_consistency(&self, old_size: u64) -> Result<ConsistencyProof, ProofError> {
         self.log.consistency_proof(old_size)
+    }
+
+    /// Proves that the log at `old_size` is a prefix of the log at `new_size`.
+    ///
+    /// The general form: two auditors holding different archived heads, neither
+    /// of them current, can be shown that one is a prefix of the other without
+    /// either learning the log's present size.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProofError::SizeOutOfRange`] if `new_size` is beyond the log or
+    /// `old_size` is beyond `new_size`.
+    pub fn prove_consistency_between(
+        &self,
+        old_size: u64,
+        new_size: u64,
+    ) -> Result<ConsistencyProof, ProofError> {
+        self.log.consistency_proof_between(old_size, new_size)
     }
 
     /// Recomputes the Merkle log from the stored entries and compares it.
@@ -1075,7 +1111,7 @@ impl<const P: u8> Journal<P> {
     ///
     /// The seal commits to three things: the log's tree head, the period's
     /// closing trial balance, and the account registry those balances are keyed
-    /// on — see [`Seal::accounts_root`] for why the last one is not optional.
+    /// on — see [`Seal::accounts`] for why the last one is not optional.
     ///
     /// On success the period advances to [`PeriodState::Sealed`]. The seal is
     /// appended to the chain *first*, so a seal the chain refuses cannot leave a
@@ -1444,9 +1480,10 @@ mod tests {
                 .prove_inclusion(LogIndex(i as u64))
                 .expect("in range");
             assert!(
-                proof.verify(&entry.content_hash(), &head.root),
+                proof.verify(&entry.content_hash(), &head),
                 "entry {i} must be provably included"
             );
+            assert_eq!(proof.leaf_index, i as u64);
         }
     }
 
@@ -1463,7 +1500,7 @@ mod tests {
         let later = b.journal.head();
 
         let proof = b.journal.prove_consistency(early.size).expect("in range");
-        assert!(proof.verify(&early.root, &later.root));
+        assert!(proof.verify(&early, &later));
     }
 
     #[test]
@@ -2267,12 +2304,12 @@ mod tests {
             .trial_balance_through_date(date!(2026 - 03 - 31))
             .expect("ok");
         assert_eq!(
-            seal.trial_balance_root,
-            crate::seal::trial_balance_root(&march_only)
+            seal.trial_balance,
+            crate::seal::trial_balance_head(&march_only)
         );
         assert_ne!(
-            seal.trial_balance_root,
-            crate::seal::trial_balance_root(&b.journal.trial_balance(None).expect("ok")),
+            seal.trial_balance,
+            crate::seal::trial_balance_head(&b.journal.trial_balance(None).expect("ok")),
             "the whole-journal balance must not be what was sealed"
         );
     }
@@ -2292,8 +2329,8 @@ mod tests {
         b.journal.record(later).expect("records");
 
         let recomputed =
-            crate::seal::trial_balance_root(&b.journal.trial_balance(None).expect("ok"));
-        assert_ne!(recomputed, seal.trial_balance_root);
+            crate::seal::trial_balance_head(&b.journal.trial_balance(None).expect("ok"));
+        assert_ne!(recomputed, seal.trial_balance);
         assert!(seal.is_self_consistent());
     }
 

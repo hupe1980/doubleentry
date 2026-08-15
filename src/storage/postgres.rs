@@ -45,7 +45,7 @@ use crate::hash::Hash;
 use crate::journal::{LogIndex, Recorded};
 use crate::merkle::{
     ConsistencyProof, InclusionProof, MalformedAccumulator, MerkleAccumulator, MerkleLog,
-    ProofError, TreeHead,
+    ProofError, TreeHead, empty_root,
 };
 use crate::money::{Amount, Currency, MoneyError};
 use crate::period::{LedgerId, Period, PeriodCalendar, PeriodId, PeriodState};
@@ -1271,6 +1271,32 @@ impl<const P: u8> LedgerStore<P> for PostgresStore<P> {
         })
     }
 
+    async fn head_at(&self, size: u64) -> Result<TreeHead, Self::Error> {
+        if size == 0 {
+            return Ok(TreeHead {
+                size: 0,
+                root: empty_root(),
+            });
+        }
+        // Each entry stores the root as of its own sequencing, so a historical
+        // head is a row lookup rather than a replay of the log.
+        let index = i64::try_from(size.saturating_sub(1)).unwrap_or(i64::MAX);
+        let row = sqlx::query("SELECT tree_root FROM entries WHERE log_index = $1")
+            .bind(index)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or_else(|| {
+                PostgresError::from(ProofError::SizeOutOfRange {
+                    from: size,
+                    size: 0,
+                })
+            })?;
+        Ok(TreeHead {
+            size,
+            root: hash_from_bytes(&row.try_get::<Vec<u8>, _>("tree_root")?)?,
+        })
+    }
+
     async fn len(&self) -> Result<u64, Self::Error> {
         let row =
             sqlx::query("SELECT COUNT(*)::BIGINT AS n FROM entries WHERE log_index IS NOT NULL")
@@ -1328,8 +1354,27 @@ impl<const P: u8> LedgerStore<P> for PostgresStore<P> {
         Ok(self.log().await?.inclusion_proof(index.get())?)
     }
 
+    async fn prove_inclusion_at(
+        &self,
+        index: LogIndex,
+        size: u64,
+    ) -> Result<InclusionProof, Self::Error> {
+        Ok(self.log().await?.inclusion_proof_at(index.get(), size)?)
+    }
+
     async fn prove_consistency(&self, old_size: u64) -> Result<ConsistencyProof, Self::Error> {
         Ok(self.log().await?.consistency_proof(old_size)?)
+    }
+
+    async fn prove_consistency_between(
+        &self,
+        old_size: u64,
+        new_size: u64,
+    ) -> Result<ConsistencyProof, Self::Error> {
+        Ok(self
+            .log()
+            .await?
+            .consistency_proof_between(old_size, new_size)?)
     }
 
     async fn define_period(&self, period: &Period) -> Result<(), Self::Error> {
@@ -1460,8 +1505,9 @@ impl<const P: u8> LedgerStore<P> for PostgresStore<P> {
         sqlx::query(
             "INSERT INTO seals ( \
                 period_id, first_index, last_index, entry_count, tree_size, tree_root, \
-                trial_balance_root, accounts_root, prev_seal, seal_hash, chain_position \
-             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+                trial_balance_size, trial_balance_root, accounts_size, accounts_root, \
+                prev_seal, seal_hash, chain_position \
+             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
         )
         .bind(seal.period.as_str())
         .bind(seal.first_index.map(|v| i64::try_from(v).unwrap_or(0)))
@@ -1469,8 +1515,10 @@ impl<const P: u8> LedgerStore<P> for PostgresStore<P> {
         .bind(i64::try_from(seal.entry_count).unwrap_or(0))
         .bind(i64::try_from(seal.tree_head.size).unwrap_or(0))
         .bind(seal.tree_head.root.as_bytes().as_slice())
-        .bind(seal.trial_balance_root.as_bytes().as_slice())
-        .bind(seal.accounts_root.as_bytes().as_slice())
+        .bind(i64::try_from(seal.trial_balance.size).unwrap_or(0))
+        .bind(seal.trial_balance.root.as_bytes().as_slice())
+        .bind(i64::try_from(seal.accounts.size).unwrap_or(0))
+        .bind(seal.accounts.root.as_bytes().as_slice())
         .bind(seal.prev_seal.map(|h| h.as_bytes().to_vec()))
         .bind(seal.seal_hash.as_bytes().as_slice())
         .bind(position)
@@ -1487,7 +1535,8 @@ impl<const P: u8> LedgerStore<P> for PostgresStore<P> {
     async fn seals(&self) -> Result<Vec<Seal>, Self::Error> {
         let rows = sqlx::query(
             "SELECT period_id, first_index, last_index, entry_count, tree_size, tree_root, \
-             trial_balance_root, accounts_root, prev_seal, seal_hash \
+             trial_balance_size, trial_balance_root, accounts_size, accounts_root, \
+             prev_seal, seal_hash \
              FROM seals ORDER BY chain_position",
         )
         .fetch_all(&self.pool)
@@ -1500,6 +1549,8 @@ impl<const P: u8> LedgerStore<P> for PostgresStore<P> {
             let last: Option<i64> = row.try_get("last_index")?;
             let count: i64 = row.try_get("entry_count")?;
             let size: i64 = row.try_get("tree_size")?;
+            let tb_size: i64 = row.try_get("trial_balance_size")?;
+            let accounts_size: i64 = row.try_get("accounts_size")?;
             let prev: Option<Vec<u8>> = row.try_get("prev_seal")?;
             out.push(Seal {
                 ledger: self.ledger.clone(),
@@ -1512,10 +1563,14 @@ impl<const P: u8> LedgerStore<P> for PostgresStore<P> {
                     size: u64::try_from(size).unwrap_or(0),
                     root: hash_from_bytes(&row.try_get::<Vec<u8>, _>("tree_root")?)?,
                 },
-                trial_balance_root: hash_from_bytes(
-                    &row.try_get::<Vec<u8>, _>("trial_balance_root")?,
-                )?,
-                accounts_root: hash_from_bytes(&row.try_get::<Vec<u8>, _>("accounts_root")?)?,
+                trial_balance: TreeHead {
+                    size: u64::try_from(tb_size).unwrap_or(0),
+                    root: hash_from_bytes(&row.try_get::<Vec<u8>, _>("trial_balance_root")?)?,
+                },
+                accounts: TreeHead {
+                    size: u64::try_from(accounts_size).unwrap_or(0),
+                    root: hash_from_bytes(&row.try_get::<Vec<u8>, _>("accounts_root")?)?,
+                },
                 prev_seal: prev.as_deref().map(hash_from_bytes).transpose()?,
                 seal_hash: hash_from_bytes(&row.try_get::<Vec<u8>, _>("seal_hash")?)?,
             });

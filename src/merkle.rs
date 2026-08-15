@@ -142,16 +142,33 @@ pub struct InclusionProof {
 }
 
 impl InclusionProof {
-    /// Verifies this proof against a leaf payload and an expected root.
+    /// Verifies this proof against a leaf payload and a published tree head.
+    ///
+    /// A `true` answer establishes the whole claim, position included:
+    /// **`leaf_payload` is the leaf at [`leaf_index`](Self::leaf_index) of the
+    /// log of `head.size` entries whose Merkle root is `head.root`**. The shape
+    /// of the path is checked as strictly as its contents — a sibling added,
+    /// dropped, duplicated or reordered fails — and exactly one labelling of a
+    /// given path can verify, so the index a caller reads back afterwards is a
+    /// checked number rather than the prover's.
+    ///
+    /// The head is what makes that last part true, which is why there is no
+    /// root-only form of this function. [`leaf_index`](Self::leaf_index) and
+    /// [`tree_size`](Self::tree_size) *steer* the walk rather than being checked
+    /// by it, and neighbouring pairs steer it identically: against a bare root
+    /// the proof for leaf 1 of a two-leaf log is accepted unchanged as the proof
+    /// for leaf 2 of three. Pinning the size to a head a verifier already trusts
+    /// removes the aliasing, and costs one integer comparison.
     ///
     /// Returns `false` on any inconsistency rather than distinguishing failure
     /// modes: a caller cannot act differently on a malformed proof than on a
     /// forged one.
     #[must_use]
-    pub fn verify(&self, leaf_payload: &Hash, root: &Hash) -> bool {
-        if self.leaf_index >= self.tree_size {
+    pub fn verify(&self, leaf_payload: &Hash, head: &TreeHead) -> bool {
+        if self.tree_size != head.size || self.leaf_index >= self.tree_size {
             return false;
         }
+        let root = &head.root;
         let mut fname = self.leaf_index;
         let mut sname = self.tree_size - 1;
         let mut acc = leaf_hash(leaf_payload);
@@ -190,9 +207,31 @@ pub struct ConsistencyProof {
 }
 
 impl ConsistencyProof {
-    /// Verifies that `old_root` at `old_size` is a prefix of `new_root` at `new_size`.
+    /// Verifies that the log at `old` is a prefix of the log at `new`.
+    ///
+    /// Both ends are (size, root) pairs, and both halves of each are checked, so
+    /// the snapshot labels a caller reads back are as trustworthy as the roots.
+    ///
+    /// Taking heads rather than bare roots is what makes that true.
+    /// [`old_size`](Self::old_size) would in fact be pinned by the walk alone —
+    /// both roots are rebuilt from the one path, and only the true old size
+    /// forks it where the old root comes out right — but
+    /// [`new_size`](Self::new_size) would not: like an [`InclusionProof`]'s tree
+    /// size it steers the walk, and neighbouring values steer it identically, so
+    /// against bare roots a one-to-three proof is accepted as a one-to-four. The
+    /// from-empty proof is unconditional besides, since every tree really does
+    /// extend the empty one, and constrains neither the new size nor the new
+    /// root.
+    ///
+    /// The old-size comparison therefore duplicates what the walk enforces. It
+    /// stays because a verifier should not have to derive that from the index
+    /// arithmetic to know its snapshot labels are sound.
     #[must_use]
-    pub fn verify(&self, old_root: &Hash, new_root: &Hash) -> bool {
+    pub fn verify(&self, old: &TreeHead, new: &TreeHead) -> bool {
+        if self.old_size != old.size || self.new_size != new.size {
+            return false;
+        }
+        let (old_root, new_root) = (&old.root, &new.root);
         if self.old_size > self.new_size {
             return false;
         }
@@ -519,42 +558,111 @@ impl MerkleLog {
         Ok(mth(&self.leaves[..size_usize]))
     }
 
-    /// Builds an inclusion proof for the leaf at `index`.
+    /// The tree head as of an earlier size.
+    ///
+    /// The pair, not just the root: a size and the root it belongs with are what
+    /// [`ConsistencyProof::verify`] needs at each end, and keeping them
+    /// together is what stops a caller from pairing a root with the wrong size.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProofError::SizeOutOfRange`] for a size beyond the log.
+    pub fn head_at(&self, size: u64) -> Result<TreeHead, ProofError> {
+        Ok(TreeHead {
+            size,
+            root: self.root_at(size)?,
+        })
+    }
+
+    /// Builds an inclusion proof for the leaf at `index`, against the current head.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProofError::IndexOutOfRange`] for a position beyond the log.
     pub fn inclusion_proof(&self, index: u64) -> Result<InclusionProof, ProofError> {
-        let n = self.leaves.len();
-        let m = usize::try_from(index).unwrap_or(usize::MAX);
-        if m >= n {
-            return Err(ProofError::IndexOutOfRange {
-                index,
+        self.inclusion_proof_at(index, self.len())
+    }
+
+    /// Builds an inclusion proof against the head the log had at `size`.
+    ///
+    /// An auditor archives a head and comes back later, by which time the log
+    /// has grown and its current root proves nothing about the head they hold.
+    /// This answers the question they can actually ask: *was this entry in the
+    /// log as of the head I already have?* Pair it with
+    /// [`head_at`](Self::head_at), or with the head they archived — the two must
+    /// agree, and [`InclusionProof::verify`] is what says so.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProofError::SizeOutOfRange`] for a size beyond the log, and
+    /// [`ProofError::IndexOutOfRange`] for a position beyond *that size* — an
+    /// entry the log has now but had not yet recorded then.
+    pub fn inclusion_proof_at(&self, index: u64, size: u64) -> Result<InclusionProof, ProofError> {
+        let n = usize::try_from(size).unwrap_or(usize::MAX);
+        if n > self.leaves.len() {
+            return Err(ProofError::SizeOutOfRange {
+                from: size,
                 size: self.len(),
             });
         }
+        let m = usize::try_from(index).unwrap_or(usize::MAX);
+        if m >= n {
+            return Err(ProofError::IndexOutOfRange { index, size });
+        }
         let mut path = Vec::new();
-        build_inclusion_path(m, &self.leaves, &mut path);
+        build_inclusion_path(m, &self.leaves[..n], &mut path);
         Ok(InclusionProof {
             leaf_index: index,
-            tree_size: self.len(),
+            tree_size: size,
             path,
         })
     }
 
     /// Builds a consistency proof from an earlier size to the current size.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProofError::SizeOutOfRange`] for a size beyond the log.
     pub fn consistency_proof(&self, old_size: u64) -> Result<ConsistencyProof, ProofError> {
-        let n = self.leaves.len();
+        self.consistency_proof_between(old_size, self.len())
+    }
+
+    /// Builds a consistency proof between two sizes the log has passed through.
+    ///
+    /// The general form: two auditors holding different archived heads, neither
+    /// of them current, can be shown that one is a prefix of the other without
+    /// either being told the log's present size.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProofError::SizeOutOfRange`] if `new_size` is beyond the log or
+    /// `old_size` is beyond `new_size` — a log cannot be shown to have shrunk.
+    pub fn consistency_proof_between(
+        &self,
+        old_size: u64,
+        new_size: u64,
+    ) -> Result<ConsistencyProof, ProofError> {
+        let n = usize::try_from(new_size).unwrap_or(usize::MAX);
+        if n > self.leaves.len() {
+            return Err(ProofError::SizeOutOfRange {
+                from: new_size,
+                size: self.len(),
+            });
+        }
         let m = usize::try_from(old_size).unwrap_or(usize::MAX);
         if m > n {
             return Err(ProofError::SizeOutOfRange {
                 from: old_size,
-                size: self.len(),
+                size: new_size,
             });
         }
         let mut path = Vec::new();
         if m > 0 && m < n {
-            build_consistency_path(m, &self.leaves, true, &mut path);
+            build_consistency_path(m, &self.leaves[..n], true, &mut path);
         }
         Ok(ConsistencyProof {
             old_size,
-            new_size: self.len(),
+            new_size,
             path,
         })
     }
@@ -645,11 +753,10 @@ mod tests {
     fn inclusion_proofs_verify_for_every_leaf_and_size() {
         for n in 1..=33u64 {
             let log = log_of(n);
-            let root = log.root();
             for i in 0..n {
                 let proof = log.inclusion_proof(i).expect("in range");
                 assert!(
-                    proof.verify(&payload(i), &root),
+                    proof.verify(&payload(i), &log.head()),
                     "inclusion proof failed for leaf {i} of {n}"
                 );
             }
@@ -659,25 +766,253 @@ mod tests {
     #[test]
     fn inclusion_proof_rejects_wrong_leaf() {
         let log = log_of(8);
-        let root = log.root();
         let proof = log.inclusion_proof(3).expect("in range");
-        assert!(!proof.verify(&payload(4), &root));
+        assert!(!proof.verify(&payload(4), &log.head()));
     }
 
     #[test]
     fn inclusion_proof_rejects_wrong_root() {
         let log = log_of(8);
         let proof = log.inclusion_proof(3).expect("in range");
-        assert!(!proof.verify(&payload(3), &payload(0)));
+        let wrong = TreeHead {
+            size: log.len(),
+            root: payload(0),
+        };
+        assert!(!proof.verify(&payload(3), &wrong));
     }
 
     #[test]
     fn inclusion_proof_rejects_tampered_path() {
         let log = log_of(8);
-        let root = log.root();
         let mut proof = log.inclusion_proof(3).expect("in range");
         proof.path[0] = payload(12345);
-        assert!(!proof.verify(&payload(3), &root));
+        assert!(!proof.verify(&payload(3), &log.head()));
+    }
+
+    /// Every way to deform a proof path without touching the hashes in it:
+    /// siblings added, dropped, duplicated, or reordered.
+    ///
+    /// A verifier that walked the path it was handed and compared only the hash
+    /// it arrived at would accept several of these. Padding runs the fold off
+    /// the top of the tree, truncation stops it short, and either can be made to
+    /// land on a real root if the walk is not tied to the tree's own shape.
+    fn shape_mutations(path: &[Hash]) -> Vec<(String, Vec<Hash>)> {
+        let mut out = Vec::new();
+        for k in 0..=path.len() {
+            let mut junk = path.to_vec();
+            junk.insert(k, payload(777_777));
+            out.push((format!("a junk sibling inserted at {k}"), junk));
+
+            // A duplicated *genuine* node is the sharper case: the padding is
+            // then a hash the tree really contains, not a value pulled from
+            // nowhere.
+            let mut duplicated = path.to_vec();
+            if let Some(&real) = path.get(k.min(path.len().saturating_sub(1))) {
+                duplicated.insert(k, real);
+                out.push((format!("a real sibling duplicated at {k}"), duplicated));
+            }
+        }
+        for k in 0..path.len() {
+            out.push((
+                format!("truncated to {k} of {}", path.len()),
+                path[..k].to_vec(),
+            ));
+
+            let mut dropped = path.to_vec();
+            dropped.remove(k);
+            out.push((format!("sibling {k} dropped"), dropped));
+        }
+        for k in 1..path.len() {
+            let mut swapped = path.to_vec();
+            swapped.swap(k - 1, k);
+            out.push((format!("siblings {} and {k} swapped", k - 1), swapped));
+        }
+        // A mutation that happened to reproduce the original proves nothing.
+        out.retain(|(_, mutated)| mutated != path);
+        out
+    }
+
+    #[test]
+    fn inclusion_proof_rejects_a_deformed_path() {
+        for n in 1..=24u64 {
+            let log = log_of(n);
+            for i in 0..n {
+                let proof = log.inclusion_proof(i).expect("in range");
+                for (how, path) in shape_mutations(&proof.path) {
+                    let deformed = InclusionProof {
+                        path,
+                        ..proof.clone()
+                    };
+                    assert!(
+                        !deformed.verify(&payload(i), &log.head()),
+                        "leaf {i} of {n} verified with {how}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn inclusion_proof_rejects_a_relabelled_index() {
+        // The index is not carried beside the path, it *drives* it: which side
+        // each sibling is folded on comes from the index bits. Replaying a
+        // genuine proof at another position therefore cannot be made to work.
+        for n in 2..=24u64 {
+            let log = log_of(n);
+            for i in 0..n {
+                let proof = log.inclusion_proof(i).expect("in range");
+                for j in (0..n).filter(|j| *j != i) {
+                    let moved = InclusionProof {
+                        leaf_index: j,
+                        ..proof.clone()
+                    };
+                    assert!(
+                        !moved.verify(&payload(i), &log.head()),
+                        "leaf {i} of {n} verified when relabelled to index {j}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn inclusion_proof_rejects_an_index_at_or_beyond_its_tree() {
+        // Load-bearing, not a formality. Without the range guard a genuine proof
+        // for leaf 0 of eight verifies while claiming index 8 — the fold reaches
+        // the same root because the extra index bits shift off the top.
+        for n in 1..=16u64 {
+            let log = log_of(n);
+            for i in 0..n {
+                let proof = log.inclusion_proof(i).expect("in range");
+                for index in n..n.saturating_add(9) {
+                    let past_the_end = InclusionProof {
+                        leaf_index: index,
+                        ..proof.clone()
+                    };
+                    assert!(
+                        !past_the_end.verify(&payload(i), &log.head()),
+                        "leaf {i} of {n} verified at index {index}, past the end of its own tree"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_grossly_padded_path_is_refused_rather_than_walked() {
+        // The fold stops consuming siblings the moment the tree is exhausted, so
+        // an oversized path costs a verifier `O(log n)` work and not `O(path)`.
+        let log = log_of(8);
+        let proof = log.inclusion_proof(3).expect("in range");
+        let bloated = InclusionProof {
+            path: proof
+                .path
+                .iter()
+                .copied()
+                .chain((0..100_000).map(payload))
+                .collect(),
+            ..proof
+        };
+        assert!(!bloated.verify(&payload(3), &log.head()));
+    }
+
+    #[test]
+    fn an_inclusion_proof_cannot_be_relabelled_outside_its_tree_under_a_head() {
+        // Rewriting the index alone fails, and rewriting it past `tree_size` is
+        // caught by the range guard. Rewriting *both* together escapes both: for
+        // a two-leaf log the proof for leaf 1 folds identically when relabelled
+        // as leaf 2 of three, so the fold alone reaches the real root while
+        // naming a position that log does not have.
+        //
+        // What rejects it is the head's size — and nothing else, which is why
+        // there is no root-only verification to reach for.
+        let log = log_of(2);
+        let head = log.head();
+        let proof = log.inclusion_proof(1).expect("in range");
+        let moved = InclusionProof {
+            leaf_index: 2,
+            tree_size: 3,
+            ..proof.clone()
+        };
+        assert!(!moved.verify(&payload(1), &head));
+
+        // The fold really does accept it, which a head that agrees with the lie
+        // exposes. No such head can be honestly published — a three-leaf tree
+        // does not have a two-leaf tree's root — but it shows where the strength
+        // of the check comes from.
+        let fabricated = TreeHead {
+            size: 3,
+            root: head.root,
+        };
+        assert!(moved.verify(&payload(1), &fabricated));
+
+        // Under a head exactly one labelling is accepted, for every leaf of
+        // every shape of log.
+        for n in 1..=12u64 {
+            let log = log_of(n);
+            let head = log.head();
+            for i in 0..n {
+                let proof = log.inclusion_proof(i).expect("in range");
+                for size in 1..=16u64 {
+                    for index in 0..size {
+                        let relabelled = InclusionProof {
+                            leaf_index: index,
+                            tree_size: size,
+                            ..proof.clone()
+                        };
+                        assert_eq!(
+                            relabelled.verify(&payload(i), &head),
+                            index == i && size == n,
+                            "leaf {i} of {n} under a claimed index {index} of size {size}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_tree_size_is_bound_by_the_head_and_by_nothing_else() {
+        let log = log_of(3);
+        let head = log.head();
+        let proof = log.inclusion_proof(1).expect("in range");
+        assert!(proof.verify(&payload(1), &head));
+
+        // Rewriting the size does not always break the recomputation: for this
+        // leaf, a claimed size of four folds the same siblings in the same
+        // order and arrives at the same root. Only the head's size rejects it.
+        let relabelled = InclusionProof {
+            tree_size: 4,
+            ..proof.clone()
+        };
+        assert!(!relabelled.verify(&payload(1), &head));
+        assert!(relabelled.verify(
+            &payload(1),
+            &TreeHead {
+                size: 4,
+                root: head.root
+            }
+        ));
+
+        // And no size but the true one passes, for any leaf of any log.
+        for n in 1..=24u64 {
+            let log = log_of(n);
+            let head = log.head();
+            for i in 0..n {
+                let proof = log.inclusion_proof(i).expect("in range");
+                assert!(proof.verify(&payload(i), &head));
+                for size in (1..=25u64).filter(|s| *s != n) {
+                    let relabelled = InclusionProof {
+                        tree_size: size,
+                        ..proof.clone()
+                    };
+                    assert!(
+                        !relabelled.verify(&payload(i), &head),
+                        "leaf {i} of {n} verified under a claimed size of {size}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -700,12 +1035,12 @@ mod tests {
     fn consistency_proofs_verify_for_every_prefix() {
         for n in 1..=33u64 {
             let log = log_of(n);
-            let new_root = log.root();
+            let new_head = log.head();
             for m in 0..=n {
-                let old_root = log.root_at(m).expect("in range");
+                let old_head = log.head_at(m).expect("in range");
                 let proof = log.consistency_proof(m).expect("in range");
                 assert!(
-                    proof.verify(&old_root, &new_root),
+                    proof.verify(&old_head, &new_head),
                     "consistency proof failed from {m} to {n}"
                 );
             }
@@ -715,15 +1050,131 @@ mod tests {
     #[test]
     fn consistency_proof_rejects_a_rewritten_prefix() {
         let log = log_of(16);
-        let new_root = log.root();
+        let new_head = log.head();
         let proof = log.consistency_proof(8).expect("in range");
 
         // A log that diverges within the first 8 leaves must not verify.
         let mut tampered = log.leaves()[..8].to_vec();
         tampered[2] = payload(4242);
-        let forged_old_root = MerkleLog::from_leaves(tampered).root();
+        let forged_old = TreeHead {
+            size: 8,
+            root: MerkleLog::from_leaves(tampered).root(),
+        };
 
-        assert!(!proof.verify(&forged_old_root, &new_root));
+        assert!(!proof.verify(&forged_old, &new_head));
+    }
+
+    #[test]
+    fn consistency_proof_rejects_a_deformed_path() {
+        for n in 1..=24u64 {
+            let log = log_of(n);
+            let new_head = log.head();
+            for m in 0..=n {
+                let old_head = log.head_at(m).expect("in range");
+                let proof = log.consistency_proof(m).expect("in range");
+                for (how, path) in shape_mutations(&proof.path) {
+                    let deformed = ConsistencyProof {
+                        path,
+                        ..proof.clone()
+                    };
+                    assert!(
+                        !deformed.verify(&old_head, &new_head),
+                        "consistency from {m} to {n} verified with {how}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn verifying_binds_both_snapshot_sizes() {
+        // A snapshot is a (size, root) pair, and a verifier that kept the pair
+        // together is entitled to trust both halves afterwards.
+        for n in 1..=20u64 {
+            let log = log_of(n);
+            let new_head = log.head();
+            for m in 0..=n {
+                let old_head = log.head_at(m).expect("in range");
+                let proof = log.consistency_proof(m).expect("in range");
+                assert!(proof.verify(&old_head, &new_head));
+
+                for size in (0..=21u64).filter(|s| *s != m) {
+                    let relabelled = ConsistencyProof {
+                        old_size: size,
+                        ..proof.clone()
+                    };
+                    assert!(
+                        !relabelled.verify(&old_head, &new_head),
+                        "consistency from {m} to {n} verified claiming an old size of {size}"
+                    );
+                }
+                for size in (0..=21u64).filter(|s| *s != n) {
+                    let relabelled = ConsistencyProof {
+                        new_size: size,
+                        ..proof.clone()
+                    };
+                    assert!(
+                        !relabelled.verify(&old_head, &new_head),
+                        "consistency from {m} to {n} verified claiming a new size of {size}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn consistency_verification_refuses_a_backwards_pair_of_heads() {
+        // Handing the two heads over in the wrong order is a caller slip rather
+        // than an attack, and it has to come back `false`. The guard that makes
+        // it do so is load-bearing in a second way: the walk subtracts one from
+        // each size, so a `new_size` of zero would underflow before any hashing
+        // began. This module turns off the checked-arithmetic lint, which means
+        // nothing but this test stands between that guard and a panic.
+        let log = log_of(8);
+        let later = log.head();
+        let earlier = log.head_at(3).expect("in range");
+        let proof = log.consistency_proof_between(3, 8).expect("in range");
+
+        // The proof's own labels no longer match the swapped heads …
+        assert!(!proof.verify(&later, &earlier));
+        // … and relabelling it to agree with them does not help.
+        let backwards = ConsistencyProof {
+            old_size: 8,
+            new_size: 3,
+            ..proof
+        };
+        assert!(!backwards.verify(&later, &earlier));
+
+        // The underflow case exactly: a later log claimed to hold nothing.
+        let empty = log.head_at(0).expect("in range");
+        let one = log.head_at(1).expect("in range");
+        let shrunk = ConsistencyProof {
+            old_size: 1,
+            new_size: 0,
+            ..log.consistency_proof_between(1, 8).expect("in range")
+        };
+        assert!(!shrunk.verify(&one, &empty));
+
+        // And across every genuine pair of heads in the wrong order.
+        for new_size in 0..=12u64 {
+            for old_size in (new_size + 1)..=12u64 {
+                let old_head = log.head_at(old_size.min(8)).expect("in range");
+                let new_head = log.head_at(new_size.min(8)).expect("in range");
+                let claim = ConsistencyProof {
+                    old_size: old_head.size,
+                    new_size: new_head.size,
+                    path: Vec::new(),
+                };
+                if old_head.size > new_head.size {
+                    assert!(
+                        !claim.verify(&old_head, &new_head),
+                        "a log was shown to shrink from {} to {}",
+                        old_head.size,
+                        new_head.size
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -740,11 +1191,22 @@ mod tests {
         let log = log_of(8);
         let proof = log.consistency_proof(0).expect("in range");
 
+        let empty = log.head_at(0).expect("in range");
+        assert_eq!(empty.root, empty_root());
+
         // The empty tree is a prefix of everything …
-        assert!(proof.verify(&empty_root(), &log.root()));
+        assert!(proof.verify(&empty, &log.head()));
         // … but a claimed history that was never empty must not verify.
-        assert!(!proof.verify(&payload(1), &log.root()));
-        assert!(!proof.verify(&log.root(), &log.root()));
+        let never_empty = TreeHead {
+            size: 0,
+            root: payload(1),
+        };
+        assert!(!proof.verify(&never_empty, &log.head()));
+        let claimed_full = TreeHead {
+            size: 0,
+            root: log.root(),
+        };
+        assert!(!proof.verify(&claimed_full, &log.head()));
     }
 
     #[test]
@@ -879,10 +1341,207 @@ mod tests {
     #[test]
     fn consistency_with_equal_sizes_is_empty_and_reflexive() {
         let log = log_of(8);
-        let root = log.root();
+        let head = log.head();
         let proof = log.consistency_proof(8).expect("in range");
         assert!(proof.path.is_empty());
-        assert!(proof.verify(&root, &root));
+        assert!(proof.verify(&head, &head));
+
+        // Reflexive is not vacuous: at equal sizes there is no path to walk, so
+        // the equality of the two roots is the *whole* check. A log that claims
+        // it did not grow must actually be the same log.
+        let bogus = TreeHead {
+            size: 8,
+            root: payload(4242),
+        };
+        assert!(!proof.verify(&bogus, &head));
+        assert!(!proof.verify(&head, &bogus));
+        let seven_leaves = TreeHead {
+            size: 8,
+            root: log_of(7).root(),
+        };
+        assert!(!proof.verify(&seven_leaves, &head));
+
+        // And an empty path is required, not merely produced: a sibling smuggled
+        // into a no-op proof is still a deformed proof.
+        let padded = ConsistencyProof {
+            path: vec![payload(1)],
+            ..proof
+        };
+        assert!(!padded.verify(&head, &head));
+    }
+
+    #[test]
+    fn a_consistency_proofs_old_size_is_bound_by_the_walk() {
+        // Both roots are reconstructed from the one path, and the old size is
+        // what decides where that path forks. No other value reproduces the old
+        // root, so the field is bound without ever being compared.
+        for n in 1..=20u64 {
+            let log = log_of(n);
+            let new_head = log.head();
+            for m in 0..=n {
+                let old_head = log.head_at(m).expect("in range");
+                let proof = log.consistency_proof(m).expect("in range");
+                for size in (0..=24u64).filter(|s| *s != m) {
+                    let relabelled = ConsistencyProof {
+                        old_size: size,
+                        ..proof.clone()
+                    };
+                    assert!(
+                        !relabelled.verify(&old_head, &new_head),
+                        "consistency from {m} to {n} verified claiming an old size of {size}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_consistency_proofs_new_size_is_bound_only_by_the_head() {
+        // The new size gets no help from the walk: like an inclusion proof's
+        // tree size it steers the fold, and neighbouring values steer it the
+        // same way. Stretching a one-to-three proof into a one-to-four still
+        // reproduces both roots — so what rejects it is the size comparison
+        // against the head, and nothing else.
+        let log = log_of(3);
+        let old_head = log.head_at(1).expect("in range");
+        let new_head = log.head();
+        let proof = log.consistency_proof(1).expect("in range");
+
+        let stretched = ConsistencyProof {
+            new_size: 4,
+            ..proof.clone()
+        };
+        assert!(!stretched.verify(&old_head, &new_head));
+
+        // Which is to say: hand the walk a head that agrees with the lie and it
+        // is satisfied. A fabricated head is not a check on anything, and this
+        // is the boundary of what a proof can establish on its own — the head
+        // has to come from somewhere the verifier already trusts.
+        let fabricated = TreeHead {
+            size: 4,
+            root: new_head.root,
+        };
+        assert!(stretched.verify(&old_head, &fabricated));
+
+        // Under both heads, only the true labelling survives — the from-empty
+        // proof included, which the walk alone leaves entirely unconstrained.
+        for n in 1..=20u64 {
+            let log = log_of(n);
+            let new_head = log.head();
+            for m in 0..=n {
+                let old_head = log.head_at(m).expect("in range");
+                let proof = log.consistency_proof(m).expect("in range");
+                assert!(proof.verify(&old_head, &new_head));
+                for size in (0..=24u64).filter(|s| *s != n) {
+                    let relabelled = ConsistencyProof {
+                        new_size: size,
+                        ..proof.clone()
+                    };
+                    assert!(
+                        !relabelled.verify(&old_head, &new_head),
+                        "consistency from {m} to {n} verified claiming a new size of {size}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn inclusion_proofs_verify_against_the_head_they_were_built_for() {
+        // An auditor archives a head and comes back later. The log has grown,
+        // and its current root says nothing about the head they hold — so the
+        // proof has to be built against that head, and must verify under it.
+        let log = log_of(40);
+        for size in 1..=40u64 {
+            let head = log.head_at(size).expect("in range");
+            for i in 0..size {
+                let proof = log.inclusion_proof_at(i, size).expect("in range");
+                assert!(
+                    proof.verify(&payload(i), &head),
+                    "leaf {i} did not prove against the head at size {size}"
+                );
+                // The same proof is worthless against any other head, which is
+                // what stops one being replayed as the log moves on.
+                for other in (1..=40u64).filter(|s| *s != size) {
+                    let elsewhere = log.head_at(other).expect("in range");
+                    assert!(!proof.verify(&payload(i), &elsewhere));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_historical_inclusion_proof_matches_one_from_a_shorter_log() {
+        // The proof must not depend on entries recorded after the head was
+        // published, or an auditor's archived head would be unusable the moment
+        // anyone appended.
+        let long = log_of(50);
+        for size in 1..=25u64 {
+            let short = log_of(size);
+            for i in 0..size {
+                assert_eq!(
+                    long.inclusion_proof_at(i, size).expect("in range"),
+                    short.inclusion_proof(i).expect("in range"),
+                    "historical proof for leaf {i} at size {size} diverged"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_historical_inclusion_proof_refuses_an_entry_the_log_had_not_reached() {
+        let log = log_of(20);
+        // Leaf 15 exists now, but not in the log of ten the head describes.
+        assert!(matches!(
+            log.inclusion_proof_at(15, 10),
+            Err(ProofError::IndexOutOfRange {
+                index: 15,
+                size: 10
+            })
+        ));
+        assert!(matches!(
+            log.inclusion_proof_at(0, 21),
+            Err(ProofError::SizeOutOfRange { from: 21, size: 20 })
+        ));
+    }
+
+    #[test]
+    fn consistency_proofs_relate_any_two_sizes_the_log_passed_through() {
+        // Two auditors, two archived heads, neither of them current: one must
+        // still be provably a prefix of the other.
+        let log = log_of(33);
+        for new_size in 0..=33u64 {
+            let new_head = log.head_at(new_size).expect("in range");
+            for old_size in 0..=new_size {
+                let old_head = log.head_at(old_size).expect("in range");
+                let proof = log
+                    .consistency_proof_between(old_size, new_size)
+                    .expect("in range");
+                assert!(
+                    proof.verify(&old_head, &new_head),
+                    "consistency failed from {old_size} to {new_size}"
+                );
+                // And it agrees with what a log that had stopped there produced.
+                assert_eq!(
+                    proof,
+                    log_of(new_size).consistency_proof(old_size).expect("ok"),
+                    "historical proof diverged from {old_size} to {new_size}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_log_cannot_be_shown_to_have_shrunk() {
+        let log = log_of(20);
+        assert!(matches!(
+            log.consistency_proof_between(10, 5),
+            Err(ProofError::SizeOutOfRange { from: 10, size: 5 })
+        ));
+        assert!(matches!(
+            log.consistency_proof_between(0, 21),
+            Err(ProofError::SizeOutOfRange { from: 21, size: 20 })
+        ));
     }
 
     #[test]

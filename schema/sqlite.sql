@@ -221,11 +221,16 @@ CREATE TABLE IF NOT EXISTS seals (
 
     tree_size           INTEGER NOT NULL,
     tree_root           BLOB    NOT NULL,
+
+    -- Size and root together, because a proof is checked against both. See
+    -- `schema/postgres.sql` for why the size is not decoration.
+    trial_balance_size  INTEGER NOT NULL,
     trial_balance_root  BLOB    NOT NULL,
 
-    -- Merkle root over the handle-to-account bindings in force at sealing. The
-    -- trial balance root is keyed on `account_index`; this is what says which
+    -- Merkle head over the handle-to-account bindings in force at sealing. The
+    -- trial balance is keyed on `account_index`; this is what says which
     -- account each of those integers was. See `schema/postgres.sql`.
+    accounts_size       INTEGER NOT NULL,
     accounts_root       BLOB    NOT NULL,
 
     prev_seal           BLOB,
@@ -243,6 +248,9 @@ CREATE TABLE IF NOT EXISTS seals (
         AND length(accounts_root) = 32
         AND length(seal_hash) = 32
         AND (prev_seal IS NULL OR length(prev_seal) = 32)
+    ),
+    CONSTRAINT seals_sizes CHECK (
+        tree_size >= 0 AND trial_balance_size >= 0 AND accounts_size >= 0
     ),
     CONSTRAINT seals_span CHECK (
         (first_index IS NULL) = (last_index IS NULL)

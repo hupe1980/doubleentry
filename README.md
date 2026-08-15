@@ -63,9 +63,11 @@ let recorded = journal.record(
 )?;
 
 // Prove the entry is committed to, without revealing any other entry.
+// Verification takes the whole head — size and root — so the position the
+// proof names is checked rather than taken on the prover's word.
 let head  = journal.head();
 let proof = journal.prove_inclusion(recorded.require_index()?)?;
-assert!(proof.verify(&recorded.content_hash, &head.root));
+assert!(proof.verify(&recorded.content_hash, &head));
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
@@ -212,7 +214,7 @@ for i in 1024..2048 { log.append(leaf(i)); }
 
 // The published snapshot is provably a prefix of what the log holds now.
 let proof = log.consistency_proof(snapshot.size)?;
-assert!(proof.verify(&snapshot.root, &log.root()));
+assert!(proof.verify(&snapshot, &log.head()));
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
@@ -266,9 +268,10 @@ assert_eq!(binding.account().path.to_string(), "Assets:Cash");
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-The trial-balance root is keyed on account **handles** — dense integers, cheap to compare.
-`accounts_root` is what says which account each handle is, so renumbering the registry after
-the fact cannot leave a seal verifying while its balances quietly mean something else.
+The trial balance is keyed on account **handles** — dense integers, cheap to compare.
+`Seal::accounts` is what says which account each handle is, so renumbering the registry after
+the fact cannot leave a seal verifying while its balances quietly mean something else. Both are
+stored as Merkle **heads**, size and root together, because a proof is checked against both.
 
 → [Periods and seals](https://hupe1980.github.io/doubleentry/docs/periods-and-seals/)
 

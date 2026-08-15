@@ -33,6 +33,7 @@ use crate::account::{
 use crate::balance::BalanceKey;
 use crate::clearing::{Clearing, PostingRef};
 use crate::entry::{Draft, Entry, EntryId, IdempotencyKey, LedgerPolicy, SealContext};
+use crate::merkle::MerkleLog;
 use crate::money::{Amount, Currency};
 use crate::period::PeriodCalendar;
 use crate::posting::Layer;
@@ -788,11 +789,11 @@ pub async fn check_period_lifecycle_and_seals<const P: u8, S: LedgerStore<P>>(
     // keep the whole chain verifying while every balance meant something else.
     match store.accounts().await {
         Ok(records) => match AccountRegistry::from_records(records) {
-            Ok(registry) if registry.commitment() == seal.accounts_root => {}
+            Ok(registry) if registry.commitment() == seal.accounts => {}
             Ok(_) => {
                 return CheckResult::fail(
                     NAME,
-                    "the seal's accounts_root does not match the stored account bindings",
+                    "the seal's accounts head does not match the stored account bindings",
                 );
             }
             Err(e) => return CheckResult::fail(NAME, format!("registry would not rebuild: {e}")),
@@ -1732,6 +1733,10 @@ pub async fn check_proofs_verify<const P: u8, S: LedgerStore<P>>(store: &S) -> C
         return CheckResult::fail(NAME, "no entries to prove");
     }
 
+    // Kept for the archived-head checks below, which need an entry that was
+    // already in the log when this head was published.
+    let mut archived_entry = None;
+    let mut leaves = Vec::new();
     let mut cursor = Some(Cursor::start());
     while let Some(c) = cursor {
         match store.page(c).await {
@@ -1740,9 +1745,13 @@ pub async fn check_proofs_verify<const P: u8, S: LedgerStore<P>>(store: &S) -> C
                     let Ok(index) = record.require_index() else {
                         return CheckResult::fail(NAME, "a page returned an unsequenced entry");
                     };
+                    if archived_entry.is_none() {
+                        archived_entry = Some((index, record.content_hash));
+                    }
+                    leaves.push(record.content_hash);
                     match store.prove_inclusion(index).await {
                         Ok(proof) => {
-                            if !proof.verify(&record.content_hash, &head.root) {
+                            if !proof.verify(&record.content_hash, &head) {
                                 return CheckResult::fail(
                                     NAME,
                                     format!("inclusion proof failed for index {index}"),
@@ -1774,9 +1783,52 @@ pub async fn check_proofs_verify<const P: u8, S: LedgerStore<P>>(store: &S) -> C
         Err(e) => return CheckResult::fail(NAME, format!("head failed: {e}")),
     };
     match store.prove_consistency(head.size).await {
-        Ok(proof) if proof.verify(&head.root, &grown.root) => CheckResult::pass(NAME),
-        Ok(_) => CheckResult::fail(NAME, "consistency proof did not verify"),
-        Err(e) => CheckResult::fail(NAME, format!("prove_consistency failed: {e}")),
+        Ok(proof) if proof.verify(&head, &grown) => {}
+        Ok(_) => return CheckResult::fail(NAME, "consistency proof did not verify"),
+        Err(e) => return CheckResult::fail(NAME, format!("prove_consistency failed: {e}")),
+    }
+
+    // The archived-head case: an auditor holding an earlier head must be able to
+    // check it, so every historical head the store reports has to equal the one
+    // a log built from the same prefix produces. A backend that answers this
+    // from a stored column rather than a replay is exactly where the two can
+    // silently drift apart.
+    for size in 0..=leaves.len() {
+        let Some(prefix) = leaves.get(..size) else {
+            return CheckResult::fail(NAME, "prefix beyond the collected log");
+        };
+        let expected = MerkleLog::from_leaves(prefix.to_vec()).head();
+        match store.head_at(expected.size).await {
+            Ok(recalled) if recalled == expected => {}
+            Ok(other) => {
+                return CheckResult::fail(
+                    NAME,
+                    format!("head_at({size}) returned {other:?}, not the head as it stood"),
+                );
+            }
+            Err(e) => return CheckResult::fail(NAME, format!("head_at({size}) failed: {e}")),
+        }
+    }
+
+    if let Some((index, content_hash)) = archived_entry {
+        // Against the archived head, not the current one — the log has grown a
+        // row since, so a proof built against `grown` would not verify here.
+        match store.prove_inclusion_at(index, head.size).await {
+            Ok(proof) if proof.verify(&content_hash, &head) => {}
+            Ok(_) => {
+                return CheckResult::fail(
+                    NAME,
+                    "an inclusion proof against the archived head did not verify",
+                );
+            }
+            Err(e) => return CheckResult::fail(NAME, format!("prove_inclusion_at failed: {e}")),
+        }
+    }
+
+    match store.prove_consistency_between(head.size, grown.size).await {
+        Ok(proof) if proof.verify(&head, &grown) => CheckResult::pass(NAME),
+        Ok(_) => CheckResult::fail(NAME, "a proof between two archived heads did not verify"),
+        Err(e) => CheckResult::fail(NAME, format!("prove_consistency_between failed: {e}")),
     }
 }
 

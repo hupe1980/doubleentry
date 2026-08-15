@@ -273,7 +273,7 @@ async fn deferred_appends_are_durable_before_they_are_sequenced() {
         .prove_inclusion(placed.index.expect("sequenced"))
         .await
         .expect("proves");
-    assert!(proof.verify(&placed.content_hash, &head.root));
+    assert!(proof.verify(&placed.content_hash, &head));
 
     // A second pass has nothing left to do.
     assert_eq!(store.sequence().await.expect("sequences"), 0);
@@ -735,7 +735,7 @@ async fn proofs_verify_against_the_stored_log() {
             .await
             .expect("proves");
         assert!(
-            proof.verify(&record.content_hash, &head.root),
+            proof.verify(&record.content_hash, &head),
             "index {} must be provable",
             record.require_index().expect("sequenced")
         );
@@ -748,7 +748,7 @@ async fn proofs_verify_against_the_stored_log() {
         .expect("appends");
     let grown = h.store.head().await.expect("reads");
     let proof = h.store.prove_consistency(head.size).await.expect("proves");
-    assert!(proof.verify(&head.root, &grown.root));
+    assert!(proof.verify(&head, &grown));
 }
 
 #[tokio::test]

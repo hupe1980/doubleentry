@@ -8,12 +8,23 @@
 //! These vectors are the tripwire. A change here is either a mistake, or a
 //! deliberate format revision.
 //!
-//! Before the first release, a deliberate revision means regenerating these
-//! values — `just golden-emit` prints them — because there are no ledgers in the
-//! world to be compatible with. After it, it means bumping the encoding version
-//! in the domain tag (`doubleentry/entry/v1`) as well, so old bytes are never
-//! silently reinterpreted under a new format, and writing down how existing
-//! seals migrate.
+//! A deliberate revision now means three things, because the crate is published
+//! and ledgers exist that were written by earlier versions:
+//!
+//! 1. Regenerating these values — `just golden-emit` prints them.
+//! 2. **Bumping the encoding version in the domain tag** for whatever moved, so
+//!    a root computed under the old rule and one computed under the new rule are
+//!    not both labelled `v1`.
+//! 3. Writing down in `CHANGELOG.md` what an existing ledger has to do.
+//!
+//! Two revisions shipped *without* step 2, and the tags are correspondingly
+//! ambiguous across published versions: the entry encoding moved in `0.3.0`
+//! under `doubleentry/entry/v1`, and the account-binding leaf moved in `0.5.0`
+//! under `doubleentry/accountbinding/v1`. Neither can cause a misreading — the
+//! preimages differ in length, so verification simply fails rather than
+//! accepting the wrong thing — and re-tagging them now would break every ledger
+//! written since for a relabelling. They are recorded here rather than repaired,
+//! and the rule binds from `0.6.0` on.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 

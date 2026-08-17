@@ -4,10 +4,87 @@ Notable changes to `doubleentry`, in the format of
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioned per
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-**Nothing has been published to crates.io yet.** `v0.1.0` through `v0.4.0` are
-development tags; `0.5.0` is the first release intended to reach the registry.
-Until 1.0 every release may break, and this one does — the reasoning is in each
-entry, because a breaking change without a reason is just churn.
+**Every version is published on crates.io**, `0.1.0` onward, none yanked. Until
+1.0 a release may break compatibility, and several have; the reasoning is in
+each entry, because a breaking change without a reason is just churn.
+
+Entries marked ⚠️ change a hash, an encoding or the schema. Read those before
+upgrading a ledger that already holds data — each one now says what an existing
+ledger has to do, which earlier revisions of this file wrongly said was nothing.
+
+## [Unreleased]
+
+Renamed to `[0.6.0]` when tagged, as `[Unreleased]` was for `0.5.0`.
+
+Everything here answers integration feedback from `accountingd` against `0.5.0`.
+Two of the three observations were valid; the third rested on a hazard that does
+not exist, and is recorded below with what the real cost is instead.
+
+### Changed
+
+- **`prove_sealed_balance` returns `SealedBalanceOutcome`, not
+  `Option<SealedBalance>`.** "The account has no row" and "the account did not
+  exist yet" are both *answers* — the books are intact and the question simply
+  has a negative reply — so both now sit on the `Ok` side as `NoRow` and
+  `NotYetRegistered`, with `is_absent()` for the common case and `into_proven()`
+  for the rest. `SealedBalanceError::NotYetRegistered` is gone.
+
+  Not cosmetic, and worse than it was reported as. `LedgerStore::Error` is the
+  *backend's* type and is only required to be `From<SealedBalanceError>`. There
+  is no route back, so an answer routed through the error path was
+  **unreachable** from generic code over `S: LedgerStore<P>` — the suggested
+  remedy of a `SealedBalanceError::is_absent()` could not have been called. The
+  error type is now only ever a real failure.
+
+### Added
+
+- **`LedgerStore::all_open_items`.** The drain loop, once, in the crate, for the
+  callers that genuinely need the whole set: allocating a payment across invoices,
+  or totalling what an account has outstanding. Both are answered wrongly by a
+  partial list and `next` is easy to leave unread. Explicitly unbounded — it is
+  the read `open_items` is paged to avoid, offered because some questions have no
+  bounded answer.
+
+  Worth stating what a partial read does *not* cost, since it is the obvious
+  guess: it cannot clear a newer item ahead of an older one. Pages come oldest
+  first, so the first page **is** the oldest items and FIFO over it is correct
+  FIFO. What it costs is completeness — a payment larger than the page's
+  residuals under-allocates, and a total comes out short.
+
+### Documentation
+
+- **The changelog claimed nothing was published to crates.io. Everything is.**
+  `0.1.0` onward, none yanked. The claim was wrong in every revision of this
+  file, and it was not idle: it was the stated *justification* for three
+  hash-breaking releases — "there is no migration", "no ledger in the world to be
+  compatible with". Anyone upgrading a real ledger was told there was nothing to
+  do.
+
+  Each ⚠️ entry now says what an existing ledger actually faces, and the three
+  differ sharply: `0.3.0` moved the **entry** hash, so `0.2.0` rows become
+  unreadable and have to be re-recorded; `0.4.0` moved the **seal preimage**, so
+  earlier seals fail `is_self_consistent()` while entries stay readable; `0.5.0`
+  moved only the **binding leaf**, so seals still verify and balances still
+  prove, but balances in periods sealed earlier cannot be *named*.
+
+- **The rule for changing an encoding assumed a pre-release crate.** Both the
+  design guide and the golden-vector tripwire — the text a developer reads at the
+  moment they break a vector — said a revision needs no tag bump "before the
+  first release". That release was `0.1.0`. Both now state the post-release rule
+  and record the two revisions that shipped without it (`0.3.0`'s entry
+  encoding, `0.5.0`'s binding leaf, both still tagged `v1`), with why re-tagging
+  them now would cost more than the ambiguity does.
+
+- **The sealed watermark is derived, never stored — and now says so.**
+  `PeriodCalendar::from_periods` and `sealed_through` document that each sealed
+  period advances it as it is defined, so replaying a period table reconstructs
+  it exactly and a restart keeps every gap the seals closed. It was already true
+  and already tested; an integrator had to read the source to confirm it, which
+  is a documentation defect rather than a code one.
+
+- The `0.5.0` watermark entry gained a ⚠️ **Changed** note stating the migration
+  consequence directly — seal any period and every earlier date is closed —
+  rather than leaving it to be inferred from the soundness reasoning.
 
 ## [0.5.0] — 2026-08-17
 
@@ -23,8 +100,21 @@ vectors:
 | Reference seal hash | `7f6f0218…` | `5dbfe84f…` |
 
 The entry hash, the trial-balance leaf and every Merkle constant are
-**unchanged**, as are all proof-path vectors. No schema change. Nothing is
-published to crates.io, so there is no migration.
+**unchanged**, as are all proof-path vectors. No schema change.
+
+**Upgrading a ledger sealed under `0.4.0` or earlier.** Entries are untouched:
+their content hashes did not move, so everything stays readable. Seals are
+untouched too — `seal_hash` covers the `accounts` root as a *stored value*, not
+as a recomputation, so old seals remain self-consistent and the chain still
+verifies. `BalanceProof::verify_against` still holds, because the trial-balance
+root did not move.
+
+What does break is **naming**: `AccountBindingProof` is computed from
+`account_binding_leaf`, so a proof built by `0.5.0` will not verify against an
+`accounts` root recorded by `0.4.0`. `verify_naming` therefore fails for periods
+sealed before the upgrade. There is no in-place repair — re-deriving those roots
+would change every seal hash and break the chain — so a balance in an older
+period is provable but not nameable. Periods sealed from `0.5.0` on are both.
 
 ### Fixed
 
@@ -202,6 +292,19 @@ published to crates.io, so there is no migration.
 
 ### Changed
 
+- **⚠️ Sealing any period now closes every earlier date.** The watermark below is
+  a soundness fix, but for an existing integration it is first of all a
+  *behaviour* change, so it is repeated here: `state_on` consults
+  `sealed_through` before the covering period, so a date at or before the
+  greatest sealed end date is refused — **including one no period covers**.
+
+  If you seal sparsely — annually, or only for audited years — bookings are now
+  refused across ranges you never sealed, arriving as an ordinary
+  `ValidationError::ClosedPeriod`. That is correct, since those dates fold into a
+  sealed cumulative closing balance, but it is not something to discover from a
+  rejected posting. Corrections into a closed range book into an open period
+  carrying `original_booking_date`, as they always have.
+
 - **`PeriodError` gained `NotClosing`, `SealedOutOfOrder` and
   `UnsealedPredecessor`;** `JournalError::PeriodNotClosing` and
   `JournalError::UnknownPeriod` are **removed**, as are the identical variants on
@@ -259,9 +362,14 @@ reference seal vector moved:
 
 The entry hash, the account-binding commitment and every Merkle constant are
 **unchanged**. The `seals` table gains `trial_balance_size` and `accounts_size`;
-apply `schema/sqlite.sql` or `schema/postgres.sql` as they now stand. Nothing is
-published to crates.io, so there is no migration and no ledger in the world to
-be compatible with.
+apply `schema/sqlite.sql` or `schema/postgres.sql` as they now stand.
+
+**Upgrading a ledger sealed under `0.3.0` or earlier.** Entries are readable —
+the entry hash did not move. Seals are not: the sizes are new fields in the seal
+preimage, so every seal issued before this release fails `is_self_consistent()`
+under `0.4.0`, and the chain with it. Those seals cannot be repaired, only
+superseded; the periods they covered stay auditable through the entries
+themselves, which are unchanged and still provable against the log.
 
 ### Changed
 
@@ -336,8 +444,14 @@ be compatible with.
 ### ⚠️ Hashes changed
 
 Two of the crate's committed golden vectors moved. Any hash, seal or proof
-produced by `0.2.0` is invalid under `0.3.0`, and there is no migration: the
-crate is unreleased, so there are no ledgers in the world to be compatible with.
+produced by `0.2.0` is invalid under `0.3.0`.
+
+This is the widest of the breaks, because the **entry** hash moved. Every stored
+`content_hash` written by `0.2.0` disagrees with what `0.3.0` computes, so
+`adopt_verified` refuses the row and the entry becomes unreadable rather than
+merely unprovable. A ledger holding `0.2.0` data cannot be carried forward by
+upgrading; it has to be re-recorded, which re-hashes and re-seals it from the
+source documents.
 
 | Vector | `0.2.0` | `0.3.0` |
 |---|---|---|

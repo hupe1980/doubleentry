@@ -142,7 +142,8 @@ pub use period::{LedgerId, Period, PeriodCalendar, PeriodError, PeriodId, Period
 pub use posting::{Direction, Layer, Posting};
 pub use seal::{
     BalanceProof, PeriodCoverage, Seal, SealChain, SealChainError, SealedBalance,
-    SealedBalanceError, TrialBalanceCommitment, balance_leaf, trial_balance_head,
+    SealedBalanceError, SealedBalanceOutcome, TrialBalanceCommitment, balance_leaf,
+    trial_balance_head,
 };
 pub use storage::{
     BatchError, Cursor, DynLedgerStore, EntryBatch, LedgerStore, MemoryStore, MemoryStoreError,

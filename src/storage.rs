@@ -44,7 +44,7 @@ use crate::merkle::{ConsistencyProof, InclusionProof, TreeHead};
 use crate::money::Currency;
 use crate::period::{LedgerId, Period, PeriodId, PeriodState};
 use crate::posting::Layer;
-use crate::seal::{Seal, SealedBalance, SealedBalanceError};
+use crate::seal::{Seal, SealedBalance, SealedBalanceError, SealedBalanceOutcome};
 
 pub mod conformance;
 
@@ -500,16 +500,18 @@ pub trait LedgerStore<const P: u8>: Send + Sync {
     /// computed yourself: internally consistent, and evidence of nothing. Here
     /// a mismatch is [`SealedBalanceError::Restated`] and no proof comes back.
     ///
-    /// Returns `Ok(None)` when the account has no row in that period's closing
-    /// trial balance. That is not a balance of zero — an account with no
-    /// postings has no row, and a proof of one must not be manufactured.
+    /// "Nothing to prove" comes back as a [`SealedBalanceOutcome`] variant
+    /// rather than an error. That is not fussiness: `Self::Error` is the
+    /// *backend's* type and is only required to be `From<SealedBalanceError>`,
+    /// so an answer routed through it is unreachable from generic code over
+    /// `S: LedgerStore<P>`.
     ///
     /// Backends inherit this; there is nothing to implement.
     fn prove_sealed_balance(
         &self,
         period: &PeriodId,
         key: BalanceKey,
-    ) -> impl Future<Output = Result<Option<SealedBalance<P>>, Self::Error>> + Send {
+    ) -> impl Future<Output = Result<SealedBalanceOutcome<P>, Self::Error>> + Send {
         let period = period.clone();
         async move {
             let Some(seal) = self.seals().await?.into_iter().find(|s| s.period == period) else {
@@ -557,6 +559,45 @@ pub trait LedgerStore<const P: u8>: Send + Sync {
         key: BalanceKey,
         cursor: PostingCursor,
     ) -> impl Future<Output = Result<OpenItemPage<P>, Self::Error>> + Send;
+
+    /// Every open item on an account, oldest first, draining every page.
+    ///
+    /// The correct thing made the short thing, for the callers that genuinely
+    /// need the whole set: allocating a payment across invoices, or totalling
+    /// what an account has outstanding. Both are answered wrongly by a partial
+    /// list, and `next` is easy to leave unread.
+    ///
+    /// Note what *cannot* go wrong, since it is the obvious guess: reading only
+    /// the first page does not clear a newer item ahead of an older one. Pages
+    /// come oldest first, so the first page **is** the oldest items and FIFO
+    /// over it is correct FIFO. What a partial read costs is completeness — a
+    /// payment larger than the page's residuals under-allocates, and a total
+    /// comes out short.
+    ///
+    /// # Unbounded on purpose
+    ///
+    /// This is the read [`open_items`](Self::open_items) is paged to avoid. It
+    /// is offered because some questions have no bounded answer, not because
+    /// paging was a nuisance — reach for it when you need the whole set, and
+    /// page when you are rendering one.
+    fn all_open_items(
+        &self,
+        key: BalanceKey,
+    ) -> impl Future<Output = Result<Vec<OpenItem<P>>, Self::Error>> + Send {
+        async move {
+            let mut out = Vec::new();
+            let mut cursor = Some(PostingCursor::start().with_limit(MAX_PAGE_SIZE));
+            while let Some(c) = cursor {
+                let page = self.open_items(key, c).await?;
+                if page.items.is_empty() {
+                    break;
+                }
+                out.extend(page.items);
+                cursor = page.next;
+            }
+            Ok(out)
+        }
+    }
 
     /// Balances for several accounts at once.
     ///
@@ -1329,6 +1370,7 @@ mod tests {
         };
         let proven = conformance::block_on(store.prove_sealed_balance(&march, key))
             .expect("the seal still describes these books")
+            .into_proven()
             .expect("cash has a row in the closing trial balance");
 
         assert!(proven.verify(), "the complete claim must check out");
@@ -1352,10 +1394,9 @@ mod tests {
             currency: Currency::USD,
             layer: Layer::Settled,
         };
-        assert!(
-            conformance::block_on(store.prove_sealed_balance(&march, no_row))
-                .expect("no error")
-                .is_none()
+        assert_eq!(
+            conformance::block_on(store.prove_sealed_balance(&march, no_row)).expect("no error"),
+            SealedBalanceOutcome::NoRow,
         );
 
         // An account onboarded *after* the seal is a different answer again —
@@ -1366,12 +1407,12 @@ mod tests {
             currency: Currency::EUR,
             layer: Layer::Settled,
         };
-        assert!(matches!(
-            conformance::block_on(store.prove_sealed_balance(&march, later)),
-            Err(MemoryStoreError::SealedBalance(
-                SealedBalanceError::NotYetRegistered { .. }
-            ))
-        ));
+        // An answer, not an error: the books are intact, the seal simply
+        // predates the account.
+        let onboarded_later =
+            conformance::block_on(store.prove_sealed_balance(&march, later)).expect("no error");
+        assert_eq!(onboarded_later, SealedBalanceOutcome::NotYetRegistered);
+        assert!(onboarded_later.is_absent());
 
         // An unsealed period has nothing to prove.
         let ghost = PeriodId::new("2026-09").expect("valid");
@@ -1381,6 +1422,86 @@ mod tests {
                 SealedBalanceError::NotSealed { .. }
             ))
         ));
+    }
+
+    #[test]
+    fn draining_open_items_agrees_with_paging_them() {
+        // `all_open_items` is the drain loop the crate writes once. It has to
+        // agree with paging exactly, at every page size, or the convenience is
+        // a second implementation that can disagree with the first.
+        use crate::money::{Amount, Currency};
+        use crate::posting::Layer;
+        use crate::{Entry, EntryId, IdempotencyKey};
+        use time::macros::date;
+
+        let store = MemoryStore::<2>::new(test_ledger());
+        let (ar, revenue) = {
+            let mut journal = store.snapshot();
+            let ar = journal
+                .accounts_mut()
+                .register_path("Assets:AR", date!(2026 - 01 - 01))
+                .expect("registers");
+            let revenue = journal
+                .accounts_mut()
+                .register_path("Income:Sales", date!(2026 - 01 - 01))
+                .expect("registers");
+            for record in journal.account_records() {
+                conformance::block_on(store.register_account(&record)).expect("restores");
+            }
+            (ar, revenue)
+        };
+
+        for n in 0..7i64 {
+            let entry = {
+                let journal = store.snapshot();
+                Entry::<crate::entry::Draft, 2>::new(
+                    EntryId::generate(),
+                    IdempotencyKey::new(format!("inv{n}").into_bytes()).expect("valid"),
+                    date!(2026 - 03 - 10),
+                )
+                .debit(ar, Amount::<2>::from_minor(100 + n), Currency::EUR)
+                .credit(revenue, Amount::<2>::from_minor(100 + n), Currency::EUR)
+                .seal(&journal.context())
+                .expect("balances")
+            };
+            conformance::block_on(store.append(&EntryBatch::single(entry))).expect("appends");
+        }
+
+        let key = BalanceKey {
+            account: ar,
+            currency: Currency::EUR,
+            layer: Layer::Settled,
+        };
+        let drained = conformance::block_on(store.all_open_items(key)).expect("reads");
+        assert_eq!(drained.len(), 7);
+
+        for limit in 1..=8usize {
+            let mut paged = Vec::new();
+            let mut cursor = Some(PostingCursor::start().with_limit(limit));
+            while let Some(c) = cursor {
+                let page = conformance::block_on(store.open_items(key, c)).expect("reads");
+                paged.extend(page.items);
+                cursor = page.next;
+            }
+            assert_eq!(
+                paged, drained,
+                "draining diverged from paging at limit {limit}"
+            );
+        }
+
+        // The first page is the *oldest* items, so FIFO over it is correct FIFO
+        // — the thing a caller who never drains is most likely to fear wrongly.
+        let first =
+            conformance::block_on(store.open_items(key, PostingCursor::start().with_limit(2)))
+                .expect("reads");
+        assert_eq!(
+            first.items.iter().map(|i| i.position).collect::<Vec<_>>(),
+            drained
+                .iter()
+                .take(2)
+                .map(|i| i.position)
+                .collect::<Vec<_>>(),
+        );
     }
 
     #[test]

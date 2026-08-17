@@ -298,10 +298,15 @@ recipe has five steps and only one of them matters — checking your rebuilt com
 the one the seal recorded — and it is the step nothing forces.
 
 ```rust,ignore
-let proven = store.prove_sealed_balance(&march, cash_key).await?.expect("has a row");
+let proven = store.prove_sealed_balance(&march, cash_key).await?
+    .into_proven().expect("cash has a row in the closing balance");
 assert!(proven.verify());
 assert_eq!(proven.path().to_string(), "Assets:Cash");
 ```
+
+The two "nothing to prove" answers — no row, and not registered when the period sealed — come
+back as `SealedBalanceOutcome` variants rather than errors, because the books are intact and the
+question simply has a negative reply. `is_absent()` covers both at once.
 
 → [Periods and seals](https://hupe1980.github.io/doubleentry/docs/periods-and-seals/)
 

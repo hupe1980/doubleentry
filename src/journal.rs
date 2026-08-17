@@ -53,6 +53,7 @@ use crate::period::{LedgerId, Period, PeriodCalendar, PeriodError, PeriodId, Per
 use crate::posting::{Layer, Posting};
 use crate::seal::{
     PeriodCoverage, Seal, SealChain, SealChainError, SealedBalance, SealedBalanceError,
+    SealedBalanceOutcome,
 };
 use crate::storage::StatementLine;
 
@@ -1206,19 +1207,19 @@ impl<const P: u8> Journal<P> {
     /// prefix. Sealing March in April is the normal case, so at the moment the
     /// seal is taken the log already holds April entries and the two differ.
     ///
-    /// Returns `Ok(None)` when the account has no row in that period's closing
-    /// trial balance — which is not a balance of zero.
+    /// "Nothing to prove" comes back as a [`SealedBalanceOutcome`] variant
+    /// rather than an error, because it is an answer: see there for why the
+    /// distinction matters.
     ///
     /// # Errors
     ///
-    /// Returns [`JournalError::SealedBalance`] when the period is not sealed,
-    /// when the books no longer reproduce the seal's closing balance, or when
-    /// the account was not registered by the time the period closed.
+    /// Returns [`JournalError::SealedBalance`] when the period is not sealed or
+    /// when the books no longer reproduce the seal's closing balance.
     pub fn prove_sealed_balance(
         &self,
         period: &PeriodId,
         key: BalanceKey,
-    ) -> Result<Option<SealedBalance<P>>, JournalError> {
+    ) -> Result<SealedBalanceOutcome<P>, JournalError> {
         let Some(seal) = self.seals.get(period).cloned() else {
             return Err(SealedBalanceError::NotSealed {
                 period: period.clone(),
@@ -2519,6 +2520,7 @@ mod tests {
             .journal
             .prove_sealed_balance(&id, b.cash_key())
             .expect("the books still reproduce the seal")
+            .into_proven()
             .expect("cash has a row");
         assert!(proven.verify());
         assert_eq!(proven.path().to_string(), "Assets:Cash");
@@ -2531,11 +2533,11 @@ mod tests {
             currency: Currency::USD,
             ..b.cash_key()
         };
-        assert!(
+        assert_eq!(
             b.journal
                 .prove_sealed_balance(&id, no_row)
-                .expect("no error")
-                .is_none()
+                .expect("no error"),
+            SealedBalanceOutcome::NoRow,
         );
 
         // An account onboarded after the seal is a different answer again.
@@ -2543,12 +2545,20 @@ mod tests {
             account: AccountId::from_index(2),
             ..b.cash_key()
         };
-        assert!(matches!(
-            b.journal.prove_sealed_balance(&id, later_account),
-            Err(JournalError::SealedBalance(
-                SealedBalanceError::NotYetRegistered { .. }
-            ))
-        ));
+        // An account onboarded after the seal is an *answer*, not an error: the
+        // books are intact and the seal simply cannot name it.
+        assert_eq!(
+            b.journal
+                .prove_sealed_balance(&id, later_account)
+                .expect("nothing is wrong with the books"),
+            SealedBalanceOutcome::NotYetRegistered,
+        );
+        assert!(
+            b.journal
+                .prove_sealed_balance(&id, later_account)
+                .expect("no error")
+                .is_absent()
+        );
 
         // And an unsealed period has nothing to prove.
         let ghost = PeriodId::new("2026-09").expect("valid");
@@ -2577,6 +2587,7 @@ mod tests {
             .journal
             .prove_sealed_balance(&id, b.cash_key())
             .expect("provable")
+            .into_proven()
             .expect("cash has a row");
 
         let json = serde_json::to_string(&proven).expect("serialises");

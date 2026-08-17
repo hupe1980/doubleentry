@@ -301,6 +301,14 @@ impl PeriodCalendar {
     /// The state matters: a sealed period that comes back open would accept
     /// postings into books that have already been committed to.
     ///
+    /// **The [watermark](Self#the-sealed-watermark) is restored with them**, in
+    /// any order and without a separate stored field. Each sealed period
+    /// advances it as it is defined, and it only ever moves forward, so
+    /// replaying a period table reconstructs it exactly. That is what makes a
+    /// restart durable: without it the first restart would reopen every gap the
+    /// seals had closed. [`Self::ensure`], which is the replay path a durable
+    /// backend actually takes, carries it across too.
+    ///
     /// # Errors
     ///
     /// Returns the same errors as [`PeriodCalendar::define`].
@@ -368,6 +376,11 @@ impl PeriodCalendar {
     /// closing balance a seal has already committed to. See the type-level
     /// documentation for why this is a property of the calendar rather than of
     /// the individual periods.
+    ///
+    /// Derived, never stored: each sealed period advances it as it is defined,
+    /// so [`from_periods`](Self::from_periods) and [`ensure`](Self::ensure)
+    /// reconstruct it from a period table and a restart keeps every gap the
+    /// seals had closed.
     #[must_use]
     pub fn sealed_through(&self) -> Option<Date> {
         self.sealed_through

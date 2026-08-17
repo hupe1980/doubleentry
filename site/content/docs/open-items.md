@@ -86,6 +86,24 @@ entry, and an entry-addressed cursor would skip whatever remained of it.
 `Journal::open_items` returns the whole list unpaged, as `Journal::statement`
 does — an in-memory journal already holds everything.
 
+When you need the whole set — allocating a payment across invoices, or totalling
+what an account has outstanding — `all_open_items` is the drain loop written
+once:
+
+```rust
+let every = store.all_open_items(receivable_key).await?;
+```
+
+It is unbounded on purpose: it is the read `open_items` is paged to avoid,
+offered because some questions have no bounded answer. Page when you are
+rendering; drain when a partial answer would be a wrong one.
+
+Note what a partial read does **not** cost, since it is the obvious worry: it
+cannot clear a newer item ahead of an older one. Pages come oldest first, so the
+first page *is* the oldest items and FIFO over it is correct FIFO. What it costs
+is completeness — a payment larger than the page's residuals under-allocates, and
+a total comes out short.
+
 ## The rules
 
 A clearing is refused unless all of these hold:

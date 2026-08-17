@@ -37,6 +37,7 @@ use crate::merkle::MerkleLog;
 use crate::money::{Amount, Currency};
 use crate::period::PeriodCalendar;
 use crate::posting::Layer;
+use crate::seal::SealedBalanceOutcome;
 use crate::storage::{Cursor, EntryBatch, LedgerStore, MAX_PAGE_SIZE, PostingCursor};
 use crate::{AccountId, Balanced};
 
@@ -932,7 +933,7 @@ pub async fn check_period_lifecycle_and_seals<const P: u8, S: LedgerStore<P>>(
     };
     for (key, balance) in closing.iter() {
         match store.prove_sealed_balance(&id, *key).await {
-            Ok(Some(proven)) => {
+            Ok(SealedBalanceOutcome::Proven(proven)) => {
                 if !proven.verify() {
                     return CheckResult::fail(
                         NAME,
@@ -963,11 +964,11 @@ pub async fn check_period_lifecycle_and_seals<const P: u8, S: LedgerStore<P>>(
                     );
                 }
             }
-            Ok(None) => {
+            Ok(absent) => {
                 return CheckResult::fail(
                     NAME,
                     format!(
-                        "{} is in the closing balance but could not be proven",
+                        "{} is in the closing balance but came back as {absent:?}",
                         key.account
                     ),
                 );

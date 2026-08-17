@@ -495,6 +495,66 @@ impl<const P: u8> BalanceProof<P> {
     }
 }
 
+/// What a period's seal can say about one account.
+///
+/// Three answers, and only the first carries a proof. The other two are answers
+/// rather than failures, which is why they are here and not in
+/// [`SealedBalanceError`]: the caller asked a well-formed question about books
+/// that are intact, and the honest reply is "nothing".
+///
+/// That distinction is load-bearing for a generic caller. A
+/// [`LedgerStore`](crate::LedgerStore)'s error type is the *backend's*, and it
+/// is only required to be `From<SealedBalanceError>` — there is no route back,
+/// so a "nothing to prove" case on the error path is unreachable through
+/// `S: LedgerStore<P>` and would have to be handled per backend.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum SealedBalanceOutcome<const P: u8> {
+    /// The account held this balance when the period closed, provably.
+    Proven(Box<SealedBalance<P>>),
+    /// The account was registered by then and has no row in the closing trial
+    /// balance.
+    ///
+    /// Not a balance of zero. An account with no postings has no row, and a
+    /// proof of one must not be manufactured.
+    NoRow,
+    /// The account had not been registered when the period sealed.
+    ///
+    /// A seal names the handles the registry had issued by then, so one
+    /// onboarded afterwards is not an account it can speak about at all.
+    NotYetRegistered,
+}
+
+impl<const P: u8> SealedBalanceOutcome<P> {
+    /// The proof, if there is one.
+    #[must_use]
+    pub fn proven(&self) -> Option<&SealedBalance<P>> {
+        match self {
+            Self::Proven(balance) => Some(balance),
+            _ => None,
+        }
+    }
+
+    /// Takes the proof, if there is one.
+    #[must_use]
+    pub fn into_proven(self) -> Option<SealedBalance<P>> {
+        match self {
+            Self::Proven(balance) => Some(*balance),
+            _ => None,
+        }
+    }
+
+    /// True when there is nothing to prove, for either reason.
+    ///
+    /// The common case a caller wants once: a report renders a blank either
+    /// way. Match the variants when the two need to read differently — "no
+    /// activity" and "not on the books yet" are different sentences.
+    #[must_use]
+    pub fn is_absent(&self) -> bool {
+        !matches!(self, Self::Proven(_))
+    }
+}
+
 /// A sealed balance, named, with everything needed to check it.
 ///
 /// The complete answer to *what did this account close a period at, and says
@@ -538,19 +598,20 @@ impl<const P: u8> SealedBalance<P> {
     ///    as it stands now.
     /// 3. That binding verifies under [`Seal::accounts`].
     ///
-    /// Returns `Ok(None)` when the key has no row in the closing trial balance.
-    /// That is not a balance of zero: an account with no postings has no row,
-    /// and a proof of one must not be manufactured.
+    /// The two "nothing to prove" answers come back as
+    /// [`SealedBalanceOutcome`] variants rather than errors — see there for why
+    /// that matters to a generic caller.
     ///
     /// # Errors
     ///
-    /// Returns [`SealedBalanceError`] for any of the three failures above.
+    /// Returns [`SealedBalanceError`] only when something is actually wrong:
+    /// the books no longer reproduce the seal, or the registry was renumbered.
     pub fn assemble(
         seal: Seal,
         closing: &TrialBalance<P>,
         accounts: &crate::account::AccountRegistry,
         key: BalanceKey,
-    ) -> Result<Option<Self>, SealedBalanceError> {
+    ) -> Result<SealedBalanceOutcome<P>, SealedBalanceError> {
         let commitment = TrialBalanceCommitment::of(closing);
         if commitment.head() != seal.trial_balance {
             return Err(SealedBalanceError::Restated {
@@ -558,21 +619,21 @@ impl<const P: u8> SealedBalance<P> {
             });
         }
         let Some(binding) = accounts.prove_binding_at(key.account, seal.accounts.size) else {
-            return Err(SealedBalanceError::NotYetRegistered {
-                period: seal.period,
-                account: key.account,
-            });
+            return Ok(SealedBalanceOutcome::NotYetRegistered);
         };
         if !binding.verify(&seal.accounts) {
             return Err(SealedBalanceError::RegistryMismatch {
                 period: seal.period,
             });
         }
-        Ok(commitment.prove(&key).map(|balance| Self {
-            seal,
-            balance,
-            binding,
-        }))
+        Ok(match commitment.prove(&key) {
+            Some(balance) => SealedBalanceOutcome::Proven(Box::new(Self {
+                seal,
+                balance,
+                binding,
+            })),
+            None => SealedBalanceOutcome::NoRow,
+        })
     }
 
     /// Re-checks the whole claim against the seal it carries.
@@ -623,18 +684,6 @@ pub enum SealedBalanceError {
     Restated {
         /// The period asked about.
         period: PeriodId,
-    },
-    /// The account had not been registered when the period was sealed.
-    ///
-    /// Distinct from having no balance: a seal names the handles the registry
-    /// had issued by then, and an account onboarded afterwards is not one it can
-    /// speak about at all.
-    #[error("account {account} was not registered when period {period} was sealed")]
-    NotYetRegistered {
-        /// The period asked about.
-        period: PeriodId,
-        /// The account asked about.
-        account: crate::account::AccountId,
     },
     /// The account bindings do not reproduce the seal's `accounts` head.
     ///

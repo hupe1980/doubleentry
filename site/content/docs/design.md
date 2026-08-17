@@ -112,9 +112,20 @@ cargo clippy --all-targets --all-features
 
 ## On changing the encoding
 
-Before the first release, a deliberate format revision means regenerating the
-golden vectors, because there are no ledgers in the world to be compatible with.
+The crate is published, and ledgers exist that were written by earlier versions.
+A deliberate format revision therefore means three things:
 
-After it, it means bumping the encoding version in the domain tag as well — so
-old bytes are never silently reinterpreted under a new format — and writing down
-how existing seals migrate.
+1. Regenerating the golden vectors — `just golden-emit` prints them.
+2. **Bumping the encoding version in the domain tag** for whatever moved, so a
+   root computed under the old rule and one computed under the new rule are not
+   both labelled `v1`.
+3. Writing down in the changelog what an existing ledger has to do — which is
+   rarely "nothing".
+
+Two revisions shipped without step 2 and are recorded rather than repaired: the
+entry encoding moved in `0.3.0` under `doubleentry/entry/v1`, and the
+account-binding leaf moved in `0.5.0` under `doubleentry/accountbinding/v1`.
+Neither can cause a misreading — the preimages differ in length, so verification
+fails rather than accepting the wrong thing — and re-tagging them now would break
+every ledger written since, to relabel a hash nobody can confuse. The rule binds
+from `0.6.0` on.

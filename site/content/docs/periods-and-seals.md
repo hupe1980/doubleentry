@@ -83,6 +83,23 @@ One rule, one place: `PeriodCalendar::check_sealable` is what the in-memory
 journal and every durable backend call, and the [conformance
 suite](@/docs/persistence.md) fails a backend that does not enforce it.
 
+### If you are adopting this into an existing ledger
+
+The watermark narrows what `record` accepts: **seal any period and every earlier
+date is closed**, including dates in gaps and in months the calendar never
+mentioned. Seal sparsely — annually, or only for audited years — and bookings are
+refused across ranges you never sealed, arriving as an ordinary
+`ValidationError::ClosedPeriod`.
+
+That is the correct rule, because those dates fold into a sealed cumulative
+closing balance. Corrections into a closed range book into an open period
+carrying `original_booking_date`, exactly as they always have.
+
+The watermark is **derived, never stored**: each sealed period advances it as it
+is defined, so `PeriodCalendar::from_periods` and `ensure` reconstruct it from a
+period table alone. A restart keeps every gap the seals had closed, with no
+extra column to persist and none to forget.
+
 ## What a seal commits to
 
 Three Merkle heads, and each answers a different question:
@@ -233,13 +250,24 @@ exists to leave the process that built it. The recipient holds the seal, the
 balance proof and the binding proof and checks all three with one `verify()`,
 having none of the books.
 
-Three answers are worth telling apart, and it does:
+Three answers are worth telling apart, and it does — with the two that are
+*answers* on the `Ok` side and only real failures on the error side:
 
-| Outcome | Meaning |
+| Result | Meaning |
 |---|---|
-| `Ok(None)` | The account is registered but has no row — *not* a balance of zero |
-| `NotYetRegistered` | The account was onboarded after the seal, so it cannot name it |
-| `Restated` | The books no longer reproduce the seal's closing balance |
+| `Ok(Proven(..))` | The account held this balance, provably |
+| `Ok(NoRow)` | Registered by then, no row — *not* a balance of zero |
+| `Ok(NotYetRegistered)` | Onboarded after the seal, so it cannot name the account |
+| `Err(Restated)` | The books no longer reproduce the seal's closing balance |
+
+`is_absent()` covers the two negatives at once for a caller that renders them the
+same; match the variants when "no activity" and "not on the books yet" need to
+read differently.
+
+Both negatives are on the `Ok` side for a concrete reason, not tidiness. A
+`LedgerStore`'s error type is the *backend's*, and is only required to be
+`From<SealedBalanceError>` — there is no route back, so an answer routed through
+the error path is unreachable from generic code over `S: LedgerStore<P>`.
 
 Note the fold it rebuilds with: a closing balance is cumulative by **booking
 date** (`trial_balance_through_date`), not a prefix of the log by position

@@ -61,6 +61,12 @@ enum Op {
     ResetClearing { which: usize },
     /// Close and seal the current period.
     SealPeriod,
+    /// Append an entry backdated into an earlier month.
+    ///
+    /// The operation that used to be able to restate a sealed period: a legal
+    /// booking whose date falls in a month a later seal already closed over,
+    /// including months the calendar never defined as periods.
+    AppendBackdated { amount: i64, month: u8, day: u8 },
     /// Fund the limited account, or try to draw against it.
     MoveLimited { amount: i64, into: bool },
     /// Impose or lift the limited account's balance limit.
@@ -75,7 +81,15 @@ fn op_strategy() -> impl Strategy<Value = Op> {
         3 => (0usize..32, 0usize..32, 1i64..1_000_000)
             .prop_map(|(debit, credit, amount)| Op::Clear { debit, credit, amount }),
         1 => (0usize..16).prop_map(|which| Op::ResetClearing { which }),
-        1 => Just(Op::SealPeriod),
+        // Weighted up: the interesting failures need *two* seals and then a
+        // backdated write, so a sequence that seals once proves little.
+        3 => Just(Op::SealPeriod),
+        // Days past the 28th matter: the sealed months are defined as 1–28, so
+        // 29–31 fall in a gap the calendar never covers. That gap reporting
+        // `Open` forever was half the defect — a booking there restates a
+        // sealed month without ever touching a defined period.
+        4 => (1i64..1_000_000, 1u8..7, 1u8..32)
+            .prop_map(|(amount, month, day)| Op::AppendBackdated { amount, month, day }),
         4 => (1i64..1_000_000, any::<bool>())
             .prop_map(|(amount, into)| Op::MoveLimited { amount, into }),
         1 => any::<bool>().prop_map(|on| Op::SetLimit { on }),
@@ -143,11 +157,15 @@ impl World {
     }
 
     fn build(&self, key: &[u8], amount: i64) -> Option<Entry<Draft, 2>> {
+        self.build_on(key, amount, date!(2026 - 06 - 15))
+    }
+
+    fn build_on(&self, key: &[u8], amount: i64, on: time::Date) -> Option<Entry<Draft, 2>> {
         Some(
             Entry::<Draft, 2>::new(
                 EntryId::generate(),
                 IdempotencyKey::new(key.to_vec()).ok()?,
-                date!(2026 - 06 - 15),
+                on,
             )
             .debit(self.left, Eur::from_minor(amount), Currency::EUR)
             .credit(self.right, Eur::from_minor(amount), Currency::EUR),
@@ -336,6 +354,24 @@ impl World {
                     .expect("the account is registered");
             }
 
+            Op::AppendBackdated { amount, month, day } => {
+                let Ok(month) = time::Month::try_from(*month) else {
+                    return;
+                };
+                let Ok(on) = time::Date::from_calendar_date(2026, month, *day) else {
+                    return;
+                };
+                let key = self.key();
+                if let Some(entry) = self.build_on(&key, *amount, on) {
+                    let id = entry.id();
+                    // Refused is the expected answer once the books are sealed
+                    // through that date; accepted is fine while they are not.
+                    if self.journal.record(entry).is_ok() {
+                        self.all_ids.push(id);
+                    }
+                }
+            }
+
             Op::SealPeriod => {
                 let name = format!("2026-{:02}", self.sealed + 1);
                 let Ok(id) = PeriodId::new(name) else {
@@ -429,6 +465,53 @@ impl World {
             self.journal
                 .verify_checkpoint(&empty)
                 .expect("an empty-prefix checkpoint must stay valid");
+        }
+
+        // Every seal still describes the books. This is the invariant a seal
+        // actually asserts — that its closing balances fold every entry booked
+        // on or before the period's last day — and it is the one that used to
+        // break silently: sealing out of order, or booking into a gap the
+        // calendar never defined, restated a sealed period while the seal, its
+        // proofs and the chain all went on verifying.
+        for seal in self.journal.seals().seals() {
+            let period = self
+                .journal
+                .calendar()
+                .get(&seal.period)
+                .expect("a sealed period stays defined");
+            let recomputed = self
+                .journal
+                .trial_balance_through_date(period.end)
+                .expect("no overflow");
+            assert_eq!(
+                doubleentry::seal::trial_balance_head(&recomputed),
+                seal.trial_balance,
+                "period {} was restated after it was sealed",
+                seal.period
+            );
+        }
+
+        // And nothing may sit at or before the watermark that was not there
+        // when it moved — the rule that keeps the above true.
+        if let Some(through) = self.journal.calendar().sealed_through() {
+            let sealed_indices: Vec<u64> = self
+                .journal
+                .seals()
+                .seals()
+                .iter()
+                .filter_map(|s| s.tree_head.size.checked_sub(1))
+                .collect();
+            let high_water = sealed_indices.iter().copied().max().unwrap_or(0);
+            for (i, entry) in self.journal.entries().iter().enumerate() {
+                if entry.booking_date() <= through {
+                    assert!(
+                        i as u64 <= high_water,
+                        "entry {i} was booked on {} — at or before the sealed \
+                         watermark of {through} — after the last seal was taken",
+                        entry.booking_date()
+                    );
+                }
+            }
         }
 
         // Residuals are bounded by the postings they belong to.

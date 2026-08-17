@@ -53,12 +53,16 @@ let registry = AccountRegistry::from_records(store.accounts().await?)?;
 // for path in my_chart { registry.register_path(path, opened)?; }
 ```
 
-`AccountRegistry::commitment` is a Merkle root over every handle-to-account
+`AccountRegistry::commitment` is a Merkle head over every handle-to-path
 binding, in handle order. Two registries agree on it only if they agree on every
-account *and* on the handle each was issued — which is what lets a seal pin the
+path *and* on the handle each was issued — which is what lets a seal pin the
 handle space it committed to, and what lets one balance be
 [named to an auditor](@/docs/periods-and-seals.md) without disclosing the
 rest of the chart.
+
+The leaf covers the handle and the path and **nothing else**. That is the
+account's identity, and precisely the part that never changes. Master data is
+out of it, deliberately — see below.
 
 ## Master data changes; postings do not
 
@@ -81,9 +85,28 @@ for record in journal.account_records() {
 }
 ```
 
-Note that master data is *outside* the entry log. Changing it moves the registry
-commitment, so seals issued before the change no longer match the registry as it
-stands now — which is correct: they attest to the accounts as they were.
+Master data is *outside* the entry log, and it is also outside the registry
+commitment. That is load-bearing rather than incidental: `kind`, the open window
+and the balance limit are mutable by design, so hashing them into the binding
+leaf would mean that closing an account on a Tuesday retroactively invalidated
+every binding proof against every seal ever issued — a routine operation reading
+as evidence of tampering.
+
+So closing an account does not move the commitment, and a proof taken before the
+change still verifies after it. What *does* move it is a change to identity:
+re-registering the same paths in a different order renumbers every handle, the
+head changes, and the seal that named the old numbering stops matching. Which is
+the alteration the commitment exists to expose.
+
+Because the registry still **grows**, a proof against a seal must be built at the
+size the seal recorded:
+
+```rust
+let binding = journal
+    .accounts()
+    .prove_binding_at(cash, seal.accounts.size)
+    .expect("issued by then");
+```
 
 ## Balance limits
 

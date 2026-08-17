@@ -236,6 +236,12 @@ does not verify at all. A sealed period is terminal: a correction books into a l
 period carrying the original date, which is the only treatment compatible with a log that has
 already been committed to.
 
+The closing balance is *cumulative* through the period's last day, so sealing also moves a
+**watermark** that shuts every date below it — including one no period covers — and periods
+must be sealed in date order. Otherwise an ordinary booking into an earlier open period, or
+into a gap the calendar never defined, would restate a sealed balance while every seal, proof
+and chain went on verifying.
+
 ```rust
 # use doubleentry::{Amount, BalanceKey, Currency, Entry, EntryId, IdempotencyKey, Journal, Layer};
 # use doubleentry::period::{LedgerId, Period, PeriodId, PeriodState};
@@ -256,15 +262,25 @@ journal.define_period(Period::new(march.clone(), date!(2026-03-01), date!(2026-0
 journal.transition_period(&march, PeriodState::Closing)?;
 let seal = journal.seal_period(&march)?;
 
+// The books are now shut through March — February included, though no period
+// ever covered it. Nothing below the watermark can restate what was sealed.
+assert_eq!(journal.calendar().sealed_through(), Some(date!(2026-03-31)));
+assert!(!journal.calendar().accepts(date!(2026-02-10)));
+
 // An auditor holding only the seal can be shown one closing balance — and be
 // told which account it is — without seeing any other account or entry.
 # let closing = journal.trial_balance_through_date(date!(2026-03-31))?;
 # let key = BalanceKey { account: cash, currency: Currency::EUR, layer: Layer::Settled };
 let balance = TrialBalanceCommitment::of(&closing).prove(&key).expect("cash was posted to");
-let binding = journal.accounts().prove_binding(cash).expect("registered");
+// `_at`, because the registry has moved on since the seal — new accounts, a
+// closure, a tightened limit — and the seal names the commitment it had then.
+let binding = journal
+    .accounts()
+    .prove_binding_at(cash, seal.accounts.size)
+    .expect("issued by then");
 
 assert!(balance.verify_naming(&binding, &seal));
-assert_eq!(binding.account().path.to_string(), "Assets:Cash");
+assert_eq!(binding.path().to_string(), "Assets:Cash");
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
@@ -272,6 +288,20 @@ The trial balance is keyed on account **handles** — dense integers, cheap to c
 `Seal::accounts` is what says which account each handle is, so renumbering the registry after
 the fact cannot leave a seal verifying while its balances quietly mean something else. Both are
 stored as Merkle **heads**, size and root together, because a proof is checked against both.
+
+The binding leaf covers the handle and the path — the account's *identity*, and the only part
+of it that never changes. Master data (`kind`, the open window, the balance limit) is out, so
+closing an account does not retroactively invalidate every proof against every earlier seal.
+
+Behind a `LedgerStore` this is one call, which is worth preferring: assembled by hand the
+recipe has five steps and only one of them matters — checking your rebuilt commitment against
+the one the seal recorded — and it is the step nothing forces.
+
+```rust,ignore
+let proven = store.prove_sealed_balance(&march, cash_key).await?.expect("has a row");
+assert!(proven.verify());
+assert_eq!(proven.path().to_string(), "Assets:Cash");
+```
 
 → [Periods and seals](https://hupe1980.github.io/doubleentry/docs/periods-and-seals/)
 

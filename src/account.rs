@@ -343,8 +343,10 @@ pub enum BalanceLimit {
 impl BalanceLimit {
     /// True when `balance` satisfies this limit.
     ///
-    /// An overflow computing the net counts as a breach: an account whose totals
-    /// cannot be netted is not one this limit can vouch for.
+    /// Decided by comparing the gross totals rather than by netting them, which
+    /// is the same question — the net crosses zero exactly when the totals cross
+    /// each other — and is total: there is no subtraction to overflow, so no
+    /// balance exists that this cannot answer for.
     #[must_use]
     pub fn permits<const P: u8>(self, balance: &Balance<P>) -> bool {
         match self {
@@ -523,33 +525,60 @@ impl Canonical for AccountRecord {
 
 /// The leaf one handle-to-account binding hashes to.
 ///
-/// Covers the handle and the whole account — path, kind, and open window — so a
-/// registry that reopened a closed account, or moved a path to a different
-/// handle, produces a different commitment.
+/// Covers the handle and the path, and **nothing else**.
+///
+/// Those two are exactly the account's identity, and exactly the fields that
+/// never change: [`AccountRegistry::restore`] refuses to move a path onto a
+/// handle that already holds a different one, because a rebound handle would
+/// repoint every posting row and every sealed balance that names it.
+///
+/// The classification, the open window and the balance limit are deliberately
+/// *out*. They are master data — the registry's own mutators
+/// ([`AccountRegistry::close`], [`AccountRegistry::reopen`],
+/// [`AccountRegistry::set_limit`]) exist to change them, and they govern what
+/// may be booked next rather than what was booked already. Hashing them in made
+/// the commitment move every time an account was legitimately closed, which
+/// retroactively invalidated every binding proof against every earlier seal:
+/// a normal Tuesday afternoon read as evidence of tampering.
+///
+/// This is the same rule the crate already applies to entries — an entry stays
+/// readable after its account closes, because validation is about what may be
+/// written next, not about what was written. A seal names handles; it is not a
+/// snapshot of the chart of accounts.
 #[must_use]
-pub fn account_binding_leaf(record: &AccountRecord) -> Hash {
+pub fn account_binding_leaf(id: AccountId, path: &AccountPath) -> Hash {
     let mut w = CanonicalWriter::new();
-    record.encode(&mut w);
+    w.u32(id.index());
+    path.encode(&mut w);
     tagged(tag::ACCOUNT_BINDING_V1, &w.finish())
 }
 
-/// Proof that a handle was issued to a particular account.
+/// Proof that a handle was issued to a particular account path.
 ///
-/// Self-contained: it carries the binding as well as the path, so a verifier
-/// needs nothing but this and an [`AccountRegistry::commitment`] — which a
-/// [`Seal`](crate::Seal) publishes as
-/// [`accounts`](crate::Seal::accounts).
+/// Self-contained: it carries the binding it proves, so a verifier needs nothing
+/// but this and an [`AccountRegistry::commitment`] — which a
+/// [`Seal`](crate::Seal) publishes as [`accounts`](crate::Seal::accounts).
 ///
 /// This is what makes a sealed balance legible. A
 /// [`BalanceProof`](crate::BalanceProof) proves that handle `#7` held a
 /// balance; on its own that is a statement about an integer. Pairing it with
 /// this proof, against the same seal, turns it into a statement about
 /// `Assets:Cash` — without disclosing any other account, balance, or entry.
+///
+/// It carries the handle and the path and no other account field, because those
+/// are the only ones it establishes. An earlier revision carried the whole
+/// [`Account`], of which the proof vouched for everything; the leaf then moved
+/// whenever master data did, so historical proofs stopped verifying. Returning
+/// fields a proof does not cover would be the opposite mistake — a verifier
+/// reading `closed_on` off a "verified" proof would be reading whatever the
+/// prover put there.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct AccountBindingProof {
-    /// The handle and the account it names.
-    pub record: AccountRecord,
+    /// The handle being proven.
+    pub id: AccountId,
+    /// The path that handle was issued to.
+    pub path: AccountPath,
     /// Path from the binding's leaf up to the registry commitment.
     pub proof: InclusionProof,
 }
@@ -558,13 +587,13 @@ impl AccountBindingProof {
     /// The handle being proven.
     #[must_use]
     pub fn id(&self) -> AccountId {
-        self.record.id
+        self.id
     }
 
-    /// The account the handle names.
+    /// The account path the handle names.
     #[must_use]
-    pub fn account(&self) -> &Account {
-        &self.record.account
+    pub fn path(&self) -> &AccountPath {
+        &self.path
     }
 
     /// Verifies the binding against an [`AccountRegistry::commitment`].
@@ -576,10 +605,10 @@ impl AccountBindingProof {
     pub fn verify(&self, accounts: &TreeHead) -> bool {
         // The handle *is* the leaf index, so a proof for one binding cannot be
         // replayed at another position without failing here.
-        self.proof.leaf_index == u64::from(self.record.id.index())
+        self.proof.leaf_index == u64::from(self.id.index())
             && self
                 .proof
-                .verify(&account_binding_leaf(&self.record), accounts)
+                .verify(&account_binding_leaf(self.id, &self.path), accounts)
     }
 }
 
@@ -886,10 +915,22 @@ impl AccountRegistry {
     /// Leaves are in handle order, so a handle is its own leaf index — which is
     /// what makes [`AccountRegistry::prove_binding`] a direct lookup.
     fn binding_log(&self) -> MerkleLog {
-        MerkleLog::from_leaves(self.records().iter().map(account_binding_leaf).collect())
+        MerkleLog::from_leaves(
+            self.accounts
+                .iter()
+                .enumerate()
+                .map(|(i, account)| {
+                    account_binding_leaf(
+                        AccountId(u32::try_from(i).unwrap_or(u32::MAX)),
+                        &account.path,
+                    )
+                })
+                .collect(),
+        )
     }
 
-    /// Proves which account a handle was issued to.
+    /// Proves which account a handle was issued to, against the registry as it
+    /// stands now.
     ///
     /// The companion to a [`BalanceProof`](crate::BalanceProof). That proof
     /// establishes what handle `#7` held; this one establishes that `#7` is
@@ -897,18 +938,77 @@ impl AccountRegistry {
     /// balance a self-describing claim, checkable by someone who holds neither
     /// the trial balance nor the chart of accounts.
     ///
+    /// To check against a seal taken earlier, use
+    /// [`prove_binding_at`](Self::prove_binding_at): a registry that has since
+    /// issued even one more handle has a different commitment, and a proof
+    /// against the current one will not verify under the seal's.
+    ///
     /// Returns `None` when the handle is not registered.
     #[must_use]
     pub fn prove_binding(&self, id: AccountId) -> Option<AccountBindingProof> {
-        let record = AccountRecord {
-            id,
-            account: self.get(id)?.clone(),
-        };
-        let proof = self
-            .binding_log()
+        self.prove_binding_at(id, self.len() as u64)
+    }
+
+    /// Proves a binding against the commitment the registry had at `size`.
+    ///
+    /// The registry's counterpart to
+    /// [`MerkleLog::inclusion_proof_at`](crate::MerkleLog::inclusion_proof_at),
+    /// and needed for the same reason: a [`Seal`](crate::Seal) records the
+    /// commitment as it stood when the period closed, and the registry has
+    /// grown since. Pass [`Seal::accounts`](crate::Seal::accounts)`.size` and
+    /// the proof will verify under [`Seal::accounts`](crate::Seal::accounts).
+    ///
+    /// This is exact rather than approximate because the leaf covers only the
+    /// handle and the path. Handles are dense and issued in order and a path is
+    /// never rebound, so the first `size` bindings are *the* bindings the
+    /// registry held at that size — master data may have moved since and it
+    /// does not matter, because the commitment never covered it.
+    ///
+    /// ```
+    /// # use doubleentry::{AccountRegistry, AccountId};
+    /// # use time::macros::date;
+    /// let mut registry = AccountRegistry::new();
+    /// let cash = registry.register_path("Assets:Cash", date!(2026-01-01))?;
+    /// registry.register_path("Income:Sales", date!(2026-01-01))?;
+    /// let sealed = registry.commitment();
+    ///
+    /// // The books move on: a new account, and the old one closes.
+    /// registry.register_path("Assets:Bank", date!(2026-04-01))?;
+    /// registry.close(cash, date!(2026-04-30))?;
+    ///
+    /// // The binding as of the seal still proves.
+    /// let binding = registry.prove_binding_at(cash, sealed.size).expect("issued by then");
+    /// assert!(binding.verify(&sealed));
+    /// assert_eq!(binding.path().to_string(), "Assets:Cash");
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    ///
+    /// Returns `None` when `size` is beyond the registry, or when the handle had
+    /// not been issued by then — which is the honest answer: an account the
+    /// registry had not reached is not one that seal can name.
+    #[must_use]
+    pub fn prove_binding_at(&self, id: AccountId, size: u64) -> Option<AccountBindingProof> {
+        let n = usize::try_from(size).ok()?;
+        if n > self.accounts.len() || usize::try_from(id.index()).ok()? >= n {
+            return None;
+        }
+        let path = self.get(id)?.path.clone();
+        let leaves = self
+            .accounts
+            .get(..n)?
+            .iter()
+            .enumerate()
+            .map(|(i, account)| {
+                account_binding_leaf(
+                    AccountId(u32::try_from(i).unwrap_or(u32::MAX)),
+                    &account.path,
+                )
+            })
+            .collect();
+        let proof = MerkleLog::from_leaves(leaves)
             .inclusion_proof(u64::from(id.index()))
             .ok()?;
-        Some(AccountBindingProof { record, proof })
+        Some(AccountBindingProof { id, path, proof })
     }
 
     /// Handles of every account at or below `prefix`, in path order.
@@ -1135,13 +1235,13 @@ mod tests {
         for (id, account) in r.iter() {
             let proof = r.prove_binding(id).expect("registered");
             assert!(proof.verify(&root), "binding for {id} must prove");
-            assert_eq!(proof.account().path, account.path);
+            assert_eq!(*proof.path(), account.path);
         }
         assert!(r.prove_binding(AccountId::from_index(99)).is_none());
     }
 
     #[test]
-    fn a_binding_proof_does_not_survive_an_edit_to_the_account() {
+    fn a_binding_proof_pins_the_path_and_the_handle() {
         let mut r = reg();
         let id = r
             .register_path("Assets:Cash", date!(2026 - 01 - 01))
@@ -1154,14 +1254,85 @@ mod tests {
 
         // Claiming a different path under the same handle.
         let mut renamed = proof.clone();
-        renamed.record.account.path = AccountPath::parse("Assets:Slush").expect("valid");
+        renamed.path = AccountPath::parse("Assets:Slush").expect("valid");
         assert!(!renamed.verify(&root));
 
-        // Claiming the account was open longer than it was.
-        let mut reopened = proof;
-        reopened.record.account.closed_on = None;
-        reopened.record.account.opened_on = date!(2020 - 01 - 01);
-        assert!(!reopened.verify(&root));
+        // Claiming a different handle for the same path.
+        let mut moved = proof;
+        moved.id = AccountId::from_index(1);
+        assert!(!moved.verify(&root));
+    }
+
+    #[test]
+    fn master_data_does_not_move_the_binding_commitment() {
+        // The property the whole seal-naming path depends on. Closing an account
+        // or tightening its limit is an ordinary Tuesday — the registry's own
+        // mutators exist to do it — and it must not retroactively invalidate
+        // every binding proof against every seal ever issued.
+        let mut r = reg();
+        let id = r
+            .register_path("Assets:Cash", date!(2026 - 01 - 01))
+            .expect("registers");
+        r.register_path("Income:Sales", date!(2026 - 01 - 01))
+            .expect("registers");
+
+        let sealed = r.commitment();
+        let proof = r.prove_binding(id).expect("registered");
+        assert!(proof.verify(&sealed));
+
+        r.close(id, date!(2026 - 06 - 30)).expect("registered");
+        r.set_limit(id, BalanceLimit::NoCreditBalance)
+            .expect("registered");
+        assert_eq!(r.commitment(), sealed, "master data is not identity");
+        assert!(
+            proof.verify(&sealed),
+            "a proof taken before the change must still hold"
+        );
+        assert!(
+            r.prove_binding(id).expect("registered").verify(&sealed),
+            "and one taken after must hold against the same head"
+        );
+    }
+
+    #[test]
+    fn a_binding_proves_against_the_commitment_the_registry_had_at_a_size() {
+        // What a seal actually needs. `Seal::accounts` is the commitment as it
+        // stood when the period closed; the registry has grown since, and a
+        // proof against the current one does not verify under it.
+        let mut r = reg();
+        let mut sealed_at = Vec::new();
+        for i in 0..9u32 {
+            r.register_path(&format!("Assets:A{i}"), date!(2026 - 01 - 01))
+                .expect("registers");
+            sealed_at.push(r.commitment());
+        }
+
+        for (i, head) in sealed_at.iter().enumerate() {
+            let issued_by_then = u32::try_from(i).expect("small") + 1;
+            for handle in 0..issued_by_then {
+                let id = AccountId::from_index(handle);
+                let binding = r
+                    .prove_binding_at(id, head.size)
+                    .expect("issued by that size");
+                assert!(
+                    binding.verify(head),
+                    "handle {handle} under size {}",
+                    head.size
+                );
+                // And it is worthless against any other size's head.
+                for other in sealed_at.iter().filter(|h| h.size != head.size) {
+                    assert!(!binding.verify(other));
+                }
+            }
+            // A handle the registry had not reached is not one that head names.
+            assert!(
+                r.prove_binding_at(AccountId::from_index(issued_by_then), head.size)
+                    .is_none()
+            );
+        }
+
+        // Beyond the registry entirely.
+        assert!(r.prove_binding_at(AccountId::from_index(0), 99).is_none());
     }
 
     #[test]
@@ -1196,9 +1367,12 @@ mod tests {
     }
 
     #[test]
-    fn a_limit_is_part_of_what_the_account_is() {
-        // The limit is inside the binding commitment, so relaxing one after the
-        // fact cannot pass unnoticed by a seal that named the account.
+    fn a_limit_is_master_data_and_not_identity() {
+        // A limit governs what may be booked next, so it is mutable by design —
+        // and therefore must stay *out* of the binding commitment. Hashing it in
+        // meant that tightening a limit invalidated every binding proof against
+        // every seal already issued, which is a routine operation reading as
+        // evidence of tampering.
         let mut r = reg();
         let id = r
             .register_path("Assets:Cash", date!(2026 - 01 - 01))
@@ -1207,7 +1381,7 @@ mod tests {
         r.set_limit(id, BalanceLimit::NoCreditBalance)
             .expect("registered");
         assert_eq!(r.limit_of(id), BalanceLimit::NoCreditBalance);
-        assert_ne!(r.commitment(), before);
+        assert_eq!(r.commitment(), before);
 
         assert!(matches!(
             r.set_limit(AccountId::from_index(9), BalanceLimit::Unlimited),

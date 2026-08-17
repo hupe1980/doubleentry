@@ -36,6 +36,56 @@ assert_eq!(open[0].residual, Eur::parse("600.00")?);        // invoice partly se
 Because it is assignment rather than movement, the trial balance before and after
 a clearing is identical.
 
+## Open items come back oldest first
+
+FIFO — apply this payment to the oldest open invoice — is what open items are
+*for*, so the list is in **log order**: the order the entries were recorded.
+
+That is the same answer this crate gives to ordering everywhere else, and it is
+deliberately not the obvious alternative of sorting by `PostingRef`, which orders
+by entry **identifier**. Identity is supplied by the caller — the engine never
+generates one on the deterministic path — so identifier order is chronological
+only when the caller happens to use `EntryId::generate()`, whose UUIDv7 values
+are time-ordered. Bring your own identifiers and that ordering silently becomes
+arbitrary, which is the worst kind: it looks right in testing.
+
+```rust
+let open = journal.open_items(&receivable_key)?;
+// open[0] is the oldest still-outstanding posting on this account.
+```
+
+`ClearingRegister::open_items` therefore imposes no order at all — it returns
+candidates in the order it was given them, because it knows nothing about the
+log and cannot honestly claim age. Supplying them in log order is the job of
+whatever *does* know: the journal and every backend do, and the conformance
+suite checks it.
+
+## Over a store, they are paged
+
+An account invoiced against for a decade is not a response body, so a durable
+store pages open items exactly as it pages a statement — same log order, same
+`PostingCursor`:
+
+```rust
+let mut cursor = Some(PostingCursor::start().with_limit(100));
+while let Some(c) = cursor {
+    let page = store.open_items(receivable_key, c).await?;
+    for item in &page.items { /* … */ }
+    cursor = page.next;
+}
+```
+
+They are the filtered and unfiltered views of the same postings, so they read
+alike. Each `OpenItem` carries its `position` — a `PostingPosition`, the entry's
+log index paired with the posting's index within it — which is both what the
+list is ordered by and what the next page resumes after.
+
+That pairing is why the cursor is not a plain log index: one entry may leave
+*several* postings open on one account, so a page boundary can fall inside an
+entry, and an entry-addressed cursor would skip whatever remained of it.
+`Journal::open_items` returns the whole list unpaged, as `Journal::statement`
+does — an in-memory journal already holds everything.
+
 ## The rules
 
 A clearing is refused unless all of these hold:

@@ -17,9 +17,27 @@
 //!    actually written* is computed from those entries.
 //! 3. That root is compared against the seal. **A mismatch aborts and deletes
 //!    nothing.**
-//! 4. Only then may the operational store drop the rows.
+//! 4. Only then *may* the operational store drop the rows — and this crate never
+//!    does it for you, because retention is a decision with legal weight.
 //!
 //! The precise claim is that *content* is immutable and *location* is not.
+//!
+//! # What pruning costs
+//!
+//! Step 4 is optional, and it is not free. A store's inclusion and consistency
+//! proofs are built from the leaves it holds, so removing a prefix renumbers
+//! every leaf after it and the store can no longer build a proof for **any**
+//! entry — not just the archived ones. The tree head is unaffected, since it is
+//! read from the last row's stored root, so the two would disagree silently.
+//!
+//! The SQL backends therefore check that the log they read back is dense from
+//! zero and refuse with a `LogNotDense` error naming the hole. Proofs over an
+//! archived period come from the archive and its seal after that; the seal is in
+//! the snapshot summary precisely so they can.
+//!
+//! Keeping the rows is the default for a reason. Compaction is worth doing on
+//! its own — a queryable columnar mirror that any engine can read — and pruning
+//! is a separate decision you make afterwards, if at all.
 //!
 //! # The seal travels with the data
 //!

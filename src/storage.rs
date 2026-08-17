@@ -36,7 +36,7 @@ use time::Date;
 use crate::account::{AccountId, AccountRecord};
 use crate::balance::{Balance, BalanceKey, TrialBalance};
 use crate::checkpoint::Checkpoint;
-use crate::clearing::{Clearing, ClearingId, OpenItem};
+use crate::clearing::{Clearing, ClearingId, OpenItem, PostingPosition};
 use crate::entry::{Balanced, Entry, EntryId};
 use crate::hash::Hash;
 use crate::journal::{Journal, JournalError, LogIndex, NotSequenced, Recorded};
@@ -44,7 +44,7 @@ use crate::merkle::{ConsistencyProof, InclusionProof, TreeHead};
 use crate::money::Currency;
 use crate::period::{LedgerId, Period, PeriodId, PeriodState};
 use crate::posting::Layer;
-use crate::seal::Seal;
+use crate::seal::{Seal, SealedBalance, SealedBalanceError};
 
 pub mod conformance;
 
@@ -221,7 +221,16 @@ impl<const P: u8> Page<P> {
 /// Implementations must guarantee all of the following. The [`conformance`]
 /// suite checks each one.
 ///
-/// 1. **Append-only.** Recorded entries are never modified or removed.
+/// 1. **Append-only.** Recorded entries are never modified, and the store never
+///    removes one of its own accord.
+///
+///    An operator may still prune a prefix that has been archived to a
+///    [cold tier](iceberg) — that is a retention decision with legal weight and
+///    no library should make it for you. What it costs is worth knowing before
+///    you make it: proofs are built from the stored leaves, so a hole renumbers
+///    every leaf after it and the store can no longer build *any* inclusion or
+///    consistency proof. The SQL backends detect the hole and name it rather
+///    than returning a proof for the wrong entry.
 /// 2. **Atomic batches.** Every entry in a batch lands, or none does.
 /// 3. **Idempotent.** Re-appending an entry whose idempotency key is already
 ///    present with identical content is a no-op returning the original outcome.
@@ -249,6 +258,12 @@ impl<const P: u8> Page<P> {
 ///    handle in the trial-balance root floating, so renumbering the accounts
 ///    table would keep the chain verifying while every balance in it referred to
 ///    a different account.
+/// 9. **Periods seal in date order.** A seal's closing balance is cumulative
+///    through its period's last day, so sealing one while an earlier period is
+///    still open would let an ordinary later booking restate it — with the seal,
+///    its proofs and the whole chain still verifying. Enforce it with
+///    [`PeriodCalendar::check_sealable`](crate::PeriodCalendar::check_sealable)
+///    rather than by hand, so every backend applies the same rule.
 ///
 /// # Sequencing
 ///
@@ -261,7 +276,18 @@ impl<const P: u8> Page<P> {
 /// is a no-op for backends that need none.
 pub trait LedgerStore<const P: u8>: Send + Sync {
     /// The backend's failure type.
-    type Error: std::error::Error + Send + Sync + 'static;
+    ///
+    /// It must be able to carry a [`SealedBalanceError`] and an
+    /// [`AccountError`](crate::account::AccountError), because
+    /// [`prove_sealed_balance`](Self::prove_sealed_balance) is part of the
+    /// contract and both are answers it has to be able to give. Deriving
+    /// `thiserror::Error` with two `#[from]` variants covers it.
+    type Error: std::error::Error
+        + Send
+        + Sync
+        + 'static
+        + From<crate::seal::SealedBalanceError>
+        + From<crate::account::AccountError>;
 
     /// The ledger this handle serves.
     ///
@@ -348,6 +374,24 @@ pub trait LedgerStore<const P: u8>: Send + Sync {
         size: Option<u64>,
     ) -> impl Future<Output = Result<TrialBalance<P>, Self::Error>> + Send;
 
+    /// The trial balance over everything booked on or before `end`.
+    ///
+    /// Folds by **booking date**, not by log position, and that is the whole
+    /// distinction: [`trial_balance`](Self::trial_balance) takes a prefix of the
+    /// log in *recording* order, while a period's closing balance is cumulative
+    /// through its last day. Sealing March in April is the normal case, so at
+    /// the moment a seal is taken the log already holds April entries and the
+    /// two answers differ.
+    ///
+    /// This is what [`Seal::trial_balance`] commits to, which makes it the only
+    /// way to rebuild a seal's commitment and prove a row out of it — see
+    /// [`prove_sealed_balance`](Self::prove_sealed_balance), which does that for
+    /// you and checks the rebuild against the seal.
+    fn trial_balance_through_date(
+        &self,
+        end: Date,
+    ) -> impl Future<Output = Result<TrialBalance<P>, Self::Error>> + Send;
+
     /// The tree head as of an earlier size.
     ///
     /// What an auditor checks an archived head against, and what the historical
@@ -373,6 +417,11 @@ pub trait LedgerStore<const P: u8>: Send + Sync {
     ) -> impl Future<Output = Result<InclusionProof, Self::Error>> + Send;
 
     /// Proves the log at `old_size` is a prefix of the current log.
+    ///
+    /// A proof from `old_size == 0` is **vacuous** — every log extends the empty
+    /// tree, so it constrains nothing about the newer one and verifies against
+    /// any root at the right size. See
+    /// [`ConsistencyProof::is_vacuous`](crate::ConsistencyProof::is_vacuous).
     fn prove_consistency(
         &self,
         old_size: u64,
@@ -382,6 +431,11 @@ pub trait LedgerStore<const P: u8>: Send + Sync {
     ///
     /// The general form, for two auditors holding different archived heads and
     /// neither holding the current one.
+    ///
+    /// A proof from `old_size == 0` is **vacuous** — every log extends the empty
+    /// tree, so it constrains nothing about the newer one and verifies against
+    /// any root at the right size. See
+    /// [`ConsistencyProof::is_vacuous`](crate::ConsistencyProof::is_vacuous).
     fn prove_consistency_between(
         &self,
         old_size: u64,
@@ -433,6 +487,51 @@ pub trait LedgerStore<const P: u8>: Send + Sync {
     /// Every seal recorded, oldest first.
     fn seals(&self) -> impl Future<Output = Result<Vec<Seal>, Self::Error>> + Send;
 
+    /// Proves what one account closed a sealed period at, and names it.
+    ///
+    /// The whole § 147-AO-shaped answer in one call: find the seal, rebuild the
+    /// closing trial balance the way the seal built it, **check the rebuild
+    /// against the seal**, prove the row, and prove the handle binding against
+    /// the registry commitment the seal recorded.
+    ///
+    /// The check in the middle is the reason this exists. Assembled by hand it
+    /// is five steps of which only one matters, and it is the one nothing forces
+    /// — skip it and you get a proof that verifies against a commitment you just
+    /// computed yourself: internally consistent, and evidence of nothing. Here
+    /// a mismatch is [`SealedBalanceError::Restated`] and no proof comes back.
+    ///
+    /// Returns `Ok(None)` when the account has no row in that period's closing
+    /// trial balance. That is not a balance of zero — an account with no
+    /// postings has no row, and a proof of one must not be manufactured.
+    ///
+    /// Backends inherit this; there is nothing to implement.
+    fn prove_sealed_balance(
+        &self,
+        period: &PeriodId,
+        key: BalanceKey,
+    ) -> impl Future<Output = Result<Option<SealedBalance<P>>, Self::Error>> + Send {
+        let period = period.clone();
+        async move {
+            let Some(seal) = self.seals().await?.into_iter().find(|s| s.period == period) else {
+                return Err(SealedBalanceError::NotSealed { period }.into());
+            };
+            let Some(definition) = self
+                .periods()
+                .await?
+                .into_iter()
+                .find(|p| p.id == seal.period)
+            else {
+                return Err(SealedBalanceError::UndefinedPeriod { period }.into());
+            };
+
+            // One recipe, one place: `SealedBalance::assemble` is what the
+            // in-memory journal calls too, so a backend cannot drift from it.
+            let closing = self.trial_balance_through_date(definition.end).await?;
+            let accounts = crate::account::AccountRegistry::from_records(self.accounts().await?)?;
+            Ok(SealedBalance::assemble(seal, &closing, &accounts, key)?)
+        }
+    }
+
     /// Records that a set of postings offset one another.
     fn clear(&self, clearing: Clearing<P>) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
@@ -443,11 +542,21 @@ pub trait LedgerStore<const P: u8>: Send + Sync {
         on: Date,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
-    /// Postings on an account with something still outstanding.
+    /// Postings on an account with something still outstanding, oldest first.
+    ///
+    /// Paged for the same reason a statement is: an account that has been
+    /// invoiced against for a decade is not a response body. It is the filtered
+    /// view of the same postings a statement lists unfiltered, in the same log
+    /// order and behind the same [`PostingCursor`], so the two read alike.
+    ///
+    /// Oldest first is not a convenience: FIFO — apply this payment to the
+    /// oldest open invoice — is what open items are for. "Oldest" is log order,
+    /// never entry-identifier order, because identifiers are caller-supplied.
     fn open_items(
         &self,
         key: BalanceKey,
-    ) -> impl Future<Output = Result<Vec<OpenItem<P>>, Self::Error>> + Send;
+        cursor: PostingCursor,
+    ) -> impl Future<Output = Result<OpenItemPage<P>, Self::Error>> + Send;
 
     /// Balances for several accounts at once.
     ///
@@ -474,7 +583,7 @@ pub trait LedgerStore<const P: u8>: Send + Sync {
     fn statement(
         &self,
         key: BalanceKey,
-        cursor: Cursor,
+        cursor: PostingCursor,
     ) -> impl Future<Output = Result<StatementPage<P>, Self::Error>> + Send;
 
     /// Records a checkpoint so later balance reads can start from it.
@@ -515,13 +624,102 @@ pub struct StatementLine<const P: u8> {
     pub kind: Option<crate::dimensions::Label>,
 }
 
+impl<const P: u8> StatementLine<P> {
+    /// Where this line sits, to the posting.
+    ///
+    /// What a [`PostingCursor`] resumes after.
+    #[must_use]
+    pub fn position(&self) -> PostingPosition {
+        PostingPosition {
+            index: self.index,
+            posting: self.posting.index,
+        }
+    }
+}
+
+/// Where to resume reading a per-account list of postings.
+///
+/// Used by [`LedgerStore::statement`] and [`LedgerStore::open_items`], which are
+/// the unfiltered and filtered views of the same thing: the postings on one
+/// account, in log order.
+///
+/// Separate from [`Cursor`], and addressing a **posting** rather than an entry,
+/// because that is what those lists are made of. One entry may put several
+/// postings on the same account — a split receipt booked as three lines against
+/// one credit is an ordinary entry — so a page boundary can fall inside an
+/// entry. An entry-addressed cursor cannot express that position, and resuming
+/// from one silently drops every remaining posting of that entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PostingCursor {
+    /// Return lines strictly after this posting; `None` starts at the beginning.
+    pub after: Option<PostingPosition>,
+    /// Maximum lines to return, clamped to [`MAX_PAGE_SIZE`].
+    pub limit: usize,
+}
+
+impl Default for PostingCursor {
+    fn default() -> Self {
+        Self {
+            after: None,
+            limit: DEFAULT_PAGE_SIZE,
+        }
+    }
+}
+
+impl PostingCursor {
+    /// A cursor starting at the first line.
+    #[must_use]
+    pub fn start() -> Self {
+        Self::default()
+    }
+
+    /// A cursor resuming after `position`.
+    #[must_use]
+    pub fn after(position: PostingPosition) -> Self {
+        Self {
+            after: Some(position),
+            limit: DEFAULT_PAGE_SIZE,
+        }
+    }
+
+    /// Sets the page size.
+    #[must_use]
+    pub fn with_limit(mut self, limit: usize) -> Self {
+        self.limit = limit;
+        self
+    }
+
+    /// The effective limit, clamped and never zero.
+    #[must_use]
+    pub fn effective_limit(&self) -> usize {
+        self.limit.clamp(1, MAX_PAGE_SIZE)
+    }
+}
+
 /// A page of statement lines.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatementPage<const P: u8> {
     /// The lines, in log order.
     pub lines: Vec<StatementLine<P>>,
     /// Cursor for the next page, or `None` at the end.
-    pub next: Option<Cursor>,
+    pub next: Option<PostingCursor>,
+}
+
+/// A page of open items.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenItemPage<const P: u8> {
+    /// The items, oldest first.
+    pub items: Vec<OpenItem<P>>,
+    /// Cursor for the next page, or `None` at the end.
+    pub next: Option<PostingCursor>,
+}
+
+impl<const P: u8> OpenItemPage<P> {
+    /// True when the page holds no items.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
 }
 
 /// A boxed future returned by [`DynLedgerStore`].
@@ -608,6 +806,9 @@ pub enum MemoryStoreError {
     /// An account binding could not be restored.
     #[error(transparent)]
     Account(#[from] crate::account::AccountError),
+    /// A sealed balance could not be proven.
+    #[error(transparent)]
+    SealedBalance(#[from] SealedBalanceError),
     /// The calendar refused a period operation.
     #[error(transparent)]
     Period(#[from] crate::period::PeriodError),
@@ -787,6 +988,14 @@ impl<const P: u8> LedgerStore<P> for MemoryStore<P> {
         async move { result }
     }
 
+    fn trial_balance_through_date(
+        &self,
+        end: Date,
+    ) -> impl Future<Output = Result<TrialBalance<P>, Self::Error>> + Send {
+        let result = self.with(|journal| Ok(journal.trial_balance_through_date(end)?));
+        async move { result }
+    }
+
     fn prove_inclusion(
         &self,
         index: LogIndex,
@@ -878,8 +1087,26 @@ impl<const P: u8> LedgerStore<P> for MemoryStore<P> {
     fn open_items(
         &self,
         key: BalanceKey,
-    ) -> impl Future<Output = Result<Vec<OpenItem<P>>, Self::Error>> + Send {
-        let result = self.with(|journal| Ok(journal.open_items(&key)?));
+        cursor: PostingCursor,
+    ) -> impl Future<Output = Result<OpenItemPage<P>, Self::Error>> + Send {
+        let result = self.with(|journal| {
+            let all = journal.open_items(&key)?;
+            let start = cursor.after.map_or(0usize, |after| {
+                all.iter()
+                    .position(|item| item.position > after)
+                    .unwrap_or(all.len())
+            });
+            let limit = cursor.effective_limit();
+            let items: Vec<OpenItem<P>> = all.iter().skip(start).take(limit).copied().collect();
+            let next = items
+                .last()
+                .filter(|_| start.saturating_add(items.len()) < all.len())
+                .map(|item| PostingCursor {
+                    after: Some(item.position),
+                    limit: cursor.limit,
+                });
+            Ok(OpenItemPage { items, next })
+        });
         async move { result }
     }
 
@@ -912,13 +1139,15 @@ impl<const P: u8> LedgerStore<P> for MemoryStore<P> {
     fn statement(
         &self,
         key: BalanceKey,
-        cursor: Cursor,
+        cursor: PostingCursor,
     ) -> impl Future<Output = Result<StatementPage<P>, Self::Error>> + Send {
         let result = self.with(|journal| {
             let all = journal.statement(&key)?;
+            // Resume after a *posting*, not after an entry: one entry may put
+            // several postings on this account, so a page can end inside one.
             let start = cursor.after.map_or(0usize, |after| {
                 all.iter()
-                    .position(|line| line.index.get() > after.get())
+                    .position(|line| line.position() > after)
                     .unwrap_or(all.len())
             });
             let limit = cursor.effective_limit();
@@ -939,8 +1168,8 @@ impl<const P: u8> LedgerStore<P> for MemoryStore<P> {
             let next = lines
                 .last()
                 .filter(|_| start.saturating_add(lines.len()) < all.len())
-                .map(|l| Cursor {
-                    after: Some(l.index),
+                .map(|l| PostingCursor {
+                    after: Some(l.position()),
                     limit: cursor.limit,
                 });
             Ok(StatementPage { lines, next })
@@ -998,6 +1227,255 @@ mod tests {
             Box::new(MemoryStore::<2>::new(test_ledger()));
         let head = conformance::block_on(store.head_boxed()).expect("reads");
         assert_eq!(head.size, 0);
+    }
+
+    #[test]
+    fn a_sealed_balance_is_provable_and_nameable_long_after_the_books_move_on() {
+        // The integration failure this exists for: `Seal::accounts` is the
+        // registry commitment as of the seal, and a proof built against the
+        // *current* registry does not verify under it. Onboard one customer and
+        // every already-sealed balance became unnameable.
+        use crate::account::BalanceLimit;
+        use crate::money::{Amount, Currency};
+        use crate::period::{Period, PeriodId, PeriodState};
+        use crate::posting::Layer;
+        use crate::{Entry, EntryId, IdempotencyKey};
+        use time::macros::date;
+
+        let store = MemoryStore::<2>::new(test_ledger());
+        let (cash, revenue) = {
+            let mut journal = store.snapshot();
+            let cash = journal
+                .accounts_mut()
+                .register_path("Assets:Cash", date!(2026 - 01 - 01))
+                .expect("registers");
+            let revenue = journal
+                .accounts_mut()
+                .register_path("Income:Sales", date!(2026 - 01 - 01))
+                .expect("registers");
+            for record in journal.account_records() {
+                conformance::block_on(store.register_account(&record)).expect("restores");
+            }
+            (cash, revenue)
+        };
+
+        let entry = Entry::<crate::entry::Draft, 2>::new(
+            EntryId::generate(),
+            IdempotencyKey::new(b"mar".to_vec()).expect("valid"),
+            date!(2026 - 03 - 10),
+        )
+        .debit(cash, Amount::<2>::from_minor(119_000), Currency::EUR)
+        .credit(revenue, Amount::<2>::from_minor(119_000), Currency::EUR);
+
+        let march = PeriodId::new("2026-03").expect("valid");
+        conformance::block_on(
+            store.define_period(
+                &Period::new(march.clone(), date!(2026 - 03 - 01), date!(2026 - 03 - 31))
+                    .expect("valid range"),
+            ),
+        )
+        .expect("defines");
+
+        let sealed = {
+            let journal = store.snapshot();
+            entry.seal(&journal.context()).expect("balances")
+        };
+        conformance::block_on(store.append(&EntryBatch::single(sealed))).expect("appends");
+
+        // Sealing March in April is the normal case, so the log already holds a
+        // later entry when the seal is taken — which is exactly why folding by
+        // log prefix reconstructs the wrong commitment.
+        let april = {
+            let journal = store.snapshot();
+            Entry::<crate::entry::Draft, 2>::new(
+                EntryId::generate(),
+                IdempotencyKey::new(b"apr".to_vec()).expect("valid"),
+                date!(2026 - 04 - 05),
+            )
+            .debit(cash, Amount::<2>::from_minor(7_777), Currency::EUR)
+            .credit(revenue, Amount::<2>::from_minor(7_777), Currency::EUR)
+            .seal(&journal.context())
+            .expect("balances")
+        };
+        conformance::block_on(store.append(&EntryBatch::single(april))).expect("appends");
+
+        conformance::block_on(store.transition_period(&march, PeriodState::Closing)).expect("ok");
+        let seal = conformance::block_on(store.seal_period(&march)).expect("seals");
+
+        // Now the books move on, in every way that used to break the proof.
+        {
+            let mut journal = store.snapshot();
+            journal
+                .accounts_mut()
+                .register_path("Assets:Bank", date!(2026 - 05 - 01))
+                .expect("registers");
+            journal
+                .accounts_mut()
+                .close(cash, date!(2026 - 05 - 31))
+                .expect("registered");
+            journal
+                .accounts_mut()
+                .set_limit(revenue, BalanceLimit::NoDebitBalance)
+                .expect("registered");
+            for record in journal.account_records() {
+                conformance::block_on(store.register_account(&record)).expect("restores");
+            }
+        }
+
+        let key = BalanceKey {
+            account: cash,
+            currency: Currency::EUR,
+            layer: Layer::Settled,
+        };
+        let proven = conformance::block_on(store.prove_sealed_balance(&march, key))
+            .expect("the seal still describes these books")
+            .expect("cash has a row in the closing trial balance");
+
+        assert!(proven.verify(), "the complete claim must check out");
+        assert_eq!(proven.path().to_string(), "Assets:Cash");
+        assert_eq!(
+            proven.balance.balance.debits,
+            Amount::<2>::from_minor(119_000)
+        );
+        assert_eq!(proven.seal.seal_hash, seal.seal_hash);
+
+        // The April entry must not have leaked into March's closing balance.
+        assert_eq!(
+            proven.balance.balance.debits,
+            Amount::<2>::from_minor(119_000)
+        );
+
+        // A registered account with no row is `None`, not a fabricated zero:
+        // absence and a zero balance are different claims.
+        let no_row = BalanceKey {
+            account: cash,
+            currency: Currency::USD,
+            layer: Layer::Settled,
+        };
+        assert!(
+            conformance::block_on(store.prove_sealed_balance(&march, no_row))
+                .expect("no error")
+                .is_none()
+        );
+
+        // An account onboarded *after* the seal is a different answer again —
+        // that seal cannot name a handle the registry had not yet issued, and
+        // saying so beats returning a bare `None` that reads as "no balance".
+        let later = BalanceKey {
+            account: AccountId::from_index(2),
+            currency: Currency::EUR,
+            layer: Layer::Settled,
+        };
+        assert!(matches!(
+            conformance::block_on(store.prove_sealed_balance(&march, later)),
+            Err(MemoryStoreError::SealedBalance(
+                SealedBalanceError::NotYetRegistered { .. }
+            ))
+        ));
+
+        // An unsealed period has nothing to prove.
+        let ghost = PeriodId::new("2026-09").expect("valid");
+        assert!(matches!(
+            conformance::block_on(store.prove_sealed_balance(&ghost, key)),
+            Err(MemoryStoreError::SealedBalance(
+                SealedBalanceError::NotSealed { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn paging_a_statement_never_splits_a_posting_off_its_entry() {
+        // One entry may put several postings on one account — a split receipt
+        // booked as three lines against one credit is ordinary. A cursor that
+        // addressed the *entry* skipped whatever remained of the entry a page
+        // ended inside, silently and permanently: the next page asked for
+        // `log_index > after` and that entry was already behind it.
+        use crate::money::{Amount, Currency};
+        use crate::posting::{Layer, Posting};
+        use crate::{Entry, EntryId, IdempotencyKey};
+        use time::macros::date;
+
+        let store = MemoryStore::<2>::new(test_ledger());
+        let (cash, revenue) = {
+            let mut journal = store.snapshot();
+            let cash = journal
+                .accounts_mut()
+                .register_path("Assets:Cash", date!(2026 - 01 - 01))
+                .expect("registers");
+            let revenue = journal
+                .accounts_mut()
+                .register_path("Income:Sales", date!(2026 - 01 - 01))
+                .expect("registers");
+            for record in journal.account_records() {
+                conformance::block_on(store.register_account(&record)).expect("restores");
+            }
+            (cash, revenue)
+        };
+
+        let entry = {
+            let journal = store.snapshot();
+            Entry::<crate::entry::Draft, 2>::new(
+                EntryId::generate(),
+                IdempotencyKey::new(b"split".to_vec()).expect("valid"),
+                date!(2026 - 03 - 10),
+            )
+            .post(Posting::debit(
+                cash,
+                Amount::<2>::from_minor(100),
+                Currency::EUR,
+            ))
+            .post(Posting::debit(
+                cash,
+                Amount::<2>::from_minor(200),
+                Currency::EUR,
+            ))
+            .post(Posting::debit(
+                cash,
+                Amount::<2>::from_minor(300),
+                Currency::EUR,
+            ))
+            .post(Posting::credit(
+                revenue,
+                Amount::<2>::from_minor(600),
+                Currency::EUR,
+            ))
+            .seal(&journal.context())
+            .expect("balances")
+        };
+        conformance::block_on(store.append(&EntryBatch::single(entry))).expect("appends");
+
+        let key = BalanceKey {
+            account: cash,
+            currency: Currency::EUR,
+            layer: Layer::Settled,
+        };
+        let whole = conformance::block_on(store.statement(key, PostingCursor::start()))
+            .expect("reads")
+            .lines;
+        assert_eq!(whole.len(), 3, "three postings hit this account");
+
+        // Every page size must reproduce the one-page answer exactly, running
+        // balances included — the boundary lands mid-entry at size 1 and 2.
+        for limit in 1..=4usize {
+            let mut paged = Vec::new();
+            let mut cursor = Some(PostingCursor::start().with_limit(limit));
+            while let Some(c) = cursor {
+                let page = conformance::block_on(store.statement(key, c)).expect("reads");
+                assert!(
+                    !page.lines.is_empty() || page.next.is_none(),
+                    "an empty page handed back another cursor"
+                );
+                paged.extend(page.lines);
+                cursor = page.next;
+            }
+            assert_eq!(paged, whole, "paging at limit {limit} diverged");
+        }
+
+        // And the running balance is cumulative from the start of the account,
+        // not restarted at each page.
+        assert_eq!(whole[0].running.debits, Amount::<2>::from_minor(100));
+        assert_eq!(whole[1].running.debits, Amount::<2>::from_minor(300));
+        assert_eq!(whole[2].running.debits, Amount::<2>::from_minor(600));
     }
 
     #[test]

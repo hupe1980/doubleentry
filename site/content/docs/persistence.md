@@ -12,7 +12,9 @@ implementation of it is correct.
 
 A backend must guarantee all of the following:
 
-1. **Append-only.** Recorded entries are never modified or removed.
+1. **Append-only.** Recorded entries are never modified, and the store never
+   removes one of its own accord. An operator may still prune a prefix archived
+   to the [cold tier](@/docs/cold-tier.md) — see there for what that costs.
 2. **Atomic batches.** Every entry in a batch lands, or none does.
 3. **Idempotent.** Re-appending an entry whose key is present with identical
    content is a no-op returning the original outcome; the same key with different
@@ -36,7 +38,16 @@ A backend must guarantee all of the following:
    first seal is checked as strictly as the last.
 9. **Seals bind their account handles.** A seal's `accounts` head is the
    commitment over the bindings the store itself holds.
-10. **Archived heads stay checkable.** `head_at`, `prove_inclusion_at` and
+10. **Periods seal in date order.** A closing balance is cumulative through the
+   period's last day, so sealing one while an earlier period is still open lets
+   an ordinary later booking restate it. Enforce it with
+   `PeriodCalendar::check_sealable` rather than by hand — see
+   [the sealed watermark](@/docs/periods-and-seals.md#the-sealed-watermark).
+11. **A sealed balance stays provable and nameable.** `prove_sealed_balance`
+   must keep answering after the registry has grown, an account has closed and a
+   limit has changed — all routine — and it must refuse rather than return a
+   proof when the rebuilt closing balance does not match the seal.
+12. **Archived heads stay checkable.** `head_at`, `prove_inclusion_at` and
    `prove_consistency_between` answer for a head published in the past, not
    only the current one.
 
@@ -228,6 +239,12 @@ while let Some(c) = cursor {
     cursor = page.next;
 }
 ```
+
+`Cursor` addresses an **entry**, which is what a log page is a list of.
+Statements and open items are paged by [`PostingCursor`](@/docs/statements.md),
+which addresses a **posting** — one entry may put several on one account, so a
+boundary can fall inside an entry and an entry-addressed cursor cannot express
+that position.
 
 ## Static and dynamic dispatch
 

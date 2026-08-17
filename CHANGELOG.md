@@ -4,10 +4,246 @@ Notable changes to `doubleentry`, in the format of
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioned per
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-**Nothing has been published to crates.io yet.** `v0.1.0` through `v0.3.0` are
-development tags; `0.4.0` is the first release intended to reach the registry.
+**Nothing has been published to crates.io yet.** `v0.1.0` through `v0.4.0` are
+development tags; `0.5.0` is the first release intended to reach the registry.
 Until 1.0 every release may break, and this one does — the reasoning is in each
 entry, because a breaking change without a reason is just churn.
+
+## [0.5.0] — 2026-08-17
+
+### ⚠️ The account-binding commitment changed
+
+`account_binding_leaf` now covers the handle and the path and nothing else. The
+classification, open window and balance limit are **out** of it. That moves two
+vectors:
+
+| Vector | before | after |
+|---|---|---|
+| Account binding commitment | `65ca7c50…` | `17d6ae22…` |
+| Reference seal hash | `7f6f0218…` | `5dbfe84f…` |
+
+The entry hash, the trial-balance leaf and every Merkle constant are
+**unchanged**, as are all proof-path vectors. No schema change. Nothing is
+published to crates.io, so there is no migration.
+
+### Fixed
+
+- **A sealed balance became unnameable the moment anything about the accounts
+  changed.** `Seal::accounts` exists so a trial-balance handle can be resolved to
+  an account, and `BalanceProof::verify_naming` documents that as the complete
+  claim an auditor wants — but the only way to build the second half was
+  `AccountRegistry::prove_binding`, which proves against the registry *as it
+  stands now*. Register one more account and every already-sealed balance stopped
+  verifying. Silently: `verify_naming` returned `false`, which reads as "the
+  books are wrong" rather than "you built the proof against the wrong registry".
+
+  The deeper cause was that the binding leaf hashed the whole `Account`,
+  including three fields the registry's own mutators exist to change. So
+  `close()` and `set_limit()` — routine master data — also retroactively
+  invalidated every binding proof against every seal ever issued. That made
+  truncating the record list to `seal.accounts.size` an unsound workaround: it
+  recovers the *set* of accounts at that size but not their master data as of
+  then.
+
+  Two changes. The leaf now covers only the handle and the path — the account's
+  identity, and precisely the fields that never change, which is the line
+  `AccountRegistry::restore` already drew ("the path is immutable and everything
+  else is master data"). And `AccountRegistry::prove_binding_at(id, size)` proves
+  against the commitment the registry had at a size, mirroring
+  `MerkleLog::inclusion_proof_at`. Pass `seal.accounts.size` and the proof
+  verifies under `seal.accounts`, whatever has happened since.
+
+  `AccountBindingProof` now carries `id` and `path` instead of an
+  `AccountRecord`, because a proof should carry exactly what it establishes —
+  reading `closed_on` off a "verified" proof that never covered it is the
+  opposite mistake. `account_binding_leaf` takes `(AccountId, &AccountPath)`.
+
+- **Proving a sealed balance through a `LedgerStore` was impossible.** A seal
+  commits to the closing balance folded by *booking date*; the trait only exposed
+  `trial_balance(size)`, which folds by *log prefix*. Sealing March in April is
+  the normal case, so at seal time the log already holds April entries and the
+  two answers differ — meaning no caller could reconstruct the commitment a seal
+  recorded, and the natural attempt produced one that silently did not match.
+
+  `LedgerStore::trial_balance_through_date` is now part of the trait (it existed
+  as a private method on both SQL backends), and `LedgerStore::prove_sealed_balance`
+  is a provided method that does the whole recipe — find the seal, rebuild the
+  closing balance the way the seal built it, **check the rebuild against the
+  seal**, prove the row, prove the binding at `seal.accounts.size` — returning a
+  `SealedBalance`. The middle step is the one that matters and the one nothing
+  previously forced: skip it and you hold a proof against a commitment you
+  computed yourself, which is internally consistent and evidence of nothing.
+  A mismatch is now `SealedBalanceError::Restated` and no proof is returned.
+
+- **A sealed closing balance could be restated afterwards by an ordinary
+  booking.** This was a soundness defect, not a hardening opportunity: a seal
+  claims its closing balances are exact — every entry booked on or before the
+  period's last day and nothing else — and two entirely legal writes could
+  falsify that claim while the seal, its balance proofs, its binding proofs and
+  the whole chain went on verifying byte for byte.
+
+  Both routes came from the same missing rule. Sealing March while February was
+  still `Open` left February accepting postings that fold into March's
+  cumulative closing balance; and a date that no period covered reported `Open`
+  forever, so a booking into an undefined February did the same thing even when
+  the calendar had never mentioned it.
+
+  `PeriodCalendar` now carries a **sealed watermark** — the greatest end date
+  among its sealed periods, maintained as they seal and never moving backwards.
+  `state_on` consults it first, so every date at or before it reports `Sealed`
+  whether or not a period covers it: a gap below a seal is not an opening to
+  book through, it is a range already committed to. `PeriodCalendar::sealed_through`
+  exposes it.
+
+  `PeriodCalendar::check_sealable` is the new single home for the sealing
+  preconditions — defined, `Closing`, every earlier defined period already
+  sealed, and ending after the watermark. `Journal::seal_period` and both SQL
+  backends call it instead of each re-implementing the first two checks and
+  neither implementing the last two. The conformance suite fails a backend that
+  seals out of order, so this is part of what a `LedgerStore` *is*.
+
+- **A pruned log built proofs for the wrong entries.** The cold tier's protocol
+  ends "only then may the operational store drop the rows", and the `LedgerStore`
+  contract said in the same breath that entries "are never modified or removed".
+  Both could not be true, and the consequence of resolving it in favour of the
+  cold tier was undocumented and bad.
+
+  Proofs are built from the leaves a store holds, so removing an archived prefix
+  renumbers every leaf after it. The tree head does not notice — it is read from
+  the last row's stored root — so head and proofs disagreed silently. Measured on
+  a ten-entry log with the first five pruned: `prove_inclusion(7)` reported
+  `IndexOutOfRange { index: 7, size: 5 }` for an index that is genuinely in
+  range, and `prove_inclusion(3)` returned a proof for **log entry 8**, caught
+  only if the caller verified before handing it to an auditor.
+
+  Both SQL backends now check that the log they read back is dense from zero and
+  return `LogNotDense` naming the hole — the same "checked, not trusted" the
+  accumulator's subtree cover already got, applied to the leaf set it was
+  missing from. The contract and the cold-tier protocol now agree with each
+  other and say what pruning costs.
+
+- **`open_items` was unbounded.** `page` and `statement` were both paged — "an
+  account statement over ten years is not a response body" — while open items on
+  the same account came back as one `Vec` of whatever size. That is the same
+  hazard the crate names elsewhere as "the difference between a report and an
+  outage", and a receivables control account is exactly where it bites.
+
+  `LedgerStore::open_items` now takes a `PostingCursor` and returns an
+  `OpenItemPage`, in the same log order and behind the same cursor as a
+  statement — they are the filtered and unfiltered views of the same postings, so
+  they now read alike. `Journal::open_items` stays unpaged, as
+  `Journal::statement` does: an in-memory journal already holds everything.
+
+  `OpenItem` gained `position: PostingPosition`, which is what the list is
+  ordered by and what a page resumes after. `PostingPosition` moved from
+  `storage` to `clearing`, beside `PostingRef` — the two are the ways of
+  addressing a posting, and the distinction is load-bearing: a reference *names*
+  one by entry identifier, a position *locates* it in the log.
+  `StatementCursor` is renamed `PostingCursor`, since it now pages both.
+
+- **Open items came back in entry-identifier order, not oldest first.**
+  `ClearingRegister::open_items` sorted by `PostingRef`, which orders by entry
+  **identifier**. Identity is caller-supplied — the engine never generates one on
+  the deterministic path — so that ordering is chronological only when a caller
+  happens to use `EntryId::generate()`, whose UUIDv7 values are time-ordered.
+  Bring your own identifiers and the list silently reverses. FIFO clearing is
+  what open items are *for*, so this was the wrong order, arrived at by an
+  ordering the crate rejects everywhere else (`LogIndex`: "a wall clock is
+  neither monotonic nor agreed between writers, and the index is both").
+
+  The register now imposes no order — it returns candidates as supplied, because
+  it knows nothing about the log and cannot honestly claim age — and the journal
+  and both SQL backends supply them in log order. The conformance suite checks
+  it, with a fixture carrying **descending** identifiers so the two orders are
+  actually distinguishable; with `EntryId::generate()` throughout they coincide
+  and a wrong implementation passes by luck.
+
+- **Paging a statement silently dropped postings.** `StatementPage::next`
+  handed back a `Cursor`, which addresses an *entry* — but a statement is a list
+  of **postings**, and one entry may put several on the same account. A split
+  receipt booked as three lines against one credit is an ordinary entry, so a
+  page boundary can fall inside one. Resuming then asked for
+  `log_index > after`, skipping every remaining posting of that entry:
+  permanently, since the cursor had already moved past it, and invisibly, since
+  the running balance stayed internally consistent across the gap.
+
+  All three backends had it, and the "statement pagination is exact" conformance
+  check missed it because its fixture never put two postings on one account —
+  every boundary fell on an entry edge, so an entry-addressed cursor passed by
+  luck. The check now seeds a three-posting entry *and* asserts that some entry
+  really did contribute two adjacent lines, so it cannot quietly stop exercising
+  the boundary.
+
+  New `PostingPosition` (log index + posting index, ordered as the pair),
+  `StatementCursor`, and `StatementLine::position()`.
+  `LedgerStore::statement` takes a `StatementCursor`; `Cursor` still pages the
+  log, where addressing an entry is right.
+
+- **The reference implementation could not do what the storage trait could.**
+  `prove_sealed_balance` landed on `LedgerStore` only, leaving `Journal` — which
+  is the semantics a backend is *defined* to agree with — without it. It is now
+  on both, and both call the same `SealedBalance::assemble`, so the recipe has
+  one home rather than two that can drift. Same reasoning as
+  `PeriodCalendar::check_sealable`.
+
+- **A `SealedBalance` could not leave the process that built it.** Every part of
+  it serialises — `Seal`, `BalanceProof`, `AccountBindingProof` — but the bundle
+  did not, and the bundle is the thing an auditor is handed. It now derives
+  serde under the `serde` feature. A seal edited on the wire still fails to
+  deserialise at all, so a recipient who never calls `verify` cannot be fooled
+  either.
+
+- **`SealChain` did not notice a shrinking account registry.** Handles are dense
+  positions and are never reissued, so a registry only grows; a seal committing
+  to fewer bindings than its predecessor is one rebuilt from a truncated set,
+  which renumbers the handles every earlier balance is keyed on. New
+  `SealChainError::ShrunkenRegistry`. Tree-head monotonicity was already checked;
+  this is its counterpart for the third root.
+
+### Changed
+
+- **`PeriodError` gained `NotClosing`, `SealedOutOfOrder` and
+  `UnsealedPredecessor`;** `JournalError::PeriodNotClosing` and
+  `JournalError::UnknownPeriod` are **removed**, as are the identical variants on
+  `SqliteError` and `PostgresError`. Those were three copies of one rule that
+  could drift apart — and did, in that none of them enforced ordering. They are
+  now one `PeriodError` surfaced through the existing `Period(#[from] …)`
+  variants. Match on `JournalError::Period(PeriodError::NotClosing { .. })`
+  where you matched `JournalError::PeriodNotClosing { .. }`.
+
+- **`SealedBalance` and `SealedBalanceError` live in `seal`, not `storage`.**
+  They are seal artifacts — a seal plus two proofs — not persistence ones, and
+  putting them in `storage` would have forced `Journal` to depend on the storage
+  layer to offer the same operation. Re-exported from the crate root either way,
+  so `doubleentry::SealedBalance` is unchanged.
+
+- **`LedgerStore::Error` must now convert from `SealedBalanceError` and
+  `AccountError`.** The bounds sit on the associated type rather than on
+  `prove_sealed_balance`, because a `where` clause there made the method
+  uncallable through a generic `S: LedgerStore<P>` — including from the
+  conformance suite, which is the tell that it was the wrong place. Two
+  `#[from]` variants on a `thiserror` enum satisfy it.
+
+- **`SealChain::verify` is linear rather than quadratic.** The one-seal-per-period
+  rule rescanned the whole prefix at every position, which is `O(n²)` in exactly
+  the operation an auditor runs; the periods seen so far are now carried along.
+  A ledger on daily periods passes 3,600 seals within a decade.
+
+### Documentation
+
+- `BalanceLimit::permits` claimed an overflow computing the net counts as a
+  breach. It compares the gross totals directly and cannot overflow — the doc
+  described an implementation that no longer existed.
+- `closing_postings` now states that an account without an `AccountKind` is
+  silently out of scope, since that is the way a close quietly does nothing.
+- **A from-empty consistency proof is vacuous, and now says so.**
+  `ConsistencyProof::is_vacuous` is new, and `verify` plus all four
+  proof-building methods carry the warning. Every log extends the empty tree, so
+  a proof taken at `old_size == 0` verifies against any root at the right size —
+  correct mathematics, and a trap: an auditor who archived a head before the
+  first entry gets `true` from a check that examined nothing, indistinguishable
+  from a real verification. Documented at the call sites that build one, not only
+  inside `verify`'s body where it was already noted.
 
 ## [0.4.0] — 2026-08-15
 

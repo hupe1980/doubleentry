@@ -40,7 +40,8 @@ use crate::checkpoint::{
     AssertAt, AssertionOutcome, BalanceAssertion, Checkpoint, CheckpointError,
 };
 use crate::clearing::{
-    Clearing, ClearingError, ClearingId, ClearingRegister, OpenItem, PostingLookup, PostingRef,
+    Clearing, ClearingError, ClearingId, ClearingRegister, OpenItem, PostingLookup,
+    PostingPosition, PostingRef,
 };
 use crate::entry::{
     Balanced, Draft, Entry, EntryId, IdempotencyKey, LedgerPolicy, SealContext, ValidationErrors,
@@ -50,7 +51,9 @@ use crate::merkle::{ConsistencyProof, InclusionProof, MerkleLog, ProofError, Tre
 use crate::money::{Currency, MoneyError};
 use crate::period::{LedgerId, Period, PeriodCalendar, PeriodError, PeriodId, PeriodState};
 use crate::posting::{Layer, Posting};
-use crate::seal::{PeriodCoverage, Seal, SealChain, SealChainError};
+use crate::seal::{
+    PeriodCoverage, Seal, SealChain, SealChainError, SealedBalance, SealedBalanceError,
+};
 use crate::storage::StatementLine;
 
 /// Position of an entry in the journal.
@@ -221,28 +224,21 @@ pub enum JournalError {
     Clearing(#[from] ClearingError),
 
     /// The calendar refused a period operation.
+    ///
+    /// Covers the sealing preconditions too — that the period is defined, is
+    /// closing, and is next in date order. Those are questions about the
+    /// calendar, and [`PeriodCalendar::check_sealable`] is the one place they
+    /// are answered.
     #[error(transparent)]
     Period(#[from] PeriodError),
-
-    /// The period is not ready to be sealed.
-    #[error("period {period} is {state}; only a closing period can be sealed")]
-    PeriodNotClosing {
-        /// The period.
-        period: PeriodId,
-        /// Its current state.
-        state: PeriodState,
-    },
-
-    /// The period is not defined in the calendar.
-    #[error("period {period} is not defined")]
-    UnknownPeriod {
-        /// The missing period.
-        period: PeriodId,
-    },
 
     /// The seal did not chain onto the existing ones.
     #[error(transparent)]
     Seal(#[from] SealChainError),
+
+    /// A sealed balance could not be proven.
+    #[error(transparent)]
+    SealedBalance(#[from] SealedBalanceError),
 }
 
 /// Where one posting sits: which entry, and which posting within it.
@@ -773,6 +769,11 @@ impl<const P: u8> Journal<P> {
 
     /// Proves that the log at `old_size` is a prefix of the current log.
     ///
+    /// A proof from `old_size == 0` is **vacuous** — every log extends the empty
+    /// tree, so it constrains nothing about the newer one and verifies against
+    /// any root at the right size. See
+    /// [`ConsistencyProof::is_vacuous`](crate::ConsistencyProof::is_vacuous).
+    ///
     /// # Errors
     ///
     /// Returns [`ProofError::SizeOutOfRange`] for a size beyond the log.
@@ -785,6 +786,11 @@ impl<const P: u8> Journal<P> {
     /// The general form: two auditors holding different archived heads, neither
     /// of them current, can be shown that one is a prefix of the other without
     /// either learning the log's present size.
+    ///
+    /// A proof from `old_size == 0` is **vacuous** — every log extends the empty
+    /// tree, so it constrains nothing about the newer one and verifies against
+    /// any root at the right size. See
+    /// [`ConsistencyProof::is_vacuous`](crate::ConsistencyProof::is_vacuous).
     ///
     /// # Errors
     ///
@@ -1074,7 +1080,22 @@ impl<const P: u8> Journal<P> {
     /// Returns [`ClearingError`] if a recorded clearing references a posting
     /// this journal does not hold, which would be a bug in this crate.
     pub fn open_items(&self, key: &BalanceKey) -> Result<Vec<OpenItem<P>>, JournalError> {
-        let candidates = self.postings_on(key);
+        // Straight from `sites`, which is maintained in log order — so the
+        // candidates arrive oldest first and carry the position that says so.
+        let candidates: Vec<(PostingPosition, PostingRef)> = self
+            .sites
+            .get(key)
+            .into_iter()
+            .flatten()
+            .filter_map(|site| {
+                self.at(site.index).map(|entry| {
+                    (
+                        PostingPosition::new(site.index, site.posting),
+                        PostingRef::new(entry.id(), site.posting),
+                    )
+                })
+            })
+            .collect();
         let lookup = PostingIndex {
             by_id: &self.by_id,
             entries: &self.entries,
@@ -1105,35 +1126,29 @@ impl<const P: u8> Journal<P> {
 
     /// Seals a closing period, committing to its entries and closing balances.
     ///
-    /// The period must already be in [`PeriodState::Closing`]: stopping new
-    /// postings is a separate, earlier decision, so that verification runs
-    /// against a set that can no longer grow underneath it.
+    /// The preconditions are [`PeriodCalendar::check_sealable`]'s: the period is
+    /// defined, it is in [`PeriodState::Closing`], and it is the next one due in
+    /// date order. The last of those is what makes the closing balance a stable
+    /// claim — it is cumulative through the period's last day, so an earlier
+    /// period still open could restate it afterwards with a perfectly ordinary
+    /// booking.
     ///
     /// The seal commits to three things: the log's tree head, the period's
     /// closing trial balance, and the account registry those balances are keyed
     /// on — see [`Seal::accounts`] for why the last one is not optional.
     ///
-    /// On success the period advances to [`PeriodState::Sealed`]. The seal is
-    /// appended to the chain *first*, so a seal the chain refuses cannot leave a
-    /// period marked sealed with nothing sealing it.
+    /// On success the period advances to [`PeriodState::Sealed`] and the
+    /// calendar's watermark moves with it, freezing every date up to and
+    /// including the period's last. The seal is appended to the chain *first*,
+    /// so a seal the chain refuses cannot leave a period marked sealed with
+    /// nothing sealing it.
     ///
     /// # Errors
     ///
-    /// Returns [`JournalError::UnknownPeriod`] when the period is not defined,
-    /// [`JournalError::PeriodNotClosing`] when it is not ready, and
+    /// Returns [`JournalError::Period`] when the period cannot be sealed, and
     /// [`JournalError::Seal`] when the seal does not chain onto the last one.
     pub fn seal_period(&mut self, period: &PeriodId) -> Result<Seal, JournalError> {
-        let Some(definition) = self.calendar.get(period) else {
-            return Err(JournalError::UnknownPeriod {
-                period: period.clone(),
-            });
-        };
-        if definition.state != PeriodState::Closing {
-            return Err(JournalError::PeriodNotClosing {
-                period: period.clone(),
-                state: definition.state,
-            });
-        }
+        let definition = self.calendar.check_sealable(period)?;
         let (start, end) = (definition.start, definition.end);
 
         let coverage = self.coverage(start, end);
@@ -1169,6 +1184,60 @@ impl<const P: u8> Journal<P> {
     /// Returns [`SealChainError`] naming the first seal that does not hold.
     pub fn verify_seals(&self) -> Result<(), SealChainError> {
         self.seals.verify()
+    }
+
+    /// Proves what one account closed a sealed period at, and names it.
+    ///
+    /// The complete claim an auditor wants, from one call: the seal, an
+    /// `O(log n)` path to the balance row, and an `O(log n)` path binding that
+    /// row's handle to an account path — disclosing nothing else.
+    ///
+    /// Assembled by hand this is a five-step recipe of which exactly one step
+    /// matters, and it is the one nothing forces: comparing the rebuilt
+    /// commitment against the one the seal recorded. Skip it and the proof is
+    /// against a commitment you just computed yourself — internally consistent,
+    /// evidence of nothing. [`SealedBalance::assemble`] is where that check
+    /// lives, and every [`LedgerStore`](crate::LedgerStore) routes through the
+    /// same function, so the durable backends cannot drift from this one.
+    ///
+    /// Note which fold rebuilds the closing balance:
+    /// [`trial_balance_through_date`](Self::trial_balance_through_date), by
+    /// booking date, not [`trial_balance`](Self::trial_balance) over a log
+    /// prefix. Sealing March in April is the normal case, so at the moment the
+    /// seal is taken the log already holds April entries and the two differ.
+    ///
+    /// Returns `Ok(None)` when the account has no row in that period's closing
+    /// trial balance — which is not a balance of zero.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JournalError::SealedBalance`] when the period is not sealed,
+    /// when the books no longer reproduce the seal's closing balance, or when
+    /// the account was not registered by the time the period closed.
+    pub fn prove_sealed_balance(
+        &self,
+        period: &PeriodId,
+        key: BalanceKey,
+    ) -> Result<Option<SealedBalance<P>>, JournalError> {
+        let Some(seal) = self.seals.get(period).cloned() else {
+            return Err(SealedBalanceError::NotSealed {
+                period: period.clone(),
+            }
+            .into());
+        };
+        let Some(definition) = self.calendar.get(&seal.period) else {
+            return Err(SealedBalanceError::UndefinedPeriod {
+                period: period.clone(),
+            }
+            .into());
+        };
+        let closing = self.trial_balance_through_date(definition.end)?;
+        Ok(SealedBalance::assemble(
+            seal,
+            &closing,
+            &self.accounts,
+            key,
+        )?)
     }
 
     // ── checkpoints and assertions ──────────────────────────────────────────
@@ -1290,7 +1359,7 @@ fn is_inversion_of<const P: u8>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::account::AccountId;
+    use crate::account::{AccountId, BalanceLimit};
     use crate::entry::{Description, Draft};
     use crate::money::{Amount, Currency};
     use crate::posting::{Direction, Posting};
@@ -2202,10 +2271,10 @@ mod tests {
         // Open is not enough: postings must be stopped before verification runs.
         assert!(matches!(
             b.journal.seal_period(&id),
-            Err(JournalError::PeriodNotClosing {
+            Err(JournalError::Period(PeriodError::NotClosing {
                 state: PeriodState::Open,
                 ..
-            })
+            }))
         ));
 
         b.journal
@@ -2221,12 +2290,92 @@ mod tests {
     }
 
     #[test]
+    fn a_sealed_closing_balance_cannot_be_restated_afterwards() {
+        // A seal's closing balance is *cumulative* through the period's last
+        // day. That claim is only worth anything if nothing can be booked at or
+        // before that day afterwards — and two ordinary, individually legal
+        // writes used to be able to.
+        let mut b = Books::new();
+        let feb = PeriodId::new("2026-02").expect("valid");
+        b.journal
+            .define_period(
+                Period::new(feb.clone(), date!(2026 - 02 - 01), date!(2026 - 02 - 28))
+                    .expect("valid range"),
+            )
+            .expect("defines");
+        let march = b.march();
+        b.record(b"m1", 100);
+
+        // 1. March cannot be sealed while February is still open, because a
+        //    later February booking would restate March's closing balance.
+        b.journal
+            .transition_period(&march, PeriodState::Closing)
+            .expect("ok");
+        assert!(matches!(
+            b.journal.seal_period(&march),
+            Err(JournalError::Period(PeriodError::UnsealedPredecessor {
+                ref predecessor,
+                ..
+            })) if *predecessor == feb
+        ));
+
+        // Seal them in order instead. March is already closing.
+        b.journal
+            .transition_period(&feb, PeriodState::Closing)
+            .expect("ok");
+        b.journal.seal_period(&feb).expect("February seals first");
+        b.journal.seal_period(&march).expect("then March");
+        let sealed = b
+            .journal
+            .seals()
+            .get(&march)
+            .expect("March is sealed")
+            .clone();
+
+        // 2. Nothing may be booked at or before the watermark any more — not
+        //    into February, and not into a gap the calendar never defined.
+        assert_eq!(
+            b.journal.calendar().sealed_through(),
+            Some(date!(2026 - 03 - 31))
+        );
+        for (key, on) in [
+            (b"f1".as_slice(), date!(2026 - 02 - 10)),
+            (b"gap".as_slice(), date!(2025 - 11 - 30)),
+            (b"last".as_slice(), date!(2026 - 03 - 31)),
+        ] {
+            let draft = b.draft_on(key, 500, on);
+            let err = b
+                .journal
+                .record(draft)
+                .expect_err("the books are sealed through 2026-03-31");
+            assert!(matches!(err, JournalError::Invalid(ref e)
+            if e.any(|v| matches!(v, crate::entry::ValidationError::ClosedPeriod {
+                state: PeriodState::Sealed, ..
+            }))));
+        }
+
+        // So the sealed closing balance still describes the books exactly.
+        let recomputed = b
+            .journal
+            .trial_balance_through_date(date!(2026 - 03 - 31))
+            .expect("no overflow");
+        assert_eq!(
+            crate::seal::trial_balance_head(&recomputed),
+            sealed.trial_balance
+        );
+
+        // And the next day forward is still perfectly open.
+        let draft = b.draft_on(b"apr", 700, date!(2026 - 04 - 01));
+        b.journal.record(draft).expect("April is open");
+    }
+
+    #[test]
     fn sealing_an_unknown_period_is_an_error() {
         let mut b = Books::new();
         let ghost = PeriodId::new("nope").expect("valid");
         assert!(matches!(
             b.journal.seal_period(&ghost),
-            Err(JournalError::UnknownPeriod { .. })
+            Err(JournalError::Period(PeriodError::Unknown { .. }))
         ));
     }
 
@@ -2241,10 +2390,10 @@ mod tests {
         b.journal.seal_period(&id).expect("seals");
         assert!(matches!(
             b.journal.seal_period(&id),
-            Err(JournalError::PeriodNotClosing {
+            Err(JournalError::Period(PeriodError::NotClosing {
                 state: PeriodState::Sealed,
                 ..
-            })
+            }))
         ));
         assert_eq!(b.journal.seals().len(), 1);
     }
@@ -2332,6 +2481,116 @@ mod tests {
             crate::seal::trial_balance_head(&b.journal.trial_balance(None).expect("ok"));
         assert_ne!(recomputed, seal.trial_balance);
         assert!(seal.is_self_consistent());
+    }
+
+    #[test]
+    fn one_call_proves_and_names_a_sealed_balance() {
+        // The whole audit answer, assembled where it cannot be assembled wrong.
+        // The engine and every durable backend route through the same
+        // `SealedBalance::assemble`, so they cannot drift.
+        let mut b = Books::new();
+        let id = b.march();
+        b.record(b"m", 119_000);
+        // Sealing March in April is the normal case, so the log holds a later
+        // entry when the seal is taken — which is why the closing balance is a
+        // fold by booking date rather than a prefix of the log.
+        let later = b.draft_on(b"apr", 7_777, date!(2026 - 04 - 05));
+        b.journal.record(later).expect("April is open");
+        b.journal
+            .transition_period(&id, PeriodState::Closing)
+            .expect("ok");
+        let seal = b.journal.seal_period(&id).expect("seals");
+
+        // The books move on in every way that used to break the binding proof.
+        b.journal
+            .accounts_mut()
+            .register_path("Assets:Bank", date!(2026 - 05 - 01))
+            .expect("registers");
+        b.journal
+            .accounts_mut()
+            .close(b.cash, date!(2026 - 05 - 31))
+            .expect("registered");
+        b.journal
+            .accounts_mut()
+            .set_limit(b.revenue, BalanceLimit::NoDebitBalance)
+            .expect("registered");
+
+        let proven = b
+            .journal
+            .prove_sealed_balance(&id, b.cash_key())
+            .expect("the books still reproduce the seal")
+            .expect("cash has a row");
+        assert!(proven.verify());
+        assert_eq!(proven.path().to_string(), "Assets:Cash");
+        assert_eq!(proven.seal.seal_hash, seal.seal_hash);
+        // April must not have leaked into March's closing balance.
+        assert_eq!(proven.balance.balance.debits, Eur::from_minor(119_000));
+
+        // A registered account with no row is `None`, not a fabricated zero.
+        let no_row = BalanceKey {
+            currency: Currency::USD,
+            ..b.cash_key()
+        };
+        assert!(
+            b.journal
+                .prove_sealed_balance(&id, no_row)
+                .expect("no error")
+                .is_none()
+        );
+
+        // An account onboarded after the seal is a different answer again.
+        let later_account = BalanceKey {
+            account: AccountId::from_index(2),
+            ..b.cash_key()
+        };
+        assert!(matches!(
+            b.journal.prove_sealed_balance(&id, later_account),
+            Err(JournalError::SealedBalance(
+                SealedBalanceError::NotYetRegistered { .. }
+            ))
+        ));
+
+        // And an unsealed period has nothing to prove.
+        let ghost = PeriodId::new("2026-09").expect("valid");
+        assert!(matches!(
+            b.journal.prove_sealed_balance(&ghost, b.cash_key()),
+            Err(JournalError::SealedBalance(
+                SealedBalanceError::NotSealed { .. }
+            ))
+        ));
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn a_sealed_balance_survives_the_trip_to_whoever_needs_it() {
+        // The artifact exists to leave the process that built it. A claim an
+        // auditor cannot be handed is not a claim.
+        let mut b = Books::new();
+        let id = b.march();
+        b.record(b"m", 119_000);
+        b.journal
+            .transition_period(&id, PeriodState::Closing)
+            .expect("ok");
+        b.journal.seal_period(&id).expect("seals");
+
+        let proven = b
+            .journal
+            .prove_sealed_balance(&id, b.cash_key())
+            .expect("provable")
+            .expect("cash has a row");
+
+        let json = serde_json::to_string(&proven).expect("serialises");
+        let received: SealedBalance<2> = serde_json::from_str(&json).expect("deserialises");
+        assert_eq!(received, proven);
+        // The receiver checks it themselves, holding nothing but this.
+        assert!(received.verify());
+        assert_eq!(received.path().to_string(), "Assets:Cash");
+
+        // A seal edited on the wire does not even deserialise, so a recipient
+        // who never thinks to call `verify` still cannot be fooled.
+        let forged = json.replace("\"entry_count\":1", "\"entry_count\":99");
+        assert_ne!(forged, json, "the test must actually alter the payload");
+        assert!(serde_json::from_str::<SealedBalance<2>>(&forged).is_err());
     }
 
     #[test]
@@ -2488,6 +2747,53 @@ mod tests {
                 .expect("ok")
                 .debits,
             Eur::from_minor(390)
+        );
+    }
+
+    #[test]
+    fn open_items_are_oldest_first_whatever_identifiers_the_caller_brings() {
+        // Open items exist to be cleared, and FIFO — apply this payment to the
+        // oldest open invoice — is the workflow. "Oldest" is log order, which is
+        // the crate's answer to ordering everywhere else, and deliberately not
+        // entry-*identifier* order: identity is caller-supplied, so sorting by
+        // it is chronological only when the caller happens to use this crate's
+        // own time-ordered generator. These identifiers descend, so the two
+        // orders are exact opposites.
+        let mut b = Books::new();
+        let ids = [
+            EntryId::from_uuid(uuid::Uuid::from_u128(0xcccc << 112)),
+            EntryId::from_uuid(uuid::Uuid::from_u128(0xbbbb << 112)),
+            EntryId::from_uuid(uuid::Uuid::from_u128(0xaaaa << 112)),
+        ];
+        for (n, id) in ids.iter().enumerate() {
+            let draft = Entry::<Draft, 2>::new(
+                *id,
+                IdempotencyKey::new(format!("inv-{n}").into_bytes()).expect("valid"),
+                date!(2026 - 03 - 15),
+            )
+            .debit(b.cash, Eur::from_minor(100), Currency::EUR)
+            .credit(b.revenue, Eur::from_minor(100), Currency::EUR);
+            b.journal.record(draft).expect("records");
+        }
+
+        let key = b.cash_key();
+        let log_order = b.journal.postings_on(&key);
+        let items: Vec<_> = b
+            .journal
+            .open_items(&key)
+            .expect("no overflow")
+            .iter()
+            .map(|i| i.posting)
+            .collect();
+
+        assert_eq!(items, log_order, "open items must be oldest-first");
+        // And that is genuinely the opposite of sorting by identifier, so the
+        // assertion above is not satisfied by both orders at once.
+        let mut by_identifier = log_order.clone();
+        by_identifier.sort();
+        assert_ne!(
+            by_identifier, log_order,
+            "the fixture must actually distinguish the two orders"
         );
     }
 

@@ -50,6 +50,20 @@ pub enum ClosingError {
 ///
 /// Returns an empty vector when there is nothing to close, which is what a
 /// second run over an already-closed period produces.
+///
+/// # Scope is decided by [`AccountKind`], which is optional
+///
+/// Only accounts carrying a `kind` in `kinds` are closed. An account left
+/// without one is **silently out of scope** — [`AccountKind`] is reporting
+/// metadata the engine never requires, so there is nothing here to reject.
+/// A revenue account registered without `.with_kind(AccountKind::Income)`
+/// therefore survives the close carrying its balance, and the mistake surfaces
+/// as an income statement that will not zero.
+///
+/// Classify every account you intend to close, and assert on the result: after
+/// booking these postings, the net of each in-scope account is zero. That is one
+/// line against a trial balance and it is the only check that distinguishes
+/// "nothing to close" from "nothing was in scope".
 pub fn closing_postings<const P: u8>(
     trial_balance: &TrialBalance<P>,
     accounts: &AccountRegistry,

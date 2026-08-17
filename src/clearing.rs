@@ -35,6 +35,7 @@ use uuid::Uuid;
 use crate::account::AccountId;
 use crate::balance::{Balance, BalanceKey};
 use crate::entry::EntryId;
+use crate::journal::LogIndex;
 use crate::money::{Amount, Currency, MoneyError};
 use crate::posting::{Direction, Layer, Posting};
 
@@ -59,6 +60,40 @@ impl PostingRef {
 impl std::fmt::Display for PostingRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}#{}", self.entry, self.index)
+    }
+}
+
+/// A posting's position in the log: which entry, and which posting within it.
+///
+/// The companion to [`PostingRef`], and the difference matters. A reference
+/// *names* a posting — by entry identifier, which is stable from the moment the
+/// row is written and says nothing about order. A position *locates* it, and is
+/// therefore what a total order over an account's postings is built from: a
+/// statement reads in this order, open items come back in it, and both page by
+/// it.
+///
+/// Only a sequenced entry has one. An entry that is durable but not yet placed
+/// is not in the log, so there is no position to give it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct PostingPosition {
+    /// The entry's position in the log.
+    pub index: LogIndex,
+    /// The posting's position within that entry.
+    pub posting: u16,
+}
+
+impl PostingPosition {
+    /// Creates a position.
+    #[must_use]
+    pub const fn new(index: LogIndex, posting: u16) -> Self {
+        Self { index, posting }
+    }
+}
+
+impl std::fmt::Display for PostingPosition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}#{}", self.index, self.posting)
     }
 }
 
@@ -295,6 +330,10 @@ pub enum ClearingEvent<const P: u8> {
 /// A posting with something still outstanding on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpenItem<const P: u8> {
+    /// Where the posting sits in the log.
+    ///
+    /// What the list is ordered by, and what a page resumes after.
+    pub position: PostingPosition,
     /// Which posting.
     pub posting: PostingRef,
     /// Which side it falls on.
@@ -507,14 +546,22 @@ impl<const P: u8> ClearingRegister<P> {
 
     /// Computes the open items among `candidates`.
     ///
-    /// Ordered by posting reference, so the result is reproducible.
+    /// Returned **in the order the candidates were supplied**, filtered to those
+    /// with something outstanding. The register deliberately does not reorder
+    /// them: it knows nothing about the log, so the only order it could impose
+    /// is by [`PostingRef`], which sorts by entry *identifier*. Identifiers are
+    /// caller-supplied — the engine never generates one on the deterministic
+    /// path — so that order is chronological only by luck, and silently is not
+    /// when a caller brings its own. Age is the log's business, and the caller
+    /// is what knows it: [`Journal::open_items`](crate::Journal::open_items)
+    /// supplies candidates in log order, and so does every backend.
     pub fn open_items(
         &self,
-        candidates: impl IntoIterator<Item = PostingRef>,
+        candidates: impl IntoIterator<Item = (PostingPosition, PostingRef)>,
         lookup: &impl PostingLookup<P>,
     ) -> Result<Vec<OpenItem<P>>, ClearingError> {
         let mut out = Vec::new();
-        for reference in candidates {
+        for (position, reference) in candidates {
             let Some(posting) = lookup.posting(reference) else {
                 return Err(ClearingError::UnknownPosting { posting: reference });
             };
@@ -522,6 +569,7 @@ impl<const P: u8> ClearingRegister<P> {
             let residual = posting.amount.checked_sub(applied)?;
             if residual.is_positive() {
                 out.push(OpenItem {
+                    position,
                     posting: reference,
                     direction: posting.direction,
                     original: posting.amount,
@@ -530,7 +578,6 @@ impl<const P: u8> ClearingRegister<P> {
                 });
             }
         }
-        out.sort_by_key(|i| i.posting);
         Ok(out)
     }
 }
@@ -555,6 +602,17 @@ mod tests {
 
     fn account() -> AccountId {
         AccountId::from_index(0)
+    }
+
+    /// Pairs hand-built references with the positions a log would give them.
+    ///
+    /// The register does not order its output, so the order the candidates come
+    /// in *is* the order out — which is the property these tests exercise.
+    fn positioned(refs: &[PostingRef]) -> Vec<(PostingPosition, PostingRef)> {
+        refs.iter()
+            .enumerate()
+            .map(|(i, r)| (PostingPosition::new(LogIndex::new(i as u64), r.index), *r))
+            .collect()
     }
 
     fn table(entries: &[(u16, Direction, i64)]) -> (Table, Vec<PostingRef>) {
@@ -603,7 +661,7 @@ mod tests {
         reg.clear(clearing(&[(r[0], 1000), (r[1], 1000)]), &t)
             .expect("clears");
 
-        let open = reg.open_items(r.iter().copied(), &t).expect("ok");
+        let open = reg.open_items(positioned(&r), &t).expect("ok");
         assert!(open.is_empty(), "nothing should remain open");
         assert_eq!(reg.len(), 1);
     }
@@ -615,7 +673,7 @@ mod tests {
         reg.clear(clearing(&[(r[0], 400), (r[1], 400)]), &t)
             .expect("clears");
 
-        let open = reg.open_items(r.iter().copied(), &t).expect("ok");
+        let open = reg.open_items(positioned(&r), &t).expect("ok");
         assert_eq!(open.len(), 1, "the invoice remains partly open");
         let item = open.first().expect("present");
         assert_eq!(item.posting, r[0]);
@@ -638,11 +696,7 @@ mod tests {
             .expect("second payment");
 
         assert_eq!(reg.applied_to(r[0]), Eur::from_minor(1000));
-        assert!(
-            reg.open_items(r.iter().copied(), &t)
-                .expect("ok")
-                .is_empty()
-        );
+        assert!(reg.open_items(positioned(&r), &t).expect("ok").is_empty());
     }
 
     #[test]
@@ -689,14 +743,10 @@ mod tests {
         let c = clearing(&[(r[0], 1000), (r[1], 1000)]);
         let id = c.id;
         reg.clear(c, &t).expect("clears");
-        assert!(
-            reg.open_items(r.iter().copied(), &t)
-                .expect("ok")
-                .is_empty()
-        );
+        assert!(reg.open_items(positioned(&r), &t).expect("ok").is_empty());
 
         reg.reset(id, date!(2026 - 04 - 01)).expect("resets");
-        let open = reg.open_items(r.iter().copied(), &t).expect("ok");
+        let open = reg.open_items(positioned(&r), &t).expect("ok");
         assert_eq!(open.len(), 2, "both items reopen");
         assert!(reg.is_reset(id));
 

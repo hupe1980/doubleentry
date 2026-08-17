@@ -37,7 +37,7 @@ use crate::merkle::MerkleLog;
 use crate::money::{Amount, Currency};
 use crate::period::PeriodCalendar;
 use crate::posting::Layer;
-use crate::storage::{Cursor, EntryBatch, LedgerStore, MAX_PAGE_SIZE};
+use crate::storage::{Cursor, EntryBatch, LedgerStore, MAX_PAGE_SIZE, PostingCursor};
 use crate::{AccountId, Balanced};
 
 /// A ledger identifier for tests and examples.
@@ -584,8 +584,40 @@ pub async fn check_statement_pages_do_not_repeat_or_skip<const P: u8, S: LedgerS
     let f = Fixture::new();
     let key = f.key();
 
+    // Seed an entry that puts *three* postings on this one account — a split
+    // receipt booked as three lines against one credit, which is an ordinary
+    // entry. Without it every page boundary falls on an entry boundary, and a
+    // cursor that addresses entries rather than postings passes by luck.
+    let split = Entry::<Draft, P>::new(
+        EntryId::generate(),
+        match IdempotencyKey::new(b"conformance-split-statement".to_vec()) {
+            Ok(k) => k,
+            Err(e) => return CheckResult::fail(NAME, format!("bad fixture key: {e}")),
+        },
+        date!(2026 - 03 - 21),
+    )
+    .debit(f.left, Amount::<P>::from_minor(11), Currency::EUR)
+    .debit(f.left, Amount::<P>::from_minor(22), Currency::EUR)
+    .debit(f.left, Amount::<P>::from_minor(33), Currency::EUR)
+    .credit(f.right, Amount::<P>::from_minor(66), Currency::EUR)
+    .seal(&f.ctx());
+    match split {
+        Ok(entry) => match EntryBatch::new(vec![entry]) {
+            Ok(batch) => {
+                if let Err(e) = store.append(&batch).await {
+                    return CheckResult::fail(NAME, format!("append failed: {e}"));
+                }
+            }
+            Err(e) => return CheckResult::fail(NAME, format!("batch failed: {e}")),
+        },
+        Err(e) => return CheckResult::fail(NAME, format!("fixture entry failed: {e}")),
+    }
+    if let Err(e) = drain_sequencing(store).await {
+        return CheckResult::fail(NAME, e);
+    }
+
     let whole = match store
-        .statement(key, Cursor::start().with_limit(MAX_PAGE_SIZE))
+        .statement(key, PostingCursor::start().with_limit(MAX_PAGE_SIZE))
         .await
     {
         Ok(page) => page.lines,
@@ -596,7 +628,7 @@ pub async fn check_statement_pages_do_not_repeat_or_skip<const P: u8, S: LedgerS
     }
 
     let mut paged = Vec::new();
-    let mut cursor = Some(Cursor::start().with_limit(1));
+    let mut cursor = Some(PostingCursor::start().with_limit(1));
     let mut guard = 0usize;
     while let Some(c) = cursor {
         guard = guard.saturating_add(1);
@@ -613,6 +645,19 @@ pub async fn check_statement_pages_do_not_repeat_or_skip<const P: u8, S: LedgerS
             }
             Err(e) => return CheckResult::fail(NAME, format!("statement failed: {e}")),
         }
+    }
+
+    // The seeding above must actually have produced a multi-posting entry, or
+    // this check is back to only ever splitting on entry boundaries.
+    let splits_inside_an_entry = whole
+        .iter()
+        .zip(whole.iter().skip(1))
+        .any(|(a, b)| a.index == b.index && a.posting.index != b.posting.index);
+    if !splits_inside_an_entry {
+        return CheckResult::fail(
+            NAME,
+            "no entry contributed two lines, so page boundaries never fell inside one",
+        );
     }
 
     if paged == whole {
@@ -719,6 +764,25 @@ pub async fn check_period_lifecycle_and_seals<const P: u8, S: LedgerStore<P>>(
     if store.seal_period(&id).await.is_ok() {
         return CheckResult::fail(NAME, "an open period was sealed");
     }
+
+    // An *earlier* period, defined and left open. A seal's closing balance is
+    // cumulative through its period's last day, so sealing March while February
+    // still accepts postings would let one ordinary February booking restate it
+    // afterwards — with every seal, proof and chain still verifying. A backend
+    // must refuse to seal out of date order.
+    let Ok(earlier_id) = crate::period::PeriodId::new("conformance-2026-02") else {
+        return CheckResult::fail(NAME, "bad fixture identifier");
+    };
+    let Ok(earlier) = crate::period::Period::new(
+        earlier_id.clone(),
+        date!(2026 - 02 - 01),
+        date!(2026 - 02 - 28),
+    ) else {
+        return CheckResult::fail(NAME, "bad fixture range");
+    };
+    if let Err(e) = store.define_period(&earlier).await {
+        return CheckResult::fail(NAME, format!("define_period failed: {e}"));
+    }
     if store
         .transition_period(&id, crate::period::PeriodState::Sealed)
         .await
@@ -750,6 +814,25 @@ pub async fn check_period_lifecycle_and_seals<const P: u8, S: LedgerStore<P>>(
             }
         }
         Err(e) => return CheckResult::fail(NAME, format!("periods failed: {e}")),
+    }
+
+    if store.seal_period(&id).await.is_ok() {
+        return CheckResult::fail(
+            NAME,
+            "a period was sealed while an earlier period was still open, so its \
+             closing balance can still be restated",
+        );
+    }
+
+    // Seal the earlier one first, and the later one becomes sealable.
+    if let Err(e) = store
+        .transition_period(&earlier_id, crate::period::PeriodState::Closing)
+        .await
+    {
+        return CheckResult::fail(NAME, format!("open to closing was refused: {e}"));
+    }
+    if let Err(e) = store.seal_period(&earlier_id).await {
+        return CheckResult::fail(NAME, format!("the earlier period would not seal: {e}"));
     }
 
     let seal = match store.seal_period(&id).await {
@@ -799,6 +882,98 @@ pub async fn check_period_lifecycle_and_seals<const P: u8, S: LedgerStore<P>>(
             Err(e) => return CheckResult::fail(NAME, format!("registry would not rebuild: {e}")),
         },
         Err(e) => return CheckResult::fail(NAME, format!("accounts failed: {e}")),
+    }
+
+    // A sealed balance must stay provable and nameable after the books move on.
+    // `Seal::accounts` is the registry commitment as of the seal; onboarding one
+    // more account used to make every already-sealed balance unnameable, and a
+    // routine `close` did the same. Both are ordinary operations, so a backend
+    // that cannot answer afterwards cannot answer in production.
+    let onboarded = Account::new(
+        match AccountPath::parse("Conformance:Later") {
+            Ok(p) => p,
+            Err(e) => return CheckResult::fail(NAME, format!("bad fixture path: {e}")),
+        },
+        date!(2026 - 05 - 01),
+    );
+    let later_handle = AccountId::from_index(match u32::try_from(seal.accounts.size) {
+        Ok(n) => n,
+        Err(_) => return CheckResult::fail(NAME, "registry size does not fit a handle"),
+    });
+    if let Err(e) = store
+        .register_account(&AccountRecord {
+            id: later_handle,
+            account: onboarded,
+        })
+        .await
+    {
+        return CheckResult::fail(NAME, format!("register_account failed: {e}"));
+    }
+
+    // Every row in the sealed closing balance must still prove and still name
+    // its account — not just one of them, and not only before the registry
+    // moved on. Which accounts those are is read off the store rather than
+    // assumed, so this does not depend on the fixture's naming.
+    let closing = match store
+        .trial_balance_through_date(date!(2026 - 03 - 31))
+        .await
+    {
+        Ok(tb) => tb,
+        Err(e) => {
+            return CheckResult::fail(NAME, format!("trial_balance_through_date failed: {e}"));
+        }
+    };
+    if closing.is_empty() {
+        return CheckResult::fail(NAME, "the period sealed with an empty closing balance");
+    }
+    let stored_paths = match store.accounts().await {
+        Ok(records) => records,
+        Err(e) => return CheckResult::fail(NAME, format!("accounts failed: {e}")),
+    };
+    for (key, balance) in closing.iter() {
+        match store.prove_sealed_balance(&id, *key).await {
+            Ok(Some(proven)) => {
+                if !proven.verify() {
+                    return CheckResult::fail(
+                        NAME,
+                        format!("the sealed balance for {} did not verify", key.account),
+                    );
+                }
+                if proven.balance.balance != *balance {
+                    return CheckResult::fail(
+                        NAME,
+                        format!("the proof for {} carries a different balance", key.account),
+                    );
+                }
+                if proven.seal.seal_hash != seal.seal_hash {
+                    return CheckResult::fail(NAME, "the proof came from a different seal");
+                }
+                let expected = stored_paths
+                    .iter()
+                    .find(|r| r.id == key.account)
+                    .map(|r| &r.account.path);
+                if expected != Some(proven.path()) {
+                    return CheckResult::fail(
+                        NAME,
+                        format!(
+                            "the sealed balance for {} named {}, not the stored path",
+                            key.account,
+                            proven.path()
+                        ),
+                    );
+                }
+            }
+            Ok(None) => {
+                return CheckResult::fail(
+                    NAME,
+                    format!(
+                        "{} is in the closing balance but could not be proven",
+                        key.account
+                    ),
+                );
+            }
+            Err(e) => return CheckResult::fail(NAME, format!("prove_sealed_balance failed: {e}")),
+        }
     }
 
     // The stored chain must reproduce what was returned, and verify.
@@ -869,7 +1044,7 @@ pub async fn check_kind_survives_a_round_trip<const P: u8, S: LedgerStore<P>>(
         currency: Currency::EUR,
         layer: Layer::Settled,
     };
-    match store.statement(key, Cursor::start()).await {
+    match store.statement(key, PostingCursor::start()).await {
         Ok(page) => {
             let seen = page
                 .lines
@@ -1331,6 +1506,62 @@ pub async fn check_open_items_track_residuals<const P: u8, S: LedgerStore<P>>(
         return CheckResult::fail(NAME, format!("append failed: {e}"));
     }
 
+    // Two more invoices, left open, with identifiers that **descend**. Without
+    // them every entry here carries an `EntryId::generate()` value — UUIDv7, so
+    // time-ordered — and sorting by identifier would coincide with log order,
+    // letting an implementation that sorts by the wrong key pass by luck.
+    let mut descending = Vec::new();
+    for (n, high) in [0xeeee_u128, 0xdddd_u128].into_iter().enumerate() {
+        let id = EntryId::from_uuid(uuid::Uuid::from_u128(high << 112));
+        let Some(entry) = f.entry_with_id::<P>(id, format!("oi-descending-{n}").as_bytes(), 400)
+        else {
+            return CheckResult::fail(NAME, "fixture entry failed to seal");
+        };
+        if let Err(e) = store.append(&EntryBatch::single(entry)).await {
+            return CheckResult::fail(NAME, format!("append failed: {e}"));
+        }
+        descending.push(PostingRef::new(id, 0));
+    }
+    if let Err(e) = drain_sequencing(store).await {
+        return CheckResult::fail(NAME, e);
+    }
+    let mut by_identifier = descending.clone();
+    by_identifier.sort();
+    if by_identifier == descending {
+        return CheckResult::fail(
+            NAME,
+            "the fixture must distinguish identifier order from log order",
+        );
+    }
+
+    // And one entry contributing *two* open postings on this account, so a page
+    // boundary can fall inside an entry. Without it every open item sits on its
+    // own entry and an entry-addressed cursor pages correctly by accident.
+    let split_id = EntryId::generate();
+    let split = Entry::<Draft, P>::new(
+        split_id,
+        match IdempotencyKey::new(b"oi-split".to_vec()) {
+            Ok(k) => k,
+            Err(e) => return CheckResult::fail(NAME, format!("bad fixture key: {e}")),
+        },
+        date!(2026 - 03 - 22),
+    )
+    .debit(f.left, Amount::<P>::from_minor(70), Currency::EUR)
+    .debit(f.left, Amount::<P>::from_minor(80), Currency::EUR)
+    .credit(f.right, Amount::<P>::from_minor(150), Currency::EUR)
+    .seal(&f.ctx());
+    match split {
+        Ok(entry) => {
+            if let Err(e) = store.append(&EntryBatch::single(entry)).await {
+                return CheckResult::fail(NAME, format!("append failed: {e}"));
+            }
+        }
+        Err(e) => return CheckResult::fail(NAME, format!("fixture entry failed: {e}")),
+    }
+    if let Err(e) = drain_sequencing(store).await {
+        return CheckResult::fail(NAME, e);
+    }
+
     let key = BalanceKey {
         account: f.left,
         currency: Currency::EUR,
@@ -1345,8 +1576,11 @@ pub async fn check_open_items_track_residuals<const P: u8, S: LedgerStore<P>>(
         return CheckResult::fail(NAME, format!("a valid clearing was rejected: {e}"));
     }
 
-    let open = match store.open_items(key).await {
-        Ok(o) => o,
+    let open = match store
+        .open_items(key, PostingCursor::start().with_limit(MAX_PAGE_SIZE))
+        .await
+    {
+        Ok(page) => page.items,
         Err(e) => return CheckResult::fail(NAME, format!("open_items failed: {e}")),
     };
     let Some(item) = open.iter().find(|i| i.posting == invoice_ref) else {
@@ -1362,6 +1596,86 @@ pub async fn check_open_items_track_residuals<const P: u8, S: LedgerStore<P>>(
         return CheckResult::fail(NAME, "a fully applied posting is still open");
     }
 
+    // Oldest first. Open items exist to be cleared, and FIFO — apply this
+    // payment to the oldest open invoice — is the workflow; "oldest" is log
+    // order, because that is the crate's answer to ordering everywhere else.
+    // It must not be entry-*identifier* order: identifiers are caller-supplied,
+    // so that ordering is chronological only when the caller happens to use
+    // this crate's own time-ordered generator, and silently is not otherwise.
+    let statement = match store
+        .statement(key, PostingCursor::start().with_limit(MAX_PAGE_SIZE))
+        .await
+    {
+        Ok(page) => page.lines,
+        Err(e) => return CheckResult::fail(NAME, format!("statement failed: {e}")),
+    };
+    let log_rank = |reference: PostingRef| {
+        statement
+            .iter()
+            .position(|l| l.posting == reference)
+            .unwrap_or(usize::MAX)
+    };
+    let mut previous = 0usize;
+    for item in &open {
+        let rank = log_rank(item.posting);
+        if rank < previous {
+            return CheckResult::fail(
+                NAME,
+                format!(
+                    "open items are not in log order; {} came too late",
+                    item.posting
+                ),
+            );
+        }
+        previous = rank;
+    }
+
+    // The seeding above must actually have left two open items on one entry, or
+    // paging is back to only ever splitting on entry boundaries.
+    let splits_inside_an_entry = open
+        .iter()
+        .zip(open.iter().skip(1))
+        .any(|(a, b)| a.position.index == b.position.index);
+    if !splits_inside_an_entry {
+        return CheckResult::fail(
+            NAME,
+            "no entry left two open items, so page boundaries never fell inside one",
+        );
+    }
+
+    // Paging must reproduce the one-page answer exactly, at every page size.
+    for limit in 1..=3usize {
+        let mut paged = Vec::new();
+        let mut cursor = Some(PostingCursor::start().with_limit(limit));
+        let mut guard = 0usize;
+        while let Some(c) = cursor {
+            guard = guard.saturating_add(1);
+            if guard > open.len().saturating_add(8) {
+                return CheckResult::fail(NAME, "open-item pagination did not terminate");
+            }
+            match store.open_items(key, c).await {
+                Ok(page) => {
+                    if page.items.is_empty() && page.next.is_some() {
+                        return CheckResult::fail(NAME, "an empty page handed back another cursor");
+                    }
+                    paged.extend(page.items);
+                    cursor = page.next;
+                }
+                Err(e) => return CheckResult::fail(NAME, format!("open_items failed: {e}")),
+            }
+        }
+        if paged != open {
+            return CheckResult::fail(
+                NAME,
+                format!(
+                    "paging open items at limit {limit} produced {} of {}",
+                    paged.len(),
+                    open.len()
+                ),
+            );
+        }
+    }
+
     // Releasing reopens both.
     if let Err(e) = store
         .reset_clearing(clearing_id, date!(2026 - 05 - 10))
@@ -1369,8 +1683,12 @@ pub async fn check_open_items_track_residuals<const P: u8, S: LedgerStore<P>>(
     {
         return CheckResult::fail(NAME, format!("reset failed: {e}"));
     }
-    match store.open_items(key).await {
-        Ok(after) => {
+    match store
+        .open_items(key, PostingCursor::start().with_limit(MAX_PAGE_SIZE))
+        .await
+    {
+        Ok(page) => {
+            let after = page.items;
             let invoice_back = after
                 .iter()
                 .any(|i| i.posting == invoice_ref && i.residual == Amount::<P>::from_minor(1000));

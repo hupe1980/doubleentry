@@ -53,6 +53,8 @@
 //! What a seal detects is *alteration*, not *access*. Preventing writes is the
 //! storage layer's job; making a write recognisable afterwards is this one's.
 
+use std::collections::BTreeSet;
+
 use crate::account::AccountBindingProof;
 use crate::balance::{Balance, BalanceKey, TrialBalance};
 use crate::canonical::{Canonical, CanonicalWriter};
@@ -493,6 +495,158 @@ impl<const P: u8> BalanceProof<P> {
     }
 }
 
+/// A sealed balance, named, with everything needed to check it.
+///
+/// The complete answer to *what did this account close a period at, and says
+/// who?* — a seal, an `O(log n)` path to one trial-balance row, and an
+/// `O(log n)` path binding that row's handle to an account path. It discloses
+/// nothing about any other account, balance or entry, and it serialises, because
+/// the whole point is handing it to someone who does not have the books.
+///
+/// Assemble it with [`Journal::prove_sealed_balance`](crate::Journal::prove_sealed_balance)
+/// or [`LedgerStore::prove_sealed_balance`](crate::LedgerStore::prove_sealed_balance),
+/// never by hand — see [`SealedBalance::assemble`] for what they check on the
+/// way. [`Self::verify`] re-checks the lot from scratch, which is what a
+/// recipient does, since they did not build it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct SealedBalance<const P: u8> {
+    /// The seal the claim is against.
+    pub seal: Seal,
+    /// The balance, and its path to [`Seal::trial_balance`].
+    pub balance: BalanceProof<P>,
+    /// The handle-to-path binding, and its path to [`Seal::accounts`].
+    pub binding: AccountBindingProof,
+}
+
+impl<const P: u8> SealedBalance<P> {
+    /// Builds the claim from a seal, the period's closing balances, and the
+    /// registry — checking every part on the way.
+    ///
+    /// The single place the recipe lives, so the in-memory journal and every
+    /// durable backend assemble it identically rather than keeping copies that
+    /// can drift.
+    ///
+    /// Three things are checked, and the first is the one that matters:
+    ///
+    /// 1. `closing` reproduces [`Seal::trial_balance`]. A commitment the caller
+    ///    just computed proves nothing until it matches the one on record —
+    ///    skip this and the resulting proof is internally consistent and
+    ///    evidence of nothing. A mismatch is [`SealedBalanceError::Restated`].
+    /// 2. The handle was issued by the time the period sealed, so the binding is
+    ///    proven at [`Seal::accounts`]`.size` rather than against the registry
+    ///    as it stands now.
+    /// 3. That binding verifies under [`Seal::accounts`].
+    ///
+    /// Returns `Ok(None)` when the key has no row in the closing trial balance.
+    /// That is not a balance of zero: an account with no postings has no row,
+    /// and a proof of one must not be manufactured.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SealedBalanceError`] for any of the three failures above.
+    pub fn assemble(
+        seal: Seal,
+        closing: &TrialBalance<P>,
+        accounts: &crate::account::AccountRegistry,
+        key: BalanceKey,
+    ) -> Result<Option<Self>, SealedBalanceError> {
+        let commitment = TrialBalanceCommitment::of(closing);
+        if commitment.head() != seal.trial_balance {
+            return Err(SealedBalanceError::Restated {
+                period: seal.period,
+            });
+        }
+        let Some(binding) = accounts.prove_binding_at(key.account, seal.accounts.size) else {
+            return Err(SealedBalanceError::NotYetRegistered {
+                period: seal.period,
+                account: key.account,
+            });
+        };
+        if !binding.verify(&seal.accounts) {
+            return Err(SealedBalanceError::RegistryMismatch {
+                period: seal.period,
+            });
+        }
+        Ok(commitment.prove(&key).map(|balance| Self {
+            seal,
+            balance,
+            binding,
+        }))
+    }
+
+    /// Re-checks the whole claim against the seal it carries.
+    ///
+    /// Equivalent to [`BalanceProof::verify_naming`]; offered here so a
+    /// recipient does not have to know which of the three pieces to feed to
+    /// which verifier.
+    ///
+    /// Note what this does *not* establish: that the seal is one you should
+    /// trust. A seal is self-consistent by construction, so check it against a
+    /// chain you already hold — [`SealChain::verify`] — or against a copy
+    /// archived when the period closed.
+    #[must_use]
+    pub fn verify(&self) -> bool {
+        self.balance.verify_naming(&self.binding, &self.seal)
+    }
+
+    /// The account path the balance belongs to.
+    #[must_use]
+    pub fn path(&self) -> &crate::account::AccountPath {
+        self.binding.path()
+    }
+}
+
+/// Failure proving a sealed balance.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum SealedBalanceError {
+    /// No seal exists for the period.
+    #[error("period {period} has not been sealed")]
+    NotSealed {
+        /// The period asked about.
+        period: PeriodId,
+    },
+    /// The period the seal names is no longer defined in the calendar.
+    #[error("period {period} is sealed but no longer defined")]
+    UndefinedPeriod {
+        /// The period asked about.
+        period: PeriodId,
+    },
+    /// The rebuilt trial balance does not match what the seal committed to.
+    ///
+    /// The books have changed since the period was sealed, or the seal did not
+    /// come from them. Either way there is nothing honest to prove, so no proof
+    /// is returned — one against a locally recomputed commitment would be
+    /// internally consistent and evidence of nothing.
+    #[error("the rebuilt closing balance does not match the seal for period {period}")]
+    Restated {
+        /// The period asked about.
+        period: PeriodId,
+    },
+    /// The account had not been registered when the period was sealed.
+    ///
+    /// Distinct from having no balance: a seal names the handles the registry
+    /// had issued by then, and an account onboarded afterwards is not one it can
+    /// speak about at all.
+    #[error("account {account} was not registered when period {period} was sealed")]
+    NotYetRegistered {
+        /// The period asked about.
+        period: PeriodId,
+        /// The account asked about.
+        account: crate::account::AccountId,
+    },
+    /// The account bindings do not reproduce the seal's `accounts` head.
+    ///
+    /// The registry was renumbered — re-registering the same paths in a
+    /// different order repoints every handle the seal's balances are keyed on.
+    #[error("the account bindings do not match the seal for period {period}")]
+    RegistryMismatch {
+        /// The period asked about.
+        period: PeriodId,
+    },
+}
+
 /// Failure verifying a chain of seals.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
@@ -541,6 +695,27 @@ pub enum SealChainError {
         /// The offending period.
         period: PeriodId,
     },
+    /// The account registry shrank between two seals.
+    ///
+    /// An [`AccountRegistry`](crate::AccountRegistry) only ever grows: handles
+    /// are dense positions and are never reissued, because a reused one would
+    /// repoint every posting row and every sealed balance that names it. A later
+    /// seal committing to *fewer* bindings than an earlier one is therefore not
+    /// a state the engine can reach — it is a registry that was rebuilt from a
+    /// truncated set, which is exactly the renumbering
+    /// [`Seal::accounts`] exists to expose.
+    #[error(
+        "seal for period {period} commits to {found} account bindings, fewer than \
+         the {expected} its predecessor did"
+    )]
+    ShrunkenRegistry {
+        /// The offending period.
+        period: PeriodId,
+        /// How many bindings the predecessor committed to.
+        expected: u64,
+        /// How many this seal commits to.
+        found: u64,
+    },
 }
 
 /// An ordered chain of period seals covering one ledger.
@@ -554,6 +729,11 @@ pub enum SealChainError {
 pub struct SealChain {
     ledger: LedgerId,
     seals: Vec<Seal>,
+    /// The periods already in the chain, so the one-seal-per-period rule costs a
+    /// lookup rather than a scan. A ledger on daily periods reaches thousands of
+    /// seals within a decade, and scanning made [`SealChain::verify`] quadratic
+    /// in exactly the case an auditor runs it.
+    periods: BTreeSet<PeriodId>,
 }
 
 impl SealChain {
@@ -563,6 +743,7 @@ impl SealChain {
         Self {
             ledger,
             seals: Vec::new(),
+            periods: BTreeSet::new(),
         }
     }
 
@@ -603,14 +784,19 @@ impl SealChain {
         self.seals.last()
     }
 
-    /// Every rule a seal must satisfy to belong at the end of `preceding`.
+    /// Every rule a seal must satisfy to belong after `previous`.
     ///
     /// Shared by [`SealChain::push`] and [`SealChain::verify`] so that appending
     /// and re-checking cannot drift apart — a chain that accepted a link it
     /// would later reject, or the reverse, would be worse than either rule alone.
+    ///
+    /// `seen` holds the periods already in the chain; the caller owns it so that
+    /// verifying a whole chain stays linear rather than rescanning the prefix at
+    /// every position.
     fn check_link(
         ledger: &LedgerId,
-        preceding: &[Seal],
+        seen: &BTreeSet<PeriodId>,
+        previous: Option<&Seal>,
         seal: &Seal,
     ) -> Result<(), SealChainError> {
         let period = || seal.period.clone();
@@ -624,10 +810,10 @@ impl SealChain {
                 found: seal.ledger.clone(),
             });
         }
-        if preceding.iter().any(|s| s.period == seal.period) {
+        if seen.contains(&seal.period) {
             return Err(SealChainError::DuplicatePeriod { period: period() });
         }
-        match (preceding.last(), seal.prev_seal) {
+        match (previous, seal.prev_seal) {
             (None, None) => Ok(()),
             (Some(prev), Some(reference)) => {
                 if prev.seal_hash != reference {
@@ -635,6 +821,16 @@ impl SealChain {
                 }
                 if seal.tree_head.size < prev.tree_head.size {
                     return Err(SealChainError::NonMonotonic { period: period() });
+                }
+                // The registry only ever grows, so a later seal committing to
+                // fewer bindings means the handles its balances are keyed on
+                // were renumbered underneath the chain.
+                if seal.accounts.size < prev.accounts.size {
+                    return Err(SealChainError::ShrunkenRegistry {
+                        period: period(),
+                        expected: prev.accounts.size,
+                        found: seal.accounts.size,
+                    });
                 }
                 Ok(())
             }
@@ -648,20 +844,30 @@ impl SealChain {
     ///
     /// Returns the [`SealChainError`] the seal violates, having appended nothing.
     pub fn push(&mut self, seal: Seal) -> Result<(), SealChainError> {
-        Self::check_link(&self.ledger, &self.seals, &seal)?;
+        Self::check_link(&self.ledger, &self.periods, self.seals.last(), &seal)?;
+        self.periods.insert(seal.period.clone());
         self.seals.push(seal);
         Ok(())
     }
 
     /// Verifies every seal and every link.
     ///
+    /// Linear in the number of seals: the periods seen so far are carried along
+    /// rather than rescanned at each position. They are re-derived from the
+    /// seals rather than read from the index [`SealChain::push`] maintains —
+    /// verification that trusted its own cache would only be checking that the
+    /// cache agreed with itself.
+    ///
     /// # Errors
     ///
     /// Returns the first [`SealChainError`] that does not hold.
     pub fn verify(&self) -> Result<(), SealChainError> {
-        for (position, seal) in self.seals.iter().enumerate() {
-            let preceding = self.seals.get(..position).unwrap_or_default();
-            Self::check_link(&self.ledger, preceding, seal)?;
+        let mut seen: BTreeSet<PeriodId> = BTreeSet::new();
+        let mut previous: Option<&Seal> = None;
+        for seal in &self.seals {
+            Self::check_link(&self.ledger, &seen, previous, seal)?;
+            seen.insert(seal.period.clone());
+            previous = Some(seal);
         }
         Ok(())
     }
@@ -1071,6 +1277,69 @@ mod tests {
     }
 
     #[test]
+    fn the_account_registry_may_not_shrink_between_seals() {
+        // Handles are dense positions and are never reissued, so a registry only
+        // grows. A later seal committing to fewer bindings is a registry rebuilt
+        // from a truncated set — which renumbers the handles every earlier
+        // balance is keyed on, while every seal hash still checks out.
+        let mut chain = SealChain::new(lid());
+        let first = Seal::build(
+            lid(),
+            pid("2026-01"),
+            PeriodCoverage::spanning(0, 4, 5),
+            head(5, 1),
+            &tb(&[(0, 100, 0)]),
+            TreeHead {
+                size: 12,
+                root: Hash::from_bytes([0xa0; 32]),
+            },
+            None,
+        );
+        chain.push(first.clone()).expect("genesis");
+
+        let renumbered = Seal::build(
+            lid(),
+            pid("2026-02"),
+            PeriodCoverage::spanning(5, 9, 5),
+            head(10, 2),
+            &tb(&[(0, 200, 0)]),
+            TreeHead {
+                size: 9,
+                root: Hash::from_bytes([0xa1; 32]),
+            },
+            Some(first.seal_hash),
+        );
+        assert!(matches!(
+            chain.push(renumbered),
+            Err(SealChainError::ShrunkenRegistry {
+                expected: 12,
+                found: 9,
+                ..
+            })
+        ));
+
+        // Growing, or holding steady, is ordinary.
+        for size in [12, 13] {
+            let grown = Seal::build(
+                lid(),
+                pid("2026-02"),
+                PeriodCoverage::spanning(5, 9, 5),
+                head(10, 2),
+                &tb(&[(0, 200, 0)]),
+                TreeHead {
+                    size,
+                    root: Hash::from_bytes([0xa2; 32]),
+                },
+                Some(first.seal_hash),
+            );
+            let mut fresh = SealChain::new(lid());
+            fresh.push(first.clone()).expect("genesis");
+            fresh.push(grown).expect("a registry that grew");
+            assert!(fresh.verify().is_ok());
+        }
+    }
+
+    #[test]
     fn tampering_with_a_sealed_period_is_detected_by_the_chain() {
         let mut chain = SealChain::new(lid());
         let first = Seal::build(
@@ -1260,7 +1529,7 @@ mod tests {
 
         // The complete claim: this account, this balance, this seal.
         assert!(balance.verify_naming(&binding, &seal));
-        assert_eq!(binding.account().path.to_string(), "Assets:Cash");
+        assert_eq!(binding.path().to_string(), "Assets:Cash");
 
         // A binding for a *different* handle must not launder a real balance
         // under the wrong account's name.
@@ -1293,7 +1562,7 @@ mod tests {
         assert!(proof.verify(&root));
 
         // Claiming the same account sits at a different position.
-        proof.record.id = AccountId::from_index(1);
+        proof.id = AccountId::from_index(1);
         assert!(!proof.verify(&root));
     }
 

@@ -20,7 +20,7 @@ use doubleentry::entry::{Draft, LedgerPolicy, SealContext};
 use doubleentry::period::{LedgerId, Period, PeriodCalendar, PeriodId, PeriodState};
 use doubleentry::seal::{Seal, SealChain, SealChainError};
 use doubleentry::storage::sqlite::{SqliteError, SqliteStore};
-use doubleentry::storage::{Cursor, EntryBatch, LedgerStore};
+use doubleentry::storage::{Cursor, EntryBatch, LedgerStore, PostingCursor};
 use doubleentry::{
     AccountId, Amount, BalanceKey, Balanced, Currency, Entry, EntryId, IdempotencyKey, Layer,
     LogIndex, MerkleLog,
@@ -149,6 +149,85 @@ async fn entries_round_trip_through_the_database() {
     assert_eq!(loaded.entry.postings().len(), 2);
     assert_eq!(loaded.entry.content_hash(), hash);
     assert_eq!(loaded.entry.booking_date(), original.booking_date());
+}
+
+#[tokio::test]
+async fn a_pruned_log_is_named_rather_than_proven_around() {
+    // The cold tier's protocol ends "only then may the operational store drop
+    // the rows". Doing so costs the hot store its proofs — the Merkle log is
+    // derived from the stored leaves, so a hole renumbers every leaf after it.
+    //
+    // The head does *not* notice: it is read from the last row's stored root.
+    // So the two would disagree silently, which is exactly the shape of failure
+    // this crate refuses to ship.
+    let h = Harness::start_named("sqlite-pruned").await;
+    for n in 0..10i64 {
+        h.store
+            .append(&EntryBatch::single(
+                h.entry(format!("k{n}").as_bytes(), 100 + n),
+            ))
+            .await
+            .expect("appends");
+    }
+
+    let head = h.store.head().await.expect("reads");
+    let entry_7 = h
+        .store
+        .page(Cursor::start())
+        .await
+        .expect("reads")
+        .records
+        .into_iter()
+        .find(|r| r.index == Some(LogIndex::new(7)))
+        .expect("entry 7 is in the log");
+    assert!(
+        h.store
+            .prove_inclusion(LogIndex::new(7))
+            .await
+            .expect("in range")
+            .verify(&entry_7.content_hash, &head),
+        "sanity: proofs work before anything is pruned"
+    );
+
+    // Prune what a compaction would have archived.
+    for sql in [
+        "DELETE FROM posting_dimensions WHERE entry_id IN \
+         (SELECT entry_id FROM entries WHERE log_index < 5)",
+        "DELETE FROM postings WHERE entry_id IN \
+         (SELECT entry_id FROM entries WHERE log_index < 5)",
+        "DELETE FROM entries WHERE log_index < 5",
+    ] {
+        sqlx::query(sql)
+            .execute(h.store.pool())
+            .await
+            .expect("prunes");
+    }
+
+    // The head still reports the truth, which is what makes the mismatch
+    // dangerous rather than obvious.
+    assert_eq!(h.store.head().await.expect("reads"), head);
+
+    // Every proof route now refuses, naming the hole. Before this check, an
+    // index past the shortened set reported `IndexOutOfRange` for an index that
+    // is genuinely in range, and one inside it returned a proof for a
+    // *different* entry — caught only if the caller verified before handing it
+    // to an auditor.
+    for outcome in [
+        h.store.prove_inclusion(LogIndex::new(7)).await.err(),
+        h.store.prove_inclusion(LogIndex::new(3)).await.err(),
+        h.store.prove_consistency(2).await.err(),
+    ] {
+        assert!(
+            matches!(
+                outcome,
+                Some(SqliteError::LogNotDense {
+                    expected: 0,
+                    found: 5
+                })
+            ),
+            "expected the hole to be named, got {outcome:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -345,15 +424,27 @@ async fn open_items_track_partial_settlement() {
         .await
         .expect("clears");
 
-    let open = h.store.open_items(h.key()).await.expect("reads");
-    assert_eq!(open.len(), 1);
-    assert_eq!(open[0].residual, Eur::from_minor(600));
+    let open = h
+        .store
+        .open_items(h.key(), PostingCursor::start())
+        .await
+        .expect("reads");
+    assert_eq!(open.items.len(), 1);
+    assert_eq!(open.items[0].residual, Eur::from_minor(600));
 
     h.store
         .reset_clearing(clearing_id, date!(2026 - 04 - 01))
         .await
         .expect("resets");
-    assert_eq!(h.store.open_items(h.key()).await.expect("reads").len(), 2);
+    assert_eq!(
+        h.store
+            .open_items(h.key(), PostingCursor::start())
+            .await
+            .expect("reads")
+            .items
+            .len(),
+        2
+    );
 }
 
 /// The abstraction is only real if independent implementations agree.

@@ -35,7 +35,7 @@ use crate::account::{
 };
 use crate::balance::{Balance, BalanceKey, TrialBalance};
 use crate::checkpoint::Checkpoint;
-use crate::clearing::{Clearing, ClearingId, OpenItem, PostingRef};
+use crate::clearing::{Clearing, ClearingId, OpenItem, PostingPosition, PostingRef};
 use crate::dimensions::{Dimensions, Label};
 use crate::entry::{
     Balanced, Description, DocumentRef, Draft, Entry, EntryId, IdempotencyKey, IntegrityError,
@@ -51,7 +51,9 @@ use crate::money::{Amount, Currency, MoneyError};
 use crate::period::{LedgerId, Period, PeriodCalendar, PeriodId, PeriodState};
 use crate::posting::{Direction, Layer, Posting};
 use crate::seal::{PeriodCoverage, Seal, SealChain};
-use crate::storage::{Cursor, EntryBatch, LedgerStore, Page, StatementPage, StoredEntry};
+use crate::storage::{
+    Cursor, EntryBatch, LedgerStore, OpenItemPage, Page, PostingCursor, StatementPage, StoredEntry,
+};
 
 /// The reference DDL, applied by [`PostgresStore::migrate`].
 pub const SCHEMA: &str = include_str!("../../schema/postgres.sql");
@@ -104,23 +106,26 @@ pub enum PostgresError {
     /// A proof could not be built.
     #[error(transparent)]
     Proof(#[from] ProofError),
+    /// The stored log is not dense from zero, so no proof can be built from it.
+    #[error(
+        "the log is missing entries: expected log index {expected}, found {found}; \
+         proofs are built from the stored leaves and a hole renumbers every one after it"
+    )]
+    LogNotDense {
+        /// The index the sequence required.
+        expected: u64,
+        /// The index actually present.
+        found: u64,
+    },
+    /// A sealed balance could not be proven.
+    #[error(transparent)]
+    SealedBalance(#[from] crate::seal::SealedBalanceError),
+    /// An account binding could not be rebuilt.
+    #[error(transparent)]
+    Account(#[from] crate::account::AccountError),
     /// Arithmetic overflowed.
     #[error(transparent)]
     Money(#[from] MoneyError),
-    /// The period is not defined.
-    #[error("period {period} is not defined")]
-    UnknownPeriod {
-        /// The missing period.
-        period: PeriodId,
-    },
-    /// The period is not ready to be sealed.
-    #[error("period {period} is {state}; only a closing period can be sealed")]
-    PeriodNotClosing {
-        /// The period.
-        period: PeriodId,
-        /// Its current state.
-        state: PeriodState,
-    },
     /// A clearing was refused.
     #[error(transparent)]
     Clearing(#[from] crate::clearing::ClearingError),
@@ -426,18 +431,46 @@ impl<const P: u8> PostgresStore<P> {
     }
 
     /// Every content hash in log order, which is the Merkle log's leaf sequence.
+    /// Reads every leaf, checking the log is dense from zero.
+    ///
+    /// **Checked, not trusted**, for the same reason
+    /// [`MerkleAccumulator::try_from_parts`] checks the subtree cover: a tree
+    /// built from whatever rows come back is a plausible-looking wrong tree.
+    ///
+    /// The leaves *are* the log here, so a hole renumbers every leaf after it.
+    /// The head is unaffected — it is read from the last row's stored root — so
+    /// the two would disagree silently: `prove_inclusion` for an index past the
+    /// shortened set reports `IndexOutOfRange` for an index that is genuinely in
+    /// range, and one inside it returns a proof for a *different* entry, caught
+    /// only if the caller verifies before handing it on.
+    ///
+    /// Rows do not go missing on their own. They go missing when hot storage is
+    /// pruned after a [cold-tier](crate::storage::iceberg) compaction, when a
+    /// restore is partial, or when `DELETE` was granted on a table the schema
+    /// says to withhold it from. All three are worth naming rather than
+    /// discovering through a proof that will not verify.
     async fn leaves(&self) -> Result<Vec<Hash>, PostgresError> {
         let rows = sqlx::query(
-            "SELECT content_hash FROM entries WHERE log_index IS NOT NULL ORDER BY log_index",
+            "SELECT log_index, content_hash FROM entries \
+             WHERE log_index IS NOT NULL ORDER BY log_index",
         )
         .fetch_all(&self.pool)
         .await?;
-        rows.iter()
-            .map(|r| {
-                let bytes: Vec<u8> = r.try_get("content_hash")?;
-                hash_from_bytes(&bytes)
-            })
-            .collect()
+        let mut leaves = Vec::with_capacity(rows.len());
+        for (position, row) in rows.iter().enumerate() {
+            let stored: i64 = row.try_get("log_index")?;
+            let expected = i64::try_from(position).unwrap_or(i64::MAX);
+            if stored != expected {
+                return Err(PostgresError::LogNotDense {
+                    expected: u64::try_from(expected).unwrap_or(0),
+                    found: u64::try_from(stored).unwrap_or(0),
+                });
+            }
+            leaves.push(hash_from_bytes(
+                &row.try_get::<Vec<u8>, _>("content_hash")?,
+            )?);
+        }
+        Ok(leaves)
     }
 
     /// Rebuilds the full log, leaves included.
@@ -1437,22 +1470,59 @@ impl<const P: u8> LedgerStore<P> for PostgresStore<P> {
         Ok(out)
     }
 
-    async fn seal_period(&self, period: &PeriodId) -> Result<Seal, Self::Error> {
-        let Some(definition) = <Self as LedgerStore<P>>::periods(self)
-            .await?
-            .into_iter()
-            .find(|p| p.id == *period)
-        else {
-            return Err(PostgresError::UnknownPeriod {
-                period: period.clone(),
-            });
-        };
-        if definition.state != PeriodState::Closing {
-            return Err(PostgresError::PeriodNotClosing {
-                period: period.clone(),
-                state: definition.state,
-            });
+    /// Folds every *sequenced* entry booked on or before `end`.
+    ///
+    /// The `log_index IS NOT NULL` predicate is what keeps a seal honest: the
+    /// tree head it carries covers only sequenced entries, so a closing balance
+    /// that folded in unsequenced ones would commit to money the tree head does
+    /// not account for. In deferred mode that window is real.
+    async fn trial_balance_through_date(
+        &self,
+        end: Date,
+    ) -> Result<TrialBalance<P>, PostgresError> {
+        let rows = sqlx::query(
+            "SELECT p.account_index, p.currency, p.layer, \
+               COALESCE(SUM(p.amount_minor) FILTER (WHERE p.direction = 'D'), 0)::BIGINT AS debits, \
+               COALESCE(SUM(p.amount_minor) FILTER (WHERE p.direction = 'C'), 0)::BIGINT AS credits \
+             FROM postings p JOIN entries e ON e.entry_id = p.entry_id \
+             WHERE e.log_index IS NOT NULL AND e.booking_date <= $1 \
+             GROUP BY p.account_index, p.currency, p.layer \
+             ORDER BY p.account_index, p.currency, p.layer",
+        )
+        .bind(end)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut tb = TrialBalance::new();
+        for row in &rows {
+            let account: i32 = row.try_get("account_index")?;
+            let currency: String = row.try_get("currency")?;
+            let layer: String = row.try_get("layer")?;
+            tb.set(
+                BalanceKey {
+                    account: AccountId::from_index(u32::try_from(account).unwrap_or(0)),
+                    currency: Currency::new(currency.trim())
+                        .map_err(|_| PostgresError::malformed("currency"))?,
+                    layer: match layer.as_str() {
+                        "settled" => Layer::Settled,
+                        _ => Layer::Pending,
+                    },
+                },
+                Balance {
+                    debits: Amount::from_minor(row.try_get::<i64, _>("debits")?),
+                    credits: Amount::from_minor(row.try_get::<i64, _>("credits")?),
+                },
+            );
         }
+        Ok(tb)
+    }
+
+    async fn seal_period(&self, period: &PeriodId) -> Result<Seal, Self::Error> {
+        // The same rule the in-memory journal applies, from the same place: the
+        // period is defined, closing, and next in date order. Sealing out of
+        // order would let a later booking into an earlier open period restate a
+        // closing balance this seal is about to commit to.
+        let definition = self.calendar().await?.check_sealable(period)?.clone();
 
         // Which entries belong to the period, and the closing balance through
         // its last day — not the whole journal, which would pull in entries
@@ -1711,30 +1781,56 @@ impl<const P: u8> LedgerStore<P> for PostgresStore<P> {
         Ok(())
     }
 
-    async fn open_items(&self, key: BalanceKey) -> Result<Vec<OpenItem<P>>, Self::Error> {
-        let rows = sqlx::query(
-            "SELECT o.entry_id, o.posting_index, o.direction, o.original_minor, \
+    async fn open_items(
+        &self,
+        key: BalanceKey,
+        cursor: PostingCursor,
+    ) -> Result<OpenItemPage<P>, Self::Error> {
+        // Same order and same cursor as a statement: open items are the
+        // filtered view of the same postings, so they page the same way.
+        let (after_index, after_posting) = cursor.after.map_or((-1i64, -1i64), |p| {
+            (
+                i64::try_from(p.index.get()).unwrap_or(i64::MAX),
+                i64::from(p.posting),
+            )
+        });
+        let limit = cursor.effective_limit();
+        let probe = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
+
+        let mut rows = sqlx::query(
+            "SELECT e.log_index, o.entry_id, o.posting_index, o.direction, o.original_minor, \
                     o.applied_minor, o.residual_minor \
-             FROM open_items o \
+             FROM open_items o JOIN entries e ON e.entry_id = o.entry_id \
              WHERE o.account_index = $1 AND o.currency = $2 AND o.layer = $3 \
-             ORDER BY o.entry_id, o.posting_index",
+               AND e.log_index IS NOT NULL \
+               AND (e.log_index > $4 \
+                    OR (e.log_index = $4 AND o.posting_index > $5)) \
+             ORDER BY e.log_index, o.posting_index LIMIT $6",
         )
         .bind(i32::try_from(key.account.index()).unwrap_or(i32::MAX))
         .bind(key.currency.code())
         .bind(layer_str(key.layer))
+        .bind(after_index)
+        .bind(i16::try_from(after_posting).unwrap_or(i16::MAX))
+        .bind(probe)
         .fetch_all(&self.pool)
         .await?;
+        let has_more = rows.len() > limit;
+        rows.truncate(limit);
 
-        let mut out = Vec::with_capacity(rows.len());
+        let mut items = Vec::with_capacity(rows.len());
         for row in &rows {
+            let log_index: i64 = row.try_get("log_index")?;
             let entry_id: uuid::Uuid = row.try_get("entry_id")?;
-            let posting_index: i16 = row.try_get("posting_index")?;
+            let entry_id = EntryId::from_uuid(entry_id);
+            let posting_index = u16::try_from(row.try_get::<i16, _>("posting_index")?).unwrap_or(0);
             let direction: String = row.try_get("direction")?;
-            out.push(OpenItem {
-                posting: PostingRef::new(
-                    EntryId::from_uuid(entry_id),
-                    u16::try_from(posting_index).unwrap_or(0),
+            items.push(OpenItem {
+                position: PostingPosition::new(
+                    LogIndex::new(u64::try_from(log_index).unwrap_or(0)),
+                    posting_index,
                 ),
+                posting: PostingRef::new(entry_id, posting_index),
                 direction: match direction.as_str() {
                     "D" => Direction::Debit,
                     _ => Direction::Credit,
@@ -1744,8 +1840,11 @@ impl<const P: u8> LedgerStore<P> for PostgresStore<P> {
                 residual: Amount::from_minor(row.try_get::<i64, _>("residual_minor")?),
             });
         }
-        out.sort_by_key(|i| i.posting);
-        Ok(out)
+        let next = items.last().filter(|_| has_more).map(|i| PostingCursor {
+            after: Some(i.position),
+            limit: cursor.limit,
+        });
+        Ok(OpenItemPage { items, next })
     }
 
     async fn balances(
@@ -1792,25 +1891,51 @@ impl<const P: u8> LedgerStore<P> for PostgresStore<P> {
     async fn statement(
         &self,
         key: BalanceKey,
-        cursor: Cursor,
+        cursor: PostingCursor,
     ) -> Result<StatementPage<P>, Self::Error> {
-        let after = cursor
-            .after
-            .map_or(-1i64, |i| i64::try_from(i.get()).unwrap_or(i64::MAX));
+        // A statement is a list of *postings*, and one entry may put several on
+        // this account, so the cursor addresses `(log_index, posting_index)`.
+        // Resuming from an entry position alone would skip whatever remained of
+        // the entry a page ended inside.
+        let (after_index, after_posting) = cursor.after.map_or((-1i64, -1i32), |p| {
+            (
+                i64::try_from(p.index.get()).unwrap_or(i64::MAX),
+                i32::from(p.posting),
+            )
+        });
         let limit = cursor.effective_limit();
 
-        // The running balance needs everything strictly before the page, so it
-        // is summed in the database rather than by reading the account's whole
-        // history. Nothing precedes the first page — reading the account's full
-        // balance here would start every statement at its own closing figure.
-        // `after` is an index, and the prefix that precedes the page is
-        // everything up to and including it — one more entry than its index.
-        let opening = match cursor.after {
-            Some(after) => {
-                self.fold_balance(&key, Some(after.get().saturating_add(1)))
-                    .await?
+        // Everything strictly before the page, summed in the database rather
+        // than by reading the account's whole history. Gross totals, not a net:
+        // a running balance carries both sides. The bound is the same pair the
+        // page filter uses, negated — so a page that starts mid-entry opens
+        // with exactly the postings already shown.
+        let opening = if cursor.after.is_some() {
+            let row = sqlx::query(
+                "SELECT \
+                    COALESCE(SUM(CASE WHEN p.direction = 'D' \
+                                      THEN p.amount_minor ELSE 0 END), 0)::BIGINT AS debits, \
+                    COALESCE(SUM(CASE WHEN p.direction = 'C' \
+                                      THEN p.amount_minor ELSE 0 END), 0)::BIGINT AS credits \
+                 FROM postings p JOIN entries e ON e.entry_id = p.entry_id \
+                 WHERE p.account_index = $1 AND p.currency = $2 AND p.layer = $3 \
+                   AND e.log_index IS NOT NULL \
+                   AND (e.log_index < $4 \
+                        OR (e.log_index = $4 AND p.posting_index <= $5))",
+            )
+            .bind(i32::try_from(key.account.index()).unwrap_or(i32::MAX))
+            .bind(key.currency.code())
+            .bind(layer_str(key.layer))
+            .bind(after_index)
+            .bind(i16::try_from(after_posting).unwrap_or(i16::MAX))
+            .fetch_one(&self.pool)
+            .await?;
+            Balance {
+                debits: Amount::<P>::from_minor(row.try_get::<i64, _>("debits")?),
+                credits: Amount::<P>::from_minor(row.try_get::<i64, _>("credits")?),
             }
-            None => Balance::ZERO,
+        } else {
+            Balance::ZERO
         };
 
         // One row past the page, so "is there more" is answered by the query
@@ -1822,13 +1947,16 @@ impl<const P: u8> LedgerStore<P> for PostgresStore<P> {
                     p.direction, p.amount_minor \
              FROM postings p JOIN entries e ON e.entry_id = p.entry_id \
              WHERE p.account_index = $1 AND p.currency = $2 AND p.layer = $3 \
-               AND e.log_index IS NOT NULL AND e.log_index > $4 \
-             ORDER BY e.log_index, p.posting_index LIMIT $5",
+               AND e.log_index IS NOT NULL \
+               AND (e.log_index > $4 \
+                    OR (e.log_index = $4 AND p.posting_index > $5)) \
+             ORDER BY e.log_index, p.posting_index LIMIT $6",
         )
         .bind(i32::try_from(key.account.index()).unwrap_or(i32::MAX))
         .bind(key.currency.code())
         .bind(layer_str(key.layer))
-        .bind(after)
+        .bind(after_index)
+        .bind(i16::try_from(after_posting).unwrap_or(i16::MAX))
         .bind(probe)
         .fetch_all(&self.pool)
         .await?;
@@ -1866,8 +1994,8 @@ impl<const P: u8> LedgerStore<P> for PostgresStore<P> {
             });
         }
 
-        let next = lines.last().filter(|_| has_more).map(|l| Cursor {
-            after: Some(l.index),
+        let next = lines.last().filter(|_| has_more).map(|l| PostingCursor {
+            after: Some(l.position()),
             limit: cursor.limit,
         });
         Ok(StatementPage { lines, next })
@@ -1926,54 +2054,7 @@ impl<const P: u8> LedgerStore<P> for PostgresStore<P> {
     }
 }
 
-impl<const P: u8> PostgresStore<P> {
-    /// Folds every *sequenced* entry booked on or before `end`.
-    ///
-    /// The `log_index IS NOT NULL` predicate is what keeps a seal honest: the
-    /// tree head it carries covers only sequenced entries, so a closing balance
-    /// that folded in unsequenced ones would commit to money the tree head does
-    /// not account for. In deferred mode that window is real.
-    async fn trial_balance_through_date(
-        &self,
-        end: Date,
-    ) -> Result<TrialBalance<P>, PostgresError> {
-        let rows = sqlx::query(
-            "SELECT p.account_index, p.currency, p.layer, \
-               COALESCE(SUM(p.amount_minor) FILTER (WHERE p.direction = 'D'), 0)::BIGINT AS debits, \
-               COALESCE(SUM(p.amount_minor) FILTER (WHERE p.direction = 'C'), 0)::BIGINT AS credits \
-             FROM postings p JOIN entries e ON e.entry_id = p.entry_id \
-             WHERE e.log_index IS NOT NULL AND e.booking_date <= $1 \
-             GROUP BY p.account_index, p.currency, p.layer \
-             ORDER BY p.account_index, p.currency, p.layer",
-        )
-        .bind(end)
-        .fetch_all(&self.pool)
-        .await?;
-
-        let mut tb = TrialBalance::new();
-        for row in &rows {
-            let account: i32 = row.try_get("account_index")?;
-            let currency: String = row.try_get("currency")?;
-            let layer: String = row.try_get("layer")?;
-            tb.set(
-                BalanceKey {
-                    account: AccountId::from_index(u32::try_from(account).unwrap_or(0)),
-                    currency: Currency::new(currency.trim())
-                        .map_err(|_| PostgresError::malformed("currency"))?,
-                    layer: match layer.as_str() {
-                        "settled" => Layer::Settled,
-                        _ => Layer::Pending,
-                    },
-                },
-                Balance {
-                    debits: Amount::from_minor(row.try_get::<i64, _>("debits")?),
-                    credits: Amount::from_minor(row.try_get::<i64, _>("credits")?),
-                },
-            );
-        }
-        Ok(tb)
-    }
-}
+impl<const P: u8> PostgresStore<P> {}
 
 /// What a clearing needs to know about one posting: which side, which account,
 /// which currency, which layer, and how much of it is still open.

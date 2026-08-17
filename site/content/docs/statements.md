@@ -28,8 +28,31 @@ Over a durable store, statements are **paged**. An account statement over ten
 years is not a response body:
 
 ```rust
-let page = store.statement(cash_key, Cursor::start().with_limit(100)).await?;
+let page = store.statement(cash_key, PostingCursor::start().with_limit(100)).await?;
+for line in &page.lines { /* … */ }
+let next = page.next;   // `None` at the end
 ```
+
+### The cursor addresses a posting, not an entry
+
+`PostingCursor` is deliberately not the `Cursor` that pages the log. A log page
+is a list of entries; a statement is a list of **postings**, and one entry may
+put several on the same account — a split receipt booked as three lines against
+one credit is an ordinary entry.
+
+So a page boundary can fall *inside* an entry, and a cursor that could only name
+an entry had no way to say where. Resuming from one asked for `log_index > after`
+and skipped every remaining posting of the entry the page ended in: lines
+vanished, silently and permanently, and the running balance stayed internally
+consistent across the gap so nothing looked wrong.
+
+`PostingPosition` is the pair — the entry's log index and the posting's index
+within it — and `StatementLine::position()` hands you the one to resume after.
+[Open items](@/docs/open-items.md) page the same way, behind the same cursor:
+they are the filtered view of the same postings.
+The running balance is folded from the start of the account either way, so a
+page opens where the previous one closed rather than at the account's own closing
+figure.
 
 ## Checkpoints
 

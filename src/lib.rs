@@ -122,7 +122,7 @@ pub use canonical::{Canonical, CanonicalWriter};
 pub use checkpoint::{AssertAt, AssertionOutcome, BalanceAssertion, Checkpoint, CheckpointError};
 pub use clearing::{
     ClearedItem, Clearing, ClearingError, ClearingEvent, ClearingId, ClearingRegister, OpenItem,
-    PostingLookup, PostingRef,
+    PostingLookup, PostingPosition, PostingRef,
 };
 pub use closing::{ClosingError, closing_postings};
 pub use dimensions::{DimensionError, Dimensions, Label};
@@ -141,12 +141,12 @@ pub use money::{Amount, Currency, MoneyError};
 pub use period::{LedgerId, Period, PeriodCalendar, PeriodError, PeriodId, PeriodState};
 pub use posting::{Direction, Layer, Posting};
 pub use seal::{
-    BalanceProof, PeriodCoverage, Seal, SealChain, SealChainError, TrialBalanceCommitment,
-    balance_leaf, trial_balance_head,
+    BalanceProof, PeriodCoverage, Seal, SealChain, SealChainError, SealedBalance,
+    SealedBalanceError, TrialBalanceCommitment, balance_leaf, trial_balance_head,
 };
 pub use storage::{
     BatchError, Cursor, DynLedgerStore, EntryBatch, LedgerStore, MemoryStore, MemoryStoreError,
-    Page, StatementLine, StatementPage, StoredEntry,
+    OpenItemPage, Page, PostingCursor, StatementLine, StatementPage, StoredEntry,
 };
 
 /// Compiles and runs every example in the crate's README.

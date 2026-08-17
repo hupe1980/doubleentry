@@ -207,7 +207,48 @@ pub struct ConsistencyProof {
 }
 
 impl ConsistencyProof {
+    /// True when this proof asserts nothing about the newer tree.
+    ///
+    /// A proof from `old_size == 0` is vacuous: every log extends the empty one,
+    /// so the walk constrains neither the new root nor anything else. It still
+    /// verifies — correctly, because the statement really is true — and that is
+    /// the trap. An auditor who archived a head *before the first entry* and
+    /// came back later gets `true` from a check that examined nothing, which is
+    /// indistinguishable from a genuine verification unless they ask.
+    ///
+    /// The new *size* is still pinned, because [`Self::verify`] compares it
+    /// against the head it is given. Only the root floats.
+    ///
+    /// ```
+    /// # use doubleentry::{MerkleLog, TreeHead, Hash};
+    /// # let mut log = MerkleLog::new();
+    /// # for i in 0..6u64 { log.append(Hash::from_bytes([i as u8; 32])); }
+    /// let empty = log.head_at(0)?;
+    /// let proof = log.consistency_proof(0)?;
+    /// assert!(proof.is_vacuous());
+    ///
+    /// // It verifies against the true head — and against a forged one.
+    /// assert!(proof.verify(&empty, &log.head()));
+    /// let forged = TreeHead { size: log.head().size, root: Hash::from_bytes([0xab; 32]) };
+    /// assert!(proof.verify(&empty, &forged));
+    ///
+    /// // One entry in, the same forgery is refused.
+    /// let one = log.head_at(1)?;
+    /// let from_one = log.consistency_proof(1)?;
+    /// assert!(!from_one.is_vacuous());
+    /// assert!(!from_one.verify(&one, &forged));
+    /// # Ok::<(), doubleentry::ProofError>(())
+    /// ```
+    #[must_use]
+    pub fn is_vacuous(&self) -> bool {
+        self.old_size == 0
+    }
+
     /// Verifies that the log at `old` is a prefix of the log at `new`.
+    ///
+    /// **A `true` answer means nothing when [`is_vacuous`](Self::is_vacuous) is
+    /// also true.** Archive a head with at least one entry in it, or check
+    /// `is_vacuous` before treating the result as evidence.
     ///
     /// Both ends are (size, root) pairs, and both halves of each are checked, so
     /// the snapshot labels a caller reads back are as trustworthy as the roots.
@@ -620,6 +661,11 @@ impl MerkleLog {
 
     /// Builds a consistency proof from an earlier size to the current size.
     ///
+    /// A proof from `old_size == 0` is **vacuous** — every log extends the empty
+    /// tree, so it constrains nothing about the newer one and verifies against
+    /// any root at the right size. See
+    /// [`ConsistencyProof::is_vacuous`](crate::ConsistencyProof::is_vacuous).
+    ///
     /// # Errors
     ///
     /// Returns [`ProofError::SizeOutOfRange`] for a size beyond the log.
@@ -632,6 +678,11 @@ impl MerkleLog {
     /// The general form: two auditors holding different archived heads, neither
     /// of them current, can be shown that one is a prefix of the other without
     /// either being told the log's present size.
+    ///
+    /// A proof from `old_size == 0` is **vacuous** — every log extends the empty
+    /// tree, so it constrains nothing about the newer one and verifies against
+    /// any root at the right size. See
+    /// [`ConsistencyProof::is_vacuous`](crate::ConsistencyProof::is_vacuous).
     ///
     /// # Errors
     ///

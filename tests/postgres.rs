@@ -28,7 +28,7 @@ use doubleentry::clearing::{Clearing, ClearingId, PostingRef};
 use doubleentry::entry::{Draft, LedgerPolicy, SealContext};
 use doubleentry::period::{LedgerId, Period, PeriodCalendar, PeriodId, PeriodState};
 use doubleentry::storage::postgres::{DEFAULT_SCHEMA, PostgresError, PostgresStore, Sequencing};
-use doubleentry::storage::{Cursor, EntryBatch, LedgerStore};
+use doubleentry::storage::{Cursor, EntryBatch, LedgerStore, PostingCursor};
 use doubleentry::{
     AccountId, Amount, BalanceKey, Balanced, Currency, Entry, EntryId, IdempotencyKey, Layer,
 };
@@ -845,7 +845,15 @@ async fn open_items_track_partial_settlement() {
         .await
         .expect("appends");
 
-    assert_eq!(h.store.open_items(h.key()).await.expect("reads").len(), 2);
+    assert_eq!(
+        h.store
+            .open_items(h.key(), PostingCursor::start())
+            .await
+            .expect("reads")
+            .items
+            .len(),
+        2
+    );
 
     let clearing_id = ClearingId::generate();
     h.store
@@ -857,10 +865,14 @@ async fn open_items_track_partial_settlement() {
         .await
         .expect("clears");
 
-    let open = h.store.open_items(h.key()).await.expect("reads");
-    assert_eq!(open.len(), 1, "the payment is fully applied");
-    assert_eq!(open[0].posting, PostingRef::new(invoice_id, 0));
-    assert_eq!(open[0].residual, Eur::from_minor(600));
+    let open = h
+        .store
+        .open_items(h.key(), PostingCursor::start())
+        .await
+        .expect("reads");
+    assert_eq!(open.items.len(), 1, "the payment is fully applied");
+    assert_eq!(open.items[0].posting, PostingRef::new(invoice_id, 0));
+    assert_eq!(open.items[0].residual, Eur::from_minor(600));
 
     // Clearing is an assignment, never a movement.
     let balance = h.store.balance(h.key(), None).await.expect("reads");
@@ -872,7 +884,15 @@ async fn open_items_track_partial_settlement() {
         .reset_clearing(clearing_id, date!(2026 - 04 - 01))
         .await
         .expect("resets");
-    assert_eq!(h.store.open_items(h.key()).await.expect("reads").len(), 2);
+    assert_eq!(
+        h.store
+            .open_items(h.key(), PostingCursor::start())
+            .await
+            .expect("reads")
+            .items
+            .len(),
+        2
+    );
 }
 
 #[tokio::test]
@@ -912,7 +932,15 @@ async fn over_applying_a_clearing_is_refused() {
     assert!(matches!(err, PostgresError::Clearing(_)));
 
     // Nothing was written.
-    assert_eq!(h.store.open_items(h.key()).await.expect("reads").len(), 2);
+    assert_eq!(
+        h.store
+            .open_items(h.key(), PostingCursor::start())
+            .await
+            .expect("reads")
+            .items
+            .len(),
+        2
+    );
 }
 
 #[tokio::test]

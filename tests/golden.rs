@@ -184,7 +184,7 @@ fn the_reference_seal_hash_is_unchanged() {
     // issued, so it is pinned separately from the entry encoding.
     assert_eq!(
         reference_seal().seal_hash.to_hex(),
-        "7f6f02186c80a35d38d94a0e68d1f2077d704c9adf5e4bc12560cc0edb1e053b",
+        "5dbfe84f0637f0f6e5a3670a7675c1a46f5c97b8887fb68d38bf1b008f4d2b65",
         "the seal hash changed; see this file's module docs"
     );
 }
@@ -208,23 +208,44 @@ fn the_account_binding_commitment_is_unchanged() {
     // issued, and the seal vector alone would not say which half moved.
     assert_eq!(
         reference_registry().commitment().root.to_hex(),
-        "65ca7c50e7235ac82ea3eef1acd66e1d90abe8dc2527617bfe81e234a1416a5a",
+        "17d6ae22c9f6d6a0b3ab66b3d50146284cf7caa80057de0a6a8d088f103df22a",
         "the account binding commitment changed; see this file\'s module docs"
     );
 }
 
 #[test]
-fn a_balance_limit_moves_the_binding_commitment() {
-    // The limit is inside the leaf, so an account whose limit was relaxed after
-    // the fact cannot pass for the one a seal named.
-    let mut relaxed = reference_registry();
-    relaxed
+fn master_data_does_not_move_the_binding_commitment() {
+    // The leaf covers the handle and the path — identity — and nothing else.
+    // A limit, a classification and an open window are master data: mutable by
+    // design, governing what may be booked next rather than what was booked
+    // already. Hashing them in made every routine close or limit change
+    // retroactively invalidate every binding proof against every earlier seal,
+    // which is why this vector asserts the opposite of what it once did.
+    let mut changed = reference_registry();
+    changed
         .set_limit(
             AccountId::from_index(0),
             doubleentry::account::BalanceLimit::NoCreditBalance,
         )
         .expect("registered");
-    assert_ne!(relaxed.commitment(), reference_registry().commitment());
+    changed
+        .close(AccountId::from_index(0), date!(2026 - 06 - 30))
+        .expect("registered");
+    assert_eq!(changed.commitment(), reference_registry().commitment());
+}
+
+#[test]
+fn a_rebound_handle_moves_the_binding_commitment() {
+    // What the commitment *does* pin. Two registries over the same paths in a
+    // different order are not the same registry, because every posting row and
+    // every sealed balance names an account by its handle.
+    let mut swapped = AccountRegistry::new();
+    for path in ["Income:Sales", "Assets:Cash"] {
+        swapped
+            .register_path(path, date!(2020 - 01 - 01))
+            .expect("registers");
+    }
+    assert_ne!(swapped.commitment(), reference_registry().commitment());
 }
 
 #[test]

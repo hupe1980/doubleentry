@@ -35,6 +35,129 @@ pub enum MoneyError {
     /// A decimal string could not be parsed at the target scale.
     #[error("invalid monetary literal")]
     InvalidLiteral,
+    /// A ratio was applied with a zero denominator.
+    #[error("cannot apply a ratio with a zero denominator")]
+    DivideByZero,
+}
+
+/// How a result that does not land on a whole minor unit is resolved.
+///
+/// Every operation in this module that can produce a fraction of a minor unit
+/// takes one of these, because there is no default that is right everywhere and
+/// picking one silently is how a ledger drifts. VAT in most of Europe is
+/// [`HalfUp`](Rounding::HalfUp); IFRS/IAS interest accrual and much of finance
+/// use [`HalfEven`](Rounding::HalfEven); a fee you may not overcharge is
+/// [`Floor`](Rounding::Floor).
+///
+/// The names follow `java.math.RoundingMode` and Python's `decimal`, so a rule
+/// written against a specification in either can be transcribed rather than
+/// translated.
+///
+/// None of these conserve a total on their own. Splitting one amount into parts
+/// that must re-sum exactly is [`Amount::allocate`], which is a different
+/// problem and has an exact answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
+pub enum Rounding {
+    /// Ties away from zero; otherwise to the nearer unit. Commercial rounding.
+    ///
+    /// The default, because it is what a person means by "round to the cent"
+    /// and what most tax authorities specify.
+    #[default]
+    HalfUp,
+    /// Ties to the nearer *even* minor unit; otherwise to the nearer unit.
+    ///
+    /// Banker's rounding. Unbiased over many roundings, which is why accrual
+    /// and valuation standards prefer it: `HalfUp` drifts upward on a long run
+    /// of ties.
+    HalfEven,
+    /// Ties toward zero; otherwise to the nearer unit.
+    HalfDown,
+    /// Always toward zero. Truncation.
+    TowardZero,
+    /// Always away from zero.
+    AwayFromZero,
+    /// Always toward negative infinity.
+    Floor,
+    /// Always toward positive infinity.
+    Ceiling,
+}
+
+/// Divides `numerator` by `denominator`, resolving the remainder by `rounding`.
+///
+/// Exact in `i128`, so no intermediate can overflow for operands derived from
+/// `i64`s: the largest product two of them can form is below `2^126`.
+fn div_rounded(numerator: i128, denominator: i128, rounding: Rounding) -> Option<i128> {
+    if denominator == 0 {
+        return None;
+    }
+    // Normalise the divisor positive so the remainder's sign is the dividend's.
+    let (n, d) = if denominator < 0 {
+        (numerator.checked_neg()?, denominator.checked_neg()?)
+    } else {
+        (numerator, denominator)
+    };
+
+    let quotient = n.checked_div(d)?;
+    let remainder = n.checked_rem(d)?;
+    if remainder == 0 {
+        return Some(quotient);
+    }
+
+    // One step further from zero, in the dividend's direction.
+    let away = if n < 0 {
+        quotient.checked_sub(1)?
+    } else {
+        quotient.checked_add(1)?
+    };
+
+    // `2 * |remainder|` against `d` decides which side of the midpoint we are
+    // on, without dividing again and without a floating-point comparison.
+    let doubled = remainder.checked_abs()?.checked_mul(2)?;
+    Some(match rounding {
+        Rounding::TowardZero => quotient,
+        Rounding::AwayFromZero => away,
+        Rounding::Floor => {
+            if n < 0 {
+                away
+            } else {
+                quotient
+            }
+        }
+        Rounding::Ceiling => {
+            if n < 0 {
+                quotient
+            } else {
+                away
+            }
+        }
+        Rounding::HalfUp => {
+            if doubled >= d {
+                away
+            } else {
+                quotient
+            }
+        }
+        Rounding::HalfDown => {
+            if doubled > d {
+                away
+            } else {
+                quotient
+            }
+        }
+        Rounding::HalfEven => match doubled.cmp(&d) {
+            core::cmp::Ordering::Greater => away,
+            core::cmp::Ordering::Less => quotient,
+            core::cmp::Ordering::Equal => {
+                if quotient.checked_rem(2)? == 0 {
+                    quotient
+                } else {
+                    away
+                }
+            }
+        },
+    })
 }
 
 /// An ISO 4217 currency code.
@@ -279,6 +402,113 @@ impl<const P: u8> Amount<P> {
         Ok(acc)
     }
 
+    /// Multiplies by a whole number, reporting overflow.
+    ///
+    /// Exact: a quantity times a unit price lands on a minor unit by
+    /// construction, so there is nothing to round and no rounding mode to pick.
+    pub fn checked_mul_int(self, factor: i64) -> Result<Self, MoneyError> {
+        self.0
+            .checked_mul(factor)
+            .map(Self)
+            .ok_or(MoneyError::Overflow)
+    }
+
+    /// Applies the ratio `numerator / denominator`, rounding the remainder.
+    ///
+    /// The operation every tax, fee, interest and conversion calculation is:
+    /// `net × 19 / 100`, `principal × days / 365`, `eur × rate / 10^k`. Doing it
+    /// on [`to_minor`](Self::to_minor) by hand is the one place a caller of this
+    /// crate would otherwise write unchecked arithmetic — the intermediate
+    /// product overflows an `i64` long before either operand is unreasonable.
+    ///
+    /// Here it is exact in `i128` and only the *result* has to fit, so
+    /// `Amount::<2>::MAX × 1 / 1_000_000` is an ordinary answer rather than an
+    /// overflow.
+    ///
+    /// ```
+    /// # use doubleentry::{Amount, Rounding};
+    /// type Eur = Amount<2>;
+    /// let net = Eur::parse("1000.00")?;
+    ///
+    /// // 19 % VAT.
+    /// assert_eq!(net.checked_mul_ratio(19, 100, Rounding::HalfUp)?, Eur::parse("190.00")?);
+    ///
+    /// // The rounding mode is not decoration: 0.005 is a genuine tie.
+    /// let odd = Eur::parse("0.01")?;
+    /// assert_eq!(odd.checked_mul_ratio(1, 2, Rounding::HalfUp)?,   Eur::parse("0.01")?);
+    /// assert_eq!(odd.checked_mul_ratio(1, 2, Rounding::HalfEven)?, Eur::parse("0.00")?);
+    /// assert_eq!(odd.checked_mul_ratio(1, 2, Rounding::Floor)?,    Eur::parse("0.00")?);
+    /// # Ok::<(), doubleentry::MoneyError>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MoneyError::DivideByZero`] for a zero denominator and
+    /// [`MoneyError::Overflow`] when the rounded result does not fit.
+    pub fn checked_mul_ratio(
+        self,
+        numerator: i64,
+        denominator: i64,
+        rounding: Rounding,
+    ) -> Result<Self, MoneyError> {
+        if denominator == 0 {
+            return Err(MoneyError::DivideByZero);
+        }
+        let product = i128::from(self.0)
+            .checked_mul(i128::from(numerator))
+            .ok_or(MoneyError::Overflow)?;
+        let scaled =
+            div_rounded(product, i128::from(denominator), rounding).ok_or(MoneyError::Overflow)?;
+        i64::try_from(scaled)
+            .map(Self)
+            .map_err(|_| MoneyError::Overflow)
+    }
+
+    /// Restates this amount at a different scale.
+    ///
+    /// Widening is exact. Narrowing drops precision the target cannot carry, so
+    /// it takes a rounding mode — this is the one conversion in the crate that
+    /// can lose information, and it says so in its signature.
+    ///
+    /// The pairing with [`checked_mul_ratio`](Self::checked_mul_ratio) is what
+    /// makes a conversion at a published rate expressible: parse the rate at the
+    /// precision it was published in, apply it, and restate the result in the
+    /// scale the receiving books are kept in.
+    ///
+    /// ```
+    /// # use doubleentry::{Amount, Rounding};
+    /// // A rate quoted to six places, applied to euros booked to two.
+    /// let eur = Amount::<2>::parse("1000.00")?;
+    /// let rate = Amount::<6>::parse("1.087350")?;
+    /// let usd: Amount<2> = eur
+    ///     .rescale::<6>(Rounding::HalfEven)?
+    ///     .checked_mul_ratio(rate.to_minor(), 1_000_000, Rounding::HalfEven)?
+    ///     .rescale::<2>(Rounding::HalfEven)?;
+    /// assert_eq!(usd, Amount::<2>::parse("1087.35")?);
+    /// # Ok::<(), doubleentry::MoneyError>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MoneyError::Overflow`] when widening pushes the value out of
+    /// range.
+    pub fn rescale<const Q: u8>(self, rounding: Rounding) -> Result<Amount<Q>, MoneyError> {
+        if Q >= P {
+            let factor = pow10_checked(Q.saturating_sub(P)).ok_or(MoneyError::Overflow)?;
+            self.0
+                .checked_mul(factor)
+                .map(Amount::<Q>::from_minor)
+                .ok_or(MoneyError::Overflow)
+        } else {
+            let divisor = pow10_checked(P.saturating_sub(Q)).ok_or(MoneyError::Overflow)?;
+            let scaled = div_rounded(i128::from(self.0), i128::from(divisor), rounding)
+                .ok_or(MoneyError::Overflow)?;
+            i64::try_from(scaled)
+                .map(Amount::<Q>::from_minor)
+                .map_err(|_| MoneyError::Overflow)
+        }
+    }
+
     /// Splits into `n` parts differing by at most one minor unit.
     ///
     /// The parts always re-sum to the original: no minor unit is created or lost.
@@ -425,23 +655,31 @@ impl<const P: u8> Amount<P> {
     }
 }
 
-/// `10^exp`.
-///
-/// The saturating arm is unreachable for every scale that compiles: the
-/// precision guard on [`Amount::SCALE`] rejects `P > 18` before this is
-/// evaluated. It exists because a `const fn` may not panic here, and returning a
-/// wrong number quietly is worse than returning a clamped one.
-const fn pow10(exp: u8) -> i64 {
+/// `10^exp`, or `None` when it exceeds `i64::MAX`.
+const fn pow10_checked(exp: u8) -> Option<i64> {
     let mut acc: i64 = 1;
     let mut i = 0u8;
     while i < exp {
         match acc.checked_mul(10) {
             Some(v) => acc = v,
-            None => return i64::MAX,
+            None => return None,
         }
         i = i.wrapping_add(1);
     }
-    acc
+    Some(acc)
+}
+
+/// `10^exp`.
+///
+/// The clamping arm is unreachable for every scale that compiles: the precision
+/// guard on [`Amount::SCALE`] rejects `P > 18` before this is evaluated. It
+/// exists because a `const fn` may not panic here, and returning a wrong number
+/// quietly is worse than returning a clamped one.
+const fn pow10(exp: u8) -> i64 {
+    match pow10_checked(exp) {
+        Some(v) => v,
+        None => i64::MAX,
+    }
 }
 
 impl<const P: u8> fmt::Display for Amount<P> {
@@ -576,6 +814,145 @@ mod tests {
             Eur::from_minor(100).distribute(0),
             Err(MoneyError::ZeroWeight)
         );
+    }
+
+    #[test]
+    fn multiplying_by_a_whole_number_is_exact() {
+        assert_eq!(
+            Eur::from_minor(199).checked_mul_int(3).expect("fits"),
+            Eur::from_minor(597)
+        );
+        assert_eq!(Eur::MAX.checked_mul_int(2), Err(MoneyError::Overflow));
+    }
+
+    #[test]
+    fn a_ratio_applies_the_requested_rounding() {
+        // 0.005 is a genuine tie, and each mode resolves it differently.
+        let one_cent = Eur::from_minor(1);
+        let cases = [
+            (Rounding::HalfUp, 1),
+            (Rounding::HalfDown, 0),
+            (Rounding::HalfEven, 0),
+            (Rounding::TowardZero, 0),
+            (Rounding::AwayFromZero, 1),
+            (Rounding::Floor, 0),
+            (Rounding::Ceiling, 1),
+        ];
+        for (mode, expected) in cases {
+            assert_eq!(
+                one_cent.checked_mul_ratio(1, 2, mode).expect("fits"),
+                Eur::from_minor(expected),
+                "{mode:?} on a positive tie"
+            );
+        }
+    }
+
+    #[test]
+    fn rounding_is_symmetric_about_zero_where_it_should_be() {
+        // Sign-symmetric modes must give mirrored answers; the directional ones
+        // must not. Getting this backwards is the classic truncation bug.
+        let minus = Eur::from_minor(-1);
+        for mode in [
+            Rounding::HalfUp,
+            Rounding::HalfDown,
+            Rounding::HalfEven,
+            Rounding::TowardZero,
+            Rounding::AwayFromZero,
+        ] {
+            let positive = Eur::from_minor(1)
+                .checked_mul_ratio(1, 2, mode)
+                .expect("fits");
+            let negative = minus.checked_mul_ratio(1, 2, mode).expect("fits");
+            assert_eq!(
+                negative,
+                positive.checked_neg().expect("fits"),
+                "{mode:?} must not favour a sign"
+            );
+        }
+        assert_eq!(
+            minus
+                .checked_mul_ratio(1, 2, Rounding::Floor)
+                .expect("fits"),
+            Eur::from_minor(-1),
+        );
+        assert_eq!(
+            minus
+                .checked_mul_ratio(1, 2, Rounding::Ceiling)
+                .expect("fits"),
+            Eur::ZERO,
+        );
+    }
+
+    #[test]
+    fn half_even_alternates_on_consecutive_ties() {
+        // The property banker's rounding exists for: ties do not all go one way.
+        // 0.5 → 0, 1.5 → 2, 2.5 → 2, 3.5 → 4, in whole minor units.
+        let landed: Vec<i64> = (1..=7)
+            .step_by(2)
+            .map(|odd| {
+                Amount::<0>::from_minor(odd)
+                    .checked_mul_ratio(1, 2, Rounding::HalfEven)
+                    .expect("fits")
+                    .to_minor()
+            })
+            .collect();
+        assert_eq!(landed, vec![0, 2, 2, 4]);
+    }
+
+    #[test]
+    fn a_ratio_is_exact_in_the_intermediate() {
+        // The whole point of the i128 intermediate: the product overflows an
+        // i64 by a wide margin while the answer is unremarkable.
+        assert_eq!(
+            Eur::MAX
+                .checked_mul_ratio(1_000_000, 1_000_000, Rounding::HalfUp)
+                .expect("the result fits even though the product does not"),
+            Eur::MAX
+        );
+    }
+
+    #[test]
+    fn a_ratio_reports_a_zero_denominator_and_an_unrepresentable_result() {
+        assert_eq!(
+            Eur::from_minor(1).checked_mul_ratio(1, 0, Rounding::HalfUp),
+            Err(MoneyError::DivideByZero)
+        );
+        assert_eq!(
+            Eur::MAX.checked_mul_ratio(2, 1, Rounding::HalfUp),
+            Err(MoneyError::Overflow)
+        );
+    }
+
+    #[test]
+    fn rescaling_wider_is_exact_and_reversible() {
+        let eur = Eur::parse("12.34").expect("parses");
+        let wide = eur.rescale::<6>(Rounding::HalfEven).expect("widens");
+        assert_eq!(wide, Amount::<6>::parse("12.340000").expect("parses"));
+        assert_eq!(wide.rescale::<2>(Rounding::HalfEven).expect("narrows"), eur);
+    }
+
+    #[test]
+    fn rescaling_narrower_rounds_and_can_overflow_widening() {
+        let precise = Amount::<4>::parse("1.2367").expect("parses");
+        assert_eq!(
+            precise.rescale::<2>(Rounding::HalfUp).expect("narrows"),
+            Eur::parse("1.24").expect("parses")
+        );
+        assert_eq!(
+            precise.rescale::<2>(Rounding::TowardZero).expect("narrows"),
+            Eur::parse("1.23").expect("parses")
+        );
+        // Widening spends range on precision, so it is the direction that fails.
+        assert_eq!(
+            Eur::MAX.rescale::<4>(Rounding::HalfUp),
+            Err(MoneyError::Overflow)
+        );
+    }
+
+    #[test]
+    fn rescaling_to_the_same_scale_is_the_identity() {
+        let eur = Eur::from_minor(-4321);
+        assert_eq!(eur.rescale::<2>(Rounding::Floor).expect("no-op"), eur);
     }
 
     #[test]

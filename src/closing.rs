@@ -45,8 +45,10 @@ pub enum ClosingError {
 /// already net to zero are skipped: a posting of zero carries no information and
 /// would be rejected by validation anyway.
 ///
-/// The postings balance per currency by construction, so adding them to a draft
-/// and sealing it succeeds unless something else about the draft is wrong.
+/// The postings balance per currency by construction, and every one of them is
+/// in `layer`, so they balance per layer too — which is what validation
+/// requires. Adding them to a draft and sealing it therefore succeeds unless
+/// something else about the draft is wrong.
 ///
 /// Returns an empty vector when there is nothing to close, which is what a
 /// second run over an already-closed period produces.

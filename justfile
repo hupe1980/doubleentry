@@ -9,7 +9,7 @@ set shell := ["bash", "-uc"]
 msrv := "1.94"
 
 # Every feature except `postgres`, which needs a running Docker daemon.
-portable := "serde,sqlite,iceberg"
+portable := "serde,sqlite,iceberg,witness"
 
 # 📋 List all recipes
 default:
@@ -101,6 +101,7 @@ features:
     cargo build --no-default-features --features sqlite
     cargo build --no-default-features --features postgres
     cargo build --no-default-features --features iceberg
+    cargo build --no-default-features --features witness
     cargo build --all-features
 
 # 🦀 Compile on the pinned MSRV

@@ -120,15 +120,10 @@ CREATE TABLE IF NOT EXISTS entries (
     reverses                BLOB,
     original_booking_date   TEXT,
 
-    -- The Merkle root after this entry, so a head query is one row read.
-    tree_root               BLOB,
-
     recorded_at             TEXT    NOT NULL DEFAULT (datetime('now')),
 
     CONSTRAINT entries_log_index_non_negative CHECK (log_index IS NULL OR log_index >= 0),
     CONSTRAINT entries_content_hash_width CHECK (length(content_hash) = 32),
-    CONSTRAINT entries_tree_root_width CHECK (tree_root IS NULL OR length(tree_root) = 32),
-    CONSTRAINT entries_sequenced_pair CHECK ((log_index IS NULL) = (tree_root IS NULL)),
     -- A hash without an identifier references nothing. The converse is
     -- allowed: an entry may name a document it holds no hash for.
     CONSTRAINT entries_document_pair CHECK (
@@ -147,18 +142,41 @@ CREATE UNIQUE INDEX IF NOT EXISTS entries_one_reversal_each
     ON entries (reverses) WHERE reverses IS NOT NULL;
 
 CREATE INDEX IF NOT EXISTS entries_booking_date ON entries (booking_date);
+-- Both dates are queryable: a `BalanceQuery` folds by booking date by default
+-- and by value date when asked, and the two answer different questions — the
+-- books versus the cash. An index on one and not the other would make the
+-- second a sequential scan.
+CREATE INDEX IF NOT EXISTS entries_value_date ON entries (value_date);
 CREATE INDEX IF NOT EXISTS entries_log_order ON entries (log_index)
     WHERE log_index IS NOT NULL;
 
--- ── merkle accumulator ──────────────────────────────────────────────────────
+-- ── merkle nodes ────────────────────────────────────────────────────────────
+--
+-- The tree, and the only thing that defines it. A completed subtree never
+-- changes in an append-only log, so this table is INSERT-only with a monotonic
+-- key: record `n` appends `1 + trailing_zeros(n + 1)` rows at consecutive
+-- positions. Storage is `2n - popcount(n)` rows; a proof reads at most
+-- `1 + ceil(log2 n)` of them.
+--
+-- Numbering is Go `sumdb/tlog`'s. See `merkle::nodes` for it and for why the
+-- interior nodes are stored at all.
+--
+-- Two consequences worth knowing before changing anything here. There is no
+-- subtree-cover table and no root column on `entries`, because both are the same
+-- `O(log n)` lookup and a second copy of a derived value can stop agreeing with
+-- the first. And because the tree lives here rather than in `entries`, archiving
+-- a prefix of `entries` to a cold tier costs no proofs.
 
-CREATE TABLE IF NOT EXISTS log_subtrees (
-    height          INTEGER NOT NULL,
+CREATE TABLE IF NOT EXISTS log_nodes (
+    -- Dense position in the order nodes become complete. Level 0 is a leaf hash;
+    -- a level-L node covers 2^L consecutive records. `merkle::nodes::index_of`
+    -- and `split_index` are the two directions of the mapping.
+    node_index      INTEGER NOT NULL,
     node            BLOB    NOT NULL,
-    position        INTEGER NOT NULL,
 
-    CONSTRAINT log_subtrees_width CHECK (length(node) = 32),
-    PRIMARY KEY (height)
+    CONSTRAINT log_nodes_width CHECK (length(node) = 32),
+    CONSTRAINT log_nodes_index_non_negative CHECK (node_index >= 0),
+    PRIMARY KEY (node_index)
 );
 
 -- ── postings ────────────────────────────────────────────────────────────────
@@ -234,6 +252,20 @@ CREATE TABLE IF NOT EXISTS seals (
     accounts_root       BLOB    NOT NULL,
 
     prev_seal           BLOB,
+
+    -- Proof that the predecessor's log is a *prefix* of this seal's log, in the
+    -- crate's canonical encoding. It is what makes the chain say the history was
+    -- only appended to rather than merely that the seals are in order; without
+    -- it, a log rebuilt between two closes satisfies every other constraint
+    -- here.
+    --
+    -- NULL only for the genesis seal and for one following a predecessor whose
+    -- tree was empty. `SealChain` refuses any other NULL.
+    --
+    -- Covered by seal_hash, so it cannot be swapped for a proof relating a
+    -- different pair of trees.
+    prev_consistency    BLOB,
+
     seal_hash           BLOB    NOT NULL,
 
     -- Monotonic ordering of the chain. SQLite has no stable timestamp ordering

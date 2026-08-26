@@ -1,7 +1,7 @@
 +++
 title = "Dimensions"
 description = "Reporting axes carried on every posting, orthogonal to the account path — and why the crate ships none of them."
-weight = 12
+weight = 13
 +++
 
 ## Axes, not deeper paths
@@ -44,8 +44,66 @@ What the engine does:
   the *set*, not of the order they were built in.
 - **Folds them into the entry hash**, so they are covered by tamper evidence.
 - **Lets you require them**, through `LedgerPolicy::requiring`.
+- **Reports on them** — [below](#slicing-a-report).
 
 It never interprets a value.
+
+## Slicing a report
+
+A `DimensionFilter` narrows any balance read: `balance`, `trial_balance`,
+`balances`. It is a conjunction, and it takes two kinds of clause.
+
+```rust
+let retail = DimensionFilter::any()
+    .matching(Label::new("segment")?, Label::new("Retail")?);
+
+// One account, one slice.
+let b = journal.balance(&key, BalanceQuery::all().matching(&retail))?;
+
+// Every account, one slice — and every report that works on a trial balance
+// works on this one, because it is a trial balance.
+let tb = journal.trial_balance(BalanceQuery::all().matching(&retail))?;
+assert!(tb.totals(Currency::EUR, Layer::Settled)?.is_balanced());
+```
+
+`dimension_values` tells you which values an axis actually takes, since the
+values are yours and nothing else knows:
+
+```rust
+for value in journal.dimension_values("segment") {
+    let filter = DimensionFilter::any().matching(Label::new("segment")?, value);
+    // … one slice per value.
+}
+```
+
+### The clause that keeps a report honest
+
+`missing(axis)` matches postings that do **not** carry the axis at all. Slice by
+the values an axis takes and the totals will not reach the trial balance, because
+unattributed postings land in none of the slices — silently.
+
+```rust
+let unattributed = DimensionFilter::any().missing(Label::new("segment")?);
+let rest = journal.balance(&key, BalanceQuery::all().matching(&unattributed))?;
+// slices + rest == the whole
+```
+
+Requiring the axis with `LedgerPolicy::requiring` is how you stop that happening
+going forward. `missing` is how you find what slipped through before you did.
+
+### Slicing and dating compose
+
+`BalanceQuery` carries the date range and the filter together, so a segment P&L
+for one month is one query — and one round trip to a `LedgerStore`:
+
+```rust
+let march = BalanceQuery::between(date!(2026-03-01), date!(2026-03-31));
+let retail_in_march = store.trial_balance(march.matching(&retail)).await?;
+```
+
+Note `between`, not `through`: a date **range** is the period's *activity*, what
+an income statement reports; `through` is the cumulative position a balance sheet
+reports. See [Historical reads](@/docs/statements.md#historical-reads).
 
 ## Requiring an axis
 
@@ -98,6 +156,12 @@ A column per axis would be either this crate's guess at yours or a schema change
 every time a new one is needed. A JSON blob indexes nothing:
 `WHERE axis = 'activity' AND value = 'Network'` is an index scan here and a full
 scan there.
+
+The index is not decoration. An equality clause becomes an **inner join** on
+`posting_dimensions`, so the planner drives from `(axis, value)` — the selective
+side — rather than testing every posting in turn. It cannot duplicate a posting,
+because `(entry_id, posting_index, axis)` is the primary key and matches at most
+one row. An *absence* clause has no row to join to and stays a `NOT EXISTS`.
 
 Because dimensions are part of the content hash, a backend that drops an axis
 does not merely under-report — it makes the entry **unreadable**, since

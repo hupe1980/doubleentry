@@ -26,7 +26,11 @@
 // without making them safer.
 #![allow(clippy::arithmetic_side_effects, clippy::indexing_slicing)]
 
+use smallvec::SmallVec;
+
 use crate::hash::{Hash, tagged};
+
+pub mod nodes;
 
 const TAG_EMPTY: &[u8] = b"doubleentry/merkle/empty/v1";
 const TAG_LEAF: &[u8] = b"doubleentry/merkle/leaf/v1";
@@ -54,6 +58,7 @@ fn node_hash(left: &Hash, right: &Hash) -> Hash {
 }
 
 /// The largest power of two strictly less than `n`, for `n > 1`.
+#[cfg(test)]
 fn split_point(n: usize) -> usize {
     debug_assert!(n > 1);
     let mut k = 1usize;
@@ -64,6 +69,17 @@ fn split_point(n: usize) -> usize {
 }
 
 /// The Merkle Tree Hash of a run of leaf payloads.
+///
+/// RFC 6962's definition, transcribed. Nothing in the engine calls it: the log
+/// answers from stored nodes in `O(log n)` instead. It is kept, and kept
+/// test-only, as the **executable specification** the fast path is checked
+/// against — an optimisation with no independent statement of what it is
+/// optimising is an optimisation nobody can audit.
+///
+/// See the `node_equivalence` tests, which compare the two exhaustively over
+/// every size and position, and the golden vectors, which pin the answer they
+/// agree on.
+#[cfg(test)]
 fn mth(leaves: &[Hash]) -> Hash {
     match leaves.len() {
         0 => empty_root(),
@@ -108,6 +124,22 @@ pub enum ProofError {
         from: u64,
         /// Current log size.
         size: u64,
+    },
+    /// A consistency proof was requested from the empty tree.
+    ///
+    /// Every log extends the empty one, so such a proof would be true of any
+    /// history at all and would constrain neither the new root nor anything
+    /// else. Returning one is worse than refusing: it verifies, and a verifier
+    /// who did not know to ask cannot tell it apart from a real check.
+    ///
+    /// [RFC 9162 §2.1.4.2](https://www.rfc-editor.org/rfc/rfc9162#section-2.1.4.2)
+    /// defines consistency only for `0 < m <= n`, and Go's `tlog.ProveTree`
+    /// refuses `m < 1` for the same reason. Archive a head with at least one
+    /// entry in it.
+    #[error("a consistency proof from the empty tree constrains nothing; archive a non-empty head")]
+    EmptyOldTree {
+        /// The later size the proof was requested against.
+        new_size: u64,
     },
 }
 
@@ -207,68 +239,54 @@ pub struct ConsistencyProof {
 }
 
 impl ConsistencyProof {
-    /// True when this proof asserts nothing about the newer tree.
-    ///
-    /// A proof from `old_size == 0` is vacuous: every log extends the empty one,
-    /// so the walk constrains neither the new root nor anything else. It still
-    /// verifies — correctly, because the statement really is true — and that is
-    /// the trap. An auditor who archived a head *before the first entry* and
-    /// came back later gets `true` from a check that examined nothing, which is
-    /// indistinguishable from a genuine verification unless they ask.
-    ///
-    /// The new *size* is still pinned, because [`Self::verify`] compares it
-    /// against the head it is given. Only the root floats.
-    ///
-    /// ```
-    /// # use doubleentry::{MerkleLog, TreeHead, Hash};
-    /// # let mut log = MerkleLog::new();
-    /// # for i in 0..6u64 { log.append(Hash::from_bytes([i as u8; 32])); }
-    /// let empty = log.head_at(0)?;
-    /// let proof = log.consistency_proof(0)?;
-    /// assert!(proof.is_vacuous());
-    ///
-    /// // It verifies against the true head — and against a forged one.
-    /// assert!(proof.verify(&empty, &log.head()));
-    /// let forged = TreeHead { size: log.head().size, root: Hash::from_bytes([0xab; 32]) };
-    /// assert!(proof.verify(&empty, &forged));
-    ///
-    /// // One entry in, the same forgery is refused.
-    /// let one = log.head_at(1)?;
-    /// let from_one = log.consistency_proof(1)?;
-    /// assert!(!from_one.is_vacuous());
-    /// assert!(!from_one.verify(&one, &forged));
-    /// # Ok::<(), doubleentry::ProofError>(())
-    /// ```
-    #[must_use]
-    pub fn is_vacuous(&self) -> bool {
-        self.old_size == 0
-    }
-
     /// Verifies that the log at `old` is a prefix of the log at `new`.
-    ///
-    /// **A `true` answer means nothing when [`is_vacuous`](Self::is_vacuous) is
-    /// also true.** Archive a head with at least one entry in it, or check
-    /// `is_vacuous` before treating the result as evidence.
     ///
     /// Both ends are (size, root) pairs, and both halves of each are checked, so
     /// the snapshot labels a caller reads back are as trustworthy as the roots.
     ///
     /// Taking heads rather than bare roots is what makes that true.
-    /// [`old_size`](Self::old_size) would in fact be pinned by the walk alone —
-    /// both roots are rebuilt from the one path, and only the true old size
-    /// forks it where the old root comes out right — but
-    /// [`new_size`](Self::new_size) would not: like an [`InclusionProof`]'s tree
-    /// size it steers the walk, and neighbouring values steer it identically, so
-    /// against bare roots a one-to-three proof is accepted as a one-to-four. The
-    /// from-empty proof is unconditional besides, since every tree really does
-    /// extend the empty one, and constrains neither the new size nor the new
-    /// root.
+    /// [`new_size`](Self::new_size) steers the walk and neighbouring values
+    /// steer it identically, so against a bare root a one-to-three proof is
+    /// accepted as a one-to-four. Comparing both sizes explicitly costs nothing
+    /// and spares a verifier deriving that from the index arithmetic.
     ///
-    /// The old-size comparison therefore duplicates what the walk enforces. It
-    /// stays because a verifier should not have to derive that from the index
-    /// arithmetic to know its snapshot labels are sound.
+    /// # From the empty tree, never
+    ///
+    /// `old_size == 0` is refused. The statement it makes is true of every
+    /// history that has ever existed — each one extends the empty tree — so an
+    /// auditor who archived a head *before the first entry* would get `true`
+    /// back from a check that examined nothing. Refused at both ends, since the
+    /// fields are public and a proof arrives over a wire: see
+    /// [`ProofError::EmptyOldTree`].
+    ///
+    /// ```
+    /// # use doubleentry::{MerkleLog, TreeHead, Hash, ProofError};
+    /// # let mut log = MerkleLog::new();
+    /// # for i in 0..6u64 { log.append(Hash::from_bytes([i as u8; 32])); }
+    /// // Refused at construction …
+    /// assert!(matches!(
+    ///     log.consistency_proof(0),
+    ///     Err(ProofError::EmptyOldTree { new_size: 6 })
+    /// ));
+    ///
+    /// // … and refused again on the wire, where the fields are public.
+    /// let forged = doubleentry::ConsistencyProof { old_size: 0, new_size: 6, path: vec![] };
+    /// let empty = TreeHead { size: 0, root: doubleentry::merkle::empty_root() };
+    /// assert!(!forged.verify(&empty, &log.head()));
+    ///
+    /// // One entry in, a real proof verifies.
+    /// let one = log.head_at(1)?;
+    /// assert!(log.consistency_proof(1)?.verify(&one, &log.head()));
+    /// # Ok::<(), ProofError>(())
+    /// ```
     #[must_use]
     pub fn verify(&self, old: &TreeHead, new: &TreeHead) -> bool {
+        // A proof from the empty tree is true of every log there has ever been.
+        // It is refused rather than answered, so a `true` from this function
+        // always means something was checked.
+        if self.old_size == 0 {
+            return false;
+        }
         if self.old_size != old.size || self.new_size != new.size {
             return false;
         }
@@ -278,13 +296,6 @@ impl ConsistencyProof {
         }
         if self.old_size == self.new_size {
             return self.path.is_empty() && old_root == new_root;
-        }
-        if self.old_size == 0 {
-            // Every tree is consistent with the empty tree, but the verifier must
-            // still confirm that the root it was handed *is* the empty root.
-            // Accepting any value here would let a caller "prove" consistency
-            // with a history that never existed.
-            return self.path.is_empty() && *old_root == empty_root();
         }
 
         // A proof for a tree whose size is an exact power of two omits the old
@@ -330,19 +341,83 @@ impl ConsistencyProof {
 
         sname == 0 && fr == *old_root && sr == *new_root
     }
+
+    /// Restores a proof from the bytes
+    /// [`to_canonical_bytes`](crate::Canonical::to_canonical_bytes) wrote.
+    ///
+    /// A [`Seal`](crate::Seal) carries one, so a durable backend has to write it
+    /// to a column and read it back. The encoding is the crate's own — fixed
+    /// width, length-prefixed, one representation per value — rather than a
+    /// general-purpose format whose framing is free to change between versions.
+    ///
+    /// The decode is strict: trailing bytes, a truncated path, or a declared
+    /// element count the buffer cannot satisfy are all refused. It cannot check
+    /// that the *hashes* are right — that is [`Self::verify`]'s job, and a seal
+    /// chain runs it on every link.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MalformedProof`] when the buffer is not exactly one encoded
+    /// proof.
+    pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, MalformedProof> {
+        let mut r = crate::canonical::CanonicalReader::new(bytes);
+        let old_size = r.u64().ok_or(MalformedProof)?;
+        let new_size = r.u64().ok_or(MalformedProof)?;
+        let count = r.u64().ok_or(MalformedProof)?;
+        let count = usize::try_from(count).map_err(|_| MalformedProof)?;
+        // Bounded by what the buffer can actually hold before allocating, so a
+        // hostile count cannot ask for a terabyte of `Vec`.
+        if count.saturating_mul(Hash::LEN) > r.remaining() {
+            return Err(MalformedProof);
+        }
+        let mut path = Vec::with_capacity(count);
+        for _ in 0..count {
+            path.push(Hash::from_bytes(
+                r.array::<{ Hash::LEN }>().ok_or(MalformedProof)?,
+            ));
+        }
+        if !r.is_exhausted() {
+            return Err(MalformedProof);
+        }
+        Ok(Self {
+            old_size,
+            new_size,
+            path,
+        })
+    }
 }
 
-/// The perfect-subtree roots covering a log, without the leaves.
+impl crate::canonical::Canonical for ConsistencyProof {
+    fn encode(&self, w: &mut crate::canonical::CanonicalWriter) {
+        w.u64(self.old_size);
+        w.u64(self.new_size);
+        w.seq(self.path.iter(), |w, h| {
+            w.fixed(h.as_bytes());
+        });
+    }
+}
+
+/// A byte buffer is not exactly one encoded [`ConsistencyProof`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("not a well-formed consistency proof encoding")]
+pub struct MalformedProof;
+
+/// The perfect-subtree roots covering a log.
 ///
-/// A [`MerkleLog`] keeps every leaf so it can build proofs. A durable backend
-/// does not want that in memory, and does not need it to answer "what is the
-/// root now" — that depends only on this stack, which holds one node per set bit
-/// in the size. Appending merges equal-height neighbours, so it is amortised
-/// `O(1)` and the whole structure is `O(log n)`.
+/// One node per set bit in the size, so `O(log n)`, and appending merges
+/// equal-height neighbours so it is amortised `O(1)`. Folding it right to left
+/// gives the root.
 ///
-/// Persisting it lets a backend record the tree head alongside each entry and
-/// answer head queries in constant time, instead of rebuilding the tree from
-/// every content hash it has ever stored.
+/// # Not a storage format
+///
+/// A backend should not persist this: the cover is exactly the nodes a
+/// [`nodes::RootPlan`] names, so a store that keeps its tree reads the cover back
+/// in `O(log n)` rather than maintaining a second copy that could stop agreeing
+/// with the first.
+///
+/// Its use is the **write** side. The merges
+/// [`push_recording`](Self::push_recording) performs are precisely the nodes an
+/// append has to store, so a backend gets them without reading anything back.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MerkleAccumulator {
     subtrees: Vec<(u8, Hash)>,
@@ -366,18 +441,18 @@ impl MerkleAccumulator {
             .collect()
     }
 
-    /// Restores an accumulator from persisted state.
+    /// Restores an accumulator from a subtree cover read out of storage.
     ///
     /// `subtrees` must be ordered largest-height first, as
-    /// [`MerkleAccumulator::subtrees`] returns them.
+    /// [`MerkleAccumulator::subtrees`] returns them — which is also the order a
+    /// [`nodes::RootPlan`] names them in.
     ///
     /// The shape is checked rather than trusted. A log of `size` leaves has
     /// exactly one perfect-subtree decomposition — one subtree per set bit in
     /// `size` — so a row lost, duplicated, reordered, or written against a
     /// different size is a shape error, and this catches it. It cannot catch a
-    /// node whose *hash* is wrong; that is what [`MerkleLog::verify_incremental_state`]
-    /// is for, and what recording the root alongside each entry lets a backend
-    /// cross-check cheaply.
+    /// node whose *hash* is wrong; that is what
+    /// [`MerkleLog::verify_structure`] is for.
     ///
     /// # Errors
     ///
@@ -420,8 +495,36 @@ impl MerkleAccumulator {
 
     /// Appends a leaf payload and returns its index.
     pub fn push(&mut self, payload: Hash) -> u64 {
+        self.push_recording(payload).0
+    }
+
+    /// Appends a leaf payload, returning its index **and the nodes to store**.
+    ///
+    /// The nodes come out in [`nodes`] storage order — the leaf hash, then one
+    /// per subtree that just closed — so a backend appends them at consecutive
+    /// positions starting at [`nodes::count`] of the previous size. It never has
+    /// to read anything back to write them, because the left siblings each merge
+    /// needs are exactly what the subtree stack already holds.
+    ///
+    /// That is the whole reason this is on the accumulator rather than beside
+    /// it: the merges are already happening here, and computing them twice is
+    /// how two implementations of one tree start to disagree.
+    ///
+    /// ```
+    /// # use doubleentry::{Hash, MerkleAccumulator};
+    /// # use doubleentry::merkle::nodes;
+    /// let mut accumulator = MerkleAccumulator::new();
+    /// // Record 0 closes nothing: one leaf hash.
+    /// assert_eq!(accumulator.push_recording(Hash::from_bytes([0; 32])).1.len(), 1);
+    /// // Record 1 closes the pair above it: a leaf hash and one interior node.
+    /// assert_eq!(accumulator.push_recording(Hash::from_bytes([1; 32])).1.len(), 2);
+    /// assert_eq!(nodes::count(accumulator.size()), 3);
+    /// ```
+    pub fn push_recording(&mut self, payload: Hash) -> (u64, SmallVec<[Hash; 8]>) {
         let index = self.size;
         let mut node = leaf_hash(&payload);
+        let mut written = SmallVec::new();
+        written.push(node);
         let mut level = 0u8;
         // The left sibling is always the one already on the stack.
         while let Some(&(top_level, top_hash)) = self.subtrees.last() {
@@ -431,10 +534,11 @@ impl MerkleAccumulator {
             self.subtrees.pop();
             node = node_hash(&top_hash, &node);
             level = level.saturating_add(1);
+            written.push(node);
         }
         self.subtrees.push((level, node));
         self.size = self.size.saturating_add(1);
-        index
+        (index, written)
     }
 
     /// The current Merkle Tree Hash.
@@ -471,17 +575,30 @@ impl MerkleAccumulator {
 ///
 /// # Cost
 ///
-/// The log keeps the roots of the perfect subtrees covering its leaves, so
-/// appending is amortised `O(1)` and reading the current root is `O(log n)`
-/// rather than a full recomputation. Historical roots and proofs are derived
-/// from the stored leaves and cost `O(n)`; they are audit-time operations, not
-/// write-path ones.
+/// The log holds the tree, not the leaves: every node whose subtree is complete,
+/// in [`nodes`] storage order. That is just under two hashes per entry, and it
+/// is what makes every operation here logarithmic —
+///
+/// | Operation | Cost |
+/// |---|---|
+/// | [`append`](Self::append) | amortised `O(1)` |
+/// | [`root`](Self::root), [`head`](Self::head) | `O(log n)` |
+/// | [`root_at`](Self::root_at), [`head_at`](Self::head_at) | `O(log n)` |
+/// | [`inclusion_proof`](Self::inclusion_proof) and friends | `O(log n)` |
+/// | [`consistency_proof`](Self::consistency_proof) and friends | `O(log n)` |
+/// | [`verify_structure`](Self::verify_structure) | `O(n)`, audit-time |
+///
+/// The same [`nodes`] plans drive the durable backends, so a proof from a
+/// database and a proof from memory are the same proof — which the equivalence
+/// tests in this module pin against an independent replay of the RFC 6962
+/// definition.
 #[derive(Debug, Clone, Default)]
 pub struct MerkleLog {
-    leaves: Vec<Hash>,
-    /// Derived state: [`MerkleLog::root`] folds it, and
-    /// [`MerkleLog::verify_incremental_state`] proves it still agrees with a
-    /// recomputation from the leaves.
+    /// Every completed node, dense by [`nodes`] storage position.
+    nodes: Vec<Hash>,
+    /// The perfect-subtree cover, so an append needs no lookup. Derived — it is
+    /// exactly the nodes a [`nodes::RootPlan`] names — and
+    /// [`MerkleLog::verify_structure`] proves it has not drifted.
     accumulator: MerkleAccumulator,
 }
 
@@ -489,10 +606,7 @@ impl MerkleLog {
     /// Creates an empty log.
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            leaves: Vec::new(),
-            accumulator: MerkleAccumulator::new(),
-        }
+        Self::default()
     }
 
     /// Builds a log from existing leaf payloads, in order.
@@ -508,28 +622,34 @@ impl MerkleLog {
     /// Number of leaves.
     #[must_use]
     pub fn len(&self) -> u64 {
-        self.leaves.len() as u64
+        self.accumulator.size()
     }
 
     /// True when the log holds no leaves.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.leaves.is_empty()
+        self.len() == 0
     }
 
-    /// The leaf payloads, in log order.
+    /// The stored nodes, dense by [`nodes`] storage position.
+    ///
+    /// What a durable backend writes. Position `i` is
+    /// [`nodes::split_index`]`(i)`, and the whole slice is what
+    /// [`nodes::count`] counts.
     #[must_use]
-    pub fn leaves(&self) -> &[Hash] {
-        &self.leaves
+    pub fn nodes(&self) -> &[Hash] {
+        &self.nodes
     }
 
     /// Appends a leaf payload and returns its index.
     ///
     /// Amortised `O(1)`: the new leaf merges with any equal-sized subtree
-    /// already on the stack, which happens once per power of two.
+    /// already on the stack, which happens once per power of two, and each merge
+    /// appends exactly one node.
     pub fn append(&mut self, payload: Hash) -> u64 {
-        self.leaves.push(payload);
-        self.accumulator.push(payload)
+        let (index, written) = self.accumulator.push_recording(payload);
+        self.nodes.extend(written);
+        index
     }
 
     /// The perfect-subtree state, for a backend that wants to persist it.
@@ -543,37 +663,112 @@ impl MerkleLog {
     /// Deliberately not public: a log that can be shortened is not append-only.
     /// It exists so an in-memory journal can undo a batch that turned out to be
     /// unacceptable partway through — leaves that were never committed to
-    /// anything, because the batch never returned. `O(n)`, and only on that
-    /// path.
+    /// anything, because the batch never returned.
+    ///
+    /// `O(log n)`: the nodes a size requires are a prefix of the ones it had, so
+    /// this is a truncation and a re-read of the cover.
     pub(crate) fn truncate(&mut self, len: u64) {
-        let len = usize::try_from(len).unwrap_or(usize::MAX);
-        if len >= self.leaves.len() {
+        if len >= self.len() {
             return;
         }
-        self.leaves.truncate(len);
-        self.accumulator = MerkleAccumulator::new();
-        for leaf in &self.leaves {
-            self.accumulator.push(*leaf);
+        let keep = usize::try_from(nodes::count(len)).unwrap_or(usize::MAX);
+        self.nodes.truncate(keep);
+        match self.cover(len) {
+            Some(cover) => self.accumulator = cover,
+            // Unreachable: `keep` is exactly the node count `len` requires, and
+            // every position in the cover at `len` is below it. Were it ever
+            // reached, a log that cannot describe its own size must not go on
+            // answering proofs about it — so it empties rather than serving from
+            // a stale cover, which is the failure that would not announce
+            // itself.
+            None => {
+                self.nodes.clear();
+                self.accumulator = MerkleAccumulator::new();
+            }
         }
     }
 
-    /// The current Merkle Tree Hash.
+    /// The subtree cover at `size`, read from the stored nodes.
     ///
-    /// Folds the perfect subtrees right to left, which reproduces the
-    /// left-perfect split the tree hash is defined by.
+    /// `None` when the log does not hold every node the cover names, which for a
+    /// `size` the log has reached means the node vector is shorter than its own
+    /// size claims.
+    ///
+    /// The shape needs no checking here, unlike
+    /// [`MerkleAccumulator::try_from_parts`]: the heights come from the plan
+    /// rather than from storage, so they are the decomposition `size` requires
+    /// by construction. What `try_from_parts` guards against is a *backend*
+    /// handing over rows, and that check stays where the rows do.
+    fn cover(&self, size: u64) -> Option<MerkleAccumulator> {
+        let plan = nodes::RootPlan::new(size);
+        let subtrees = plan
+            .nodes()
+            .iter()
+            .map(|at| {
+                let hash = *self.nodes.get(usize::try_from(*at).ok()?)?;
+                Some((nodes::split_index(*at).0, hash))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        MerkleAccumulator::try_from_parts(subtrees, size).ok()
+    }
+
+    /// The nodes a plan named, read out of this log.
+    ///
+    /// Returns `None` for a position the log does not hold, which cannot happen
+    /// for a plan built against a size this log has reached.
+    fn read(&self, want: &[u64]) -> Option<Vec<Hash>> {
+        want.iter()
+            .map(|at| self.nodes.get(usize::try_from(*at).ok()?).copied())
+            .collect()
+    }
+
+    /// The current Merkle Tree Hash.
     #[must_use]
     pub fn root(&self) -> Hash {
         self.accumulator.root()
     }
 
-    /// Recomputes the root from the stored leaves and compares it with the
-    /// incrementally maintained one.
+    /// Checks that every stored node is the hash of the two beneath it.
     ///
-    /// The incremental subtree stack is derived state; this proves it has not
-    /// drifted from the leaves it claims to summarise.
+    /// The nodes are the log, so this is the log checking itself: for every
+    /// interior node, recompute it from its children and compare. It also
+    /// confirms the maintained subtree cover still agrees with the nodes it
+    /// summarises.
+    ///
+    /// A single altered node fails here, wherever it sits. What it cannot say is
+    /// whether the *leaves* are the right leaves — that is
+    /// [`Journal::verify_log`](crate::Journal::verify_log)'s question, and it
+    /// answers it by rebuilding from the entries.
+    ///
+    /// `O(n)`. An audit-time operation.
     #[must_use]
-    pub fn verify_incremental_state(&self) -> bool {
-        self.root() == mth(&self.leaves)
+    pub fn verify_structure(&self) -> bool {
+        if self.nodes.len() as u64 != nodes::count(self.len()) {
+            return false;
+        }
+        for (at, node) in self.nodes.iter().enumerate() {
+            let at = at as u64;
+            let (level, index) = nodes::split_index(at);
+            if level == 0 {
+                continue;
+            }
+            let (Some(left), Some(right)) = (
+                self.nodes.get(
+                    usize::try_from(nodes::index_of(level - 1, index * 2)).unwrap_or(usize::MAX),
+                ),
+                self.nodes.get(
+                    usize::try_from(nodes::index_of(level - 1, index * 2 + 1))
+                        .unwrap_or(usize::MAX),
+                ),
+            ) else {
+                return false;
+            };
+            if node_hash(left, right) != *node {
+                return false;
+            }
+        }
+        self.cover(self.len())
+            .is_some_and(|cover| cover == self.accumulator)
     }
 
     /// The current tree head.
@@ -587,16 +782,13 @@ impl MerkleLog {
 
     /// The Merkle Tree Hash over the first `size` leaves.
     ///
-    /// Used to reconstruct a historical root without replaying the log.
+    /// `O(log n)`: the perfect-subtree cover at that size, folded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProofError::SizeOutOfRange`] for a size beyond the log.
     pub fn root_at(&self, size: u64) -> Result<Hash, ProofError> {
-        let size_usize = usize::try_from(size).unwrap_or(usize::MAX);
-        if size_usize > self.leaves.len() {
-            return Err(ProofError::SizeOutOfRange {
-                from: size,
-                size: self.len(),
-            });
-        }
-        Ok(mth(&self.leaves[..size_usize]))
+        self.head_at(size).map(|head| head.root)
     }
 
     /// The tree head as of an earlier size.
@@ -609,10 +801,24 @@ impl MerkleLog {
     ///
     /// Returns [`ProofError::SizeOutOfRange`] for a size beyond the log.
     pub fn head_at(&self, size: u64) -> Result<TreeHead, ProofError> {
-        Ok(TreeHead {
-            size,
-            root: self.root_at(size)?,
-        })
+        if size > self.len() {
+            return Err(ProofError::SizeOutOfRange {
+                from: size,
+                size: self.len(),
+            });
+        }
+        let plan = nodes::RootPlan::new(size);
+        let read = self.read(plan.nodes()).ok_or(ProofError::SizeOutOfRange {
+            from: size,
+            size: self.len(),
+        })?;
+        let root = plan
+            .assemble(&read)
+            .map_err(|_| ProofError::SizeOutOfRange {
+                from: size,
+                size: self.len(),
+            })?;
+        Ok(TreeHead { size, root })
     }
 
     /// Builds an inclusion proof for the leaf at `index`, against the current head.
@@ -639,36 +845,27 @@ impl MerkleLog {
     /// [`ProofError::IndexOutOfRange`] for a position beyond *that size* — an
     /// entry the log has now but had not yet recorded then.
     pub fn inclusion_proof_at(&self, index: u64, size: u64) -> Result<InclusionProof, ProofError> {
-        let n = usize::try_from(size).unwrap_or(usize::MAX);
-        if n > self.leaves.len() {
+        if size > self.len() {
             return Err(ProofError::SizeOutOfRange {
                 from: size,
                 size: self.len(),
             });
         }
-        let m = usize::try_from(index).unwrap_or(usize::MAX);
-        if m >= n {
-            return Err(ProofError::IndexOutOfRange { index, size });
-        }
-        let mut path = Vec::new();
-        build_inclusion_path(m, &self.leaves[..n], &mut path);
-        Ok(InclusionProof {
-            leaf_index: index,
-            tree_size: size,
-            path,
-        })
+        let plan = nodes::InclusionPlan::new(index, size)?;
+        let read = self
+            .read(plan.nodes())
+            .ok_or(ProofError::IndexOutOfRange { index, size })?;
+        plan.assemble(&read)
+            .map_err(|_| ProofError::IndexOutOfRange { index, size })
     }
 
     /// Builds a consistency proof from an earlier size to the current size.
     ///
-    /// A proof from `old_size == 0` is **vacuous** — every log extends the empty
-    /// tree, so it constrains nothing about the newer one and verifies against
-    /// any root at the right size. See
-    /// [`ConsistencyProof::is_vacuous`](crate::ConsistencyProof::is_vacuous).
-    ///
     /// # Errors
     ///
-    /// Returns [`ProofError::SizeOutOfRange`] for a size beyond the log.
+    /// Returns [`ProofError::SizeOutOfRange`] for a size beyond the log, and
+    /// [`ProofError::EmptyOldTree`] for `old_size == 0` — a proof from the empty
+    /// tree is true of every history and is refused rather than handed out.
     pub fn consistency_proof(&self, old_size: u64) -> Result<ConsistencyProof, ProofError> {
         self.consistency_proof_between(old_size, self.len())
     }
@@ -679,47 +876,39 @@ impl MerkleLog {
     /// of them current, can be shown that one is a prefix of the other without
     /// either being told the log's present size.
     ///
-    /// A proof from `old_size == 0` is **vacuous** — every log extends the empty
-    /// tree, so it constrains nothing about the newer one and verifies against
-    /// any root at the right size. See
-    /// [`ConsistencyProof::is_vacuous`](crate::ConsistencyProof::is_vacuous).
-    ///
     /// # Errors
     ///
     /// Returns [`ProofError::SizeOutOfRange`] if `new_size` is beyond the log or
-    /// `old_size` is beyond `new_size` — a log cannot be shown to have shrunk.
+    /// `old_size` is beyond `new_size` — a log cannot be shown to have shrunk —
+    /// and [`ProofError::EmptyOldTree`] for `old_size == 0`.
     pub fn consistency_proof_between(
         &self,
         old_size: u64,
         new_size: u64,
     ) -> Result<ConsistencyProof, ProofError> {
-        let n = usize::try_from(new_size).unwrap_or(usize::MAX);
-        if n > self.leaves.len() {
+        if new_size > self.len() {
             return Err(ProofError::SizeOutOfRange {
                 from: new_size,
                 size: self.len(),
             });
         }
-        let m = usize::try_from(old_size).unwrap_or(usize::MAX);
-        if m > n {
-            return Err(ProofError::SizeOutOfRange {
+        let plan = nodes::ConsistencyPlan::new(old_size, new_size)?;
+        let read = self.read(plan.nodes()).ok_or(ProofError::SizeOutOfRange {
+            from: new_size,
+            size: self.len(),
+        })?;
+        plan.assemble(&read)
+            .map_err(|_| ProofError::SizeOutOfRange {
                 from: old_size,
                 size: new_size,
-            });
-        }
-        let mut path = Vec::new();
-        if m > 0 && m < n {
-            build_consistency_path(m, &self.leaves[..n], true, &mut path);
-        }
-        Ok(ConsistencyProof {
-            old_size,
-            new_size,
-            path,
-        })
+            })
     }
 }
 
 /// `PATH(m, D[n])` from RFC 6962.
+///
+/// The reference implementation, kept test-only for the reason given on [`mth`].
+#[cfg(test)]
 fn build_inclusion_path(m: usize, leaves: &[Hash], out: &mut Vec<Hash>) {
     let n = leaves.len();
     if n <= 1 {
@@ -736,6 +925,9 @@ fn build_inclusion_path(m: usize, leaves: &[Hash], out: &mut Vec<Hash>) {
 }
 
 /// `SUBPROOF(m, D[n], b)` from RFC 6962.
+///
+/// The reference implementation, kept test-only for the reason given on [`mth`].
+#[cfg(test)]
 fn build_consistency_path(m: usize, leaves: &[Hash], b: bool, out: &mut Vec<Hash>) {
     let n = leaves.len();
     if m == n {
@@ -751,6 +943,167 @@ fn build_consistency_path(m: usize, leaves: &[Hash], b: bool, out: &mut Vec<Hash
     } else {
         build_consistency_path(m - k, &leaves[k..], false, out);
         out.push(mth(&leaves[..k]));
+    }
+}
+
+#[cfg(test)]
+mod node_equivalence {
+    //! The stored-node algorithms and the leaf-replay ones must agree exactly.
+    //!
+    //! [`nodes`] exists so a durable backend can answer a proof from `O(log n)`
+    //! rows instead of replaying the whole log. That is only safe if it produces
+    //! *the same proof* — a second implementation that drifts is worse than the
+    //! `O(n)` one it replaced, because the proofs it hands out would verify
+    //! against a root nobody else computes.
+    //!
+    //! So this compares them exhaustively over every size and position a test
+    //! can enumerate, rather than sampling. The golden vectors pin the shared
+    //! answer; this pins that there is only one answer.
+
+    use super::*;
+    use crate::merkle::nodes::{ConsistencyPlan, InclusionPlan, RootPlan};
+
+    fn payload(i: u64) -> Hash {
+        let mut bytes = [0u8; 32];
+        bytes[..8].copy_from_slice(&i.to_le_bytes());
+        Hash::from_bytes(bytes)
+    }
+
+    /// Every node a log of `size` records stores, in storage order.
+    ///
+    /// Built the way a backend builds it — one append at a time, keeping only
+    /// what the accumulator hands back — so this is the write path under test as
+    /// well as a fixture.
+    fn stored_nodes(size: u64) -> Vec<Hash> {
+        let mut accumulator = MerkleAccumulator::new();
+        let mut out = Vec::new();
+        for i in 0..size {
+            out.extend(accumulator.push_recording(payload(i)).1);
+        }
+        out
+    }
+
+    fn read(all: &[Hash], plan: &[u64]) -> Vec<Hash> {
+        plan.iter()
+            .map(|i| all[usize::try_from(*i).expect("small")])
+            .collect()
+    }
+
+    #[test]
+    fn the_stored_node_count_is_what_the_appends_produced() {
+        for size in 0..300u64 {
+            assert_eq!(
+                stored_nodes(size).len() as u64,
+                crate::merkle::nodes::count(size),
+                "node count disagreed at size {size}"
+            );
+        }
+    }
+
+    #[test]
+    fn roots_agree_at_every_size() {
+        let all = stored_nodes(300);
+        for size in 0..=300u64 {
+            let plan = RootPlan::new(size);
+            let from_nodes = plan
+                .assemble(&read(&all, plan.nodes()))
+                .expect("well formed");
+            let from_leaves = mth(&(0..size).map(payload).collect::<Vec<_>>());
+            assert_eq!(from_nodes, from_leaves, "root disagreed at size {size}");
+        }
+    }
+
+    #[test]
+    fn inclusion_proofs_agree_at_every_position() {
+        let all = stored_nodes(130);
+        for size in 1..=130u64 {
+            let leaves: Vec<Hash> = (0..size).map(payload).collect();
+            for index in 0..size {
+                let plan = InclusionPlan::new(index, size).expect("in range");
+                let from_nodes = plan
+                    .assemble(&read(&all, plan.nodes()))
+                    .expect("well formed");
+
+                // RFC 6962's PATH, transcribed, against the same leaves.
+                let mut reference = Vec::new();
+                build_inclusion_path(
+                    usize::try_from(index).expect("small"),
+                    &leaves,
+                    &mut reference,
+                );
+                assert_eq!(
+                    from_nodes.path, reference,
+                    "inclusion path disagreed for leaf {index} of {size}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn consistency_proofs_agree_at_every_pair() {
+        let all = stored_nodes(130);
+        for new in 1..=130u64 {
+            let leaves: Vec<Hash> = (0..new).map(payload).collect();
+            for old in 1..=new {
+                let plan = ConsistencyPlan::new(old, new).expect("in range");
+                let from_nodes = plan
+                    .assemble(&read(&all, plan.nodes()))
+                    .expect("well formed");
+
+                // RFC 6962's SUBPROOF, transcribed, against the same leaves.
+                let mut reference = Vec::new();
+                if old < new {
+                    build_consistency_path(
+                        usize::try_from(old).expect("small"),
+                        &leaves,
+                        true,
+                        &mut reference,
+                    );
+                }
+                assert_eq!(
+                    from_nodes.path, reference,
+                    "consistency path disagreed from {old} to {new}"
+                );
+            }
+        }
+    }
+
+    /// The whole log's proofs, checked against the definition, at every size.
+    ///
+    /// `MerkleLog` answers from stored nodes, so this ties the two together end
+    /// to end rather than only at the plan layer.
+    #[test]
+    fn the_log_agrees_with_the_definition_at_every_size() {
+        let mut log = MerkleLog::new();
+        let mut leaves = Vec::new();
+        for i in 0..100u64 {
+            log.append(payload(i));
+            leaves.push(payload(i));
+            assert_eq!(log.root(), mth(&leaves), "root diverged at size {}", i + 1);
+        }
+        for size in 0..=100u64 {
+            assert_eq!(
+                log.root_at(size).expect("in range"),
+                mth(&leaves[..usize::try_from(size).expect("small")]),
+                "historical root diverged at size {size}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stored_node_proof_verifies_against_a_replayed_head() {
+        // The two halves meeting: a proof assembled from stored nodes, checked
+        // against a head computed from leaves.
+        let all = stored_nodes(100);
+        let log = MerkleLog::from_leaves((0..100u64).map(payload).collect());
+        let head = log.head();
+        for index in [0u64, 1, 37, 63, 64, 99] {
+            let plan = InclusionPlan::new(index, 100).expect("in range");
+            let proof = plan
+                .assemble(&read(&all, plan.nodes()))
+                .expect("well formed");
+            assert!(proof.verify(&payload(index), &head), "leaf {index}");
+        }
     }
 }
 
@@ -794,7 +1147,7 @@ mod tests {
     #[test]
     fn root_changes_when_a_leaf_changes() {
         let a = log_of(8);
-        let mut leaves = a.leaves().to_vec();
+        let mut leaves: Vec<Hash> = (0..8u64).map(payload).collect();
         leaves[3] = payload(999);
         let b = MerkleLog::from_leaves(leaves);
         assert_ne!(a.root(), b.root());
@@ -1087,7 +1440,7 @@ mod tests {
         for n in 1..=33u64 {
             let log = log_of(n);
             let new_head = log.head();
-            for m in 0..=n {
+            for m in 1..=n {
                 let old_head = log.head_at(m).expect("in range");
                 let proof = log.consistency_proof(m).expect("in range");
                 assert!(
@@ -1105,7 +1458,7 @@ mod tests {
         let proof = log.consistency_proof(8).expect("in range");
 
         // A log that diverges within the first 8 leaves must not verify.
-        let mut tampered = log.leaves()[..8].to_vec();
+        let mut tampered: Vec<Hash> = (0..8u64).map(payload).collect();
         tampered[2] = payload(4242);
         let forged_old = TreeHead {
             size: 8,
@@ -1120,7 +1473,7 @@ mod tests {
         for n in 1..=24u64 {
             let log = log_of(n);
             let new_head = log.head();
-            for m in 0..=n {
+            for m in 1..=n {
                 let old_head = log.head_at(m).expect("in range");
                 let proof = log.consistency_proof(m).expect("in range");
                 for (how, path) in shape_mutations(&proof.path) {
@@ -1144,7 +1497,7 @@ mod tests {
         for n in 1..=20u64 {
             let log = log_of(n);
             let new_head = log.head();
-            for m in 0..=n {
+            for m in 1..=n {
                 let old_head = log.head_at(m).expect("in range");
                 let proof = log.consistency_proof(m).expect("in range");
                 assert!(proof.verify(&old_head, &new_head));
@@ -1238,38 +1591,72 @@ mod tests {
     }
 
     #[test]
-    fn consistency_from_the_empty_tree_requires_the_empty_root() {
+    fn a_proof_from_the_empty_tree_is_refused_at_both_ends() {
         let log = log_of(8);
-        let proof = log.consistency_proof(0).expect("in range");
 
+        // Not built. "Every log extends the empty tree" is true of every log
+        // there has ever been, so the proof would verify against a history
+        // nobody has and its `true` would mean nothing.
+        assert!(matches!(
+            log.consistency_proof(0),
+            Err(ProofError::EmptyOldTree { new_size: 8 })
+        ));
+        assert!(matches!(
+            log.consistency_proof_between(0, 4),
+            Err(ProofError::EmptyOldTree { new_size: 4 })
+        ));
+
+        // And not verified either, because the fields are public and a proof
+        // arrives over a wire. Refusing only at construction would leave the
+        // hole open to exactly the party it protects against.
         let empty = log.head_at(0).expect("in range");
         assert_eq!(empty.root, empty_root());
-
-        // The empty tree is a prefix of everything …
-        assert!(proof.verify(&empty, &log.head()));
-        // … but a claimed history that was never empty must not verify.
-        let never_empty = TreeHead {
-            size: 0,
-            root: payload(1),
-        };
-        assert!(!proof.verify(&never_empty, &log.head()));
-        let claimed_full = TreeHead {
-            size: 0,
-            root: log.root(),
-        };
-        assert!(!proof.verify(&claimed_full, &log.head()));
+        for path in [vec![], vec![payload(1)]] {
+            let forged = ConsistencyProof {
+                old_size: 0,
+                new_size: 8,
+                path,
+            };
+            assert!(!forged.verify(&empty, &log.head()));
+            // Not even against a head that is itself a forgery — which is the
+            // whole point: nothing about the newer tree was ever constrained.
+            let invented = TreeHead {
+                size: 8,
+                root: payload(999),
+            };
+            assert!(!forged.verify(&empty, &invented));
+        }
     }
 
     #[test]
     fn incremental_root_matches_full_recomputation() {
-        // The subtree stack is derived state; it must agree with the definition
-        // at every size, including the ragged ones between powers of two.
+        // The stored tree is derived state; it must agree with the RFC 6962
+        // definition at every size, including the ragged ones between powers of
+        // two — and every node in it must be the hash of the two beneath it.
         let mut log = MerkleLog::new();
         assert_eq!(log.root(), mth(&[]));
+        let mut leaves = Vec::new();
         for i in 0..129u64 {
             log.append(payload(i));
-            assert_eq!(log.root(), mth(log.leaves()), "diverged at size {}", i + 1);
-            assert!(log.verify_incremental_state());
+            leaves.push(payload(i));
+            assert_eq!(log.root(), mth(&leaves), "diverged at size {}", i + 1);
+            assert!(log.verify_structure(), "malformed at size {}", i + 1);
+        }
+    }
+
+    #[test]
+    fn a_single_altered_node_is_caught_wherever_it_sits() {
+        // What `verify_structure` buys over comparing roots: the position of the
+        // damage is not a place the check has to be pointed at.
+        let log = log_of(64);
+        assert!(log.verify_structure());
+        for at in [0usize, 1, 2, 60, 100, 120] {
+            let mut damaged = log.clone();
+            damaged.nodes[at] = payload(0xdead);
+            assert!(
+                !damaged.verify_structure(),
+                "an altered node at position {at} went unnoticed"
+            );
         }
     }
 
@@ -1386,7 +1773,8 @@ mod tests {
             appended.append(l);
         }
         assert_eq!(built.root(), appended.root());
-        assert!(built.verify_incremental_state());
+        assert_eq!(built.nodes(), appended.nodes());
+        assert!(built.verify_structure());
     }
 
     #[test]
@@ -1429,7 +1817,7 @@ mod tests {
         for n in 1..=20u64 {
             let log = log_of(n);
             let new_head = log.head();
-            for m in 0..=n {
+            for m in 1..=n {
                 let old_head = log.head_at(m).expect("in range");
                 let proof = log.consistency_proof(m).expect("in range");
                 for size in (0..=24u64).filter(|s| *s != m) {
@@ -1479,7 +1867,7 @@ mod tests {
         for n in 1..=20u64 {
             let log = log_of(n);
             let new_head = log.head();
-            for m in 0..=n {
+            for m in 1..=n {
                 let old_head = log.head_at(m).expect("in range");
                 let proof = log.consistency_proof(m).expect("in range");
                 assert!(proof.verify(&old_head, &new_head));
@@ -1561,9 +1949,10 @@ mod tests {
         // Two auditors, two archived heads, neither of them current: one must
         // still be provably a prefix of the other.
         let log = log_of(33);
-        for new_size in 0..=33u64 {
+        for new_size in 1..=33u64 {
             let new_head = log.head_at(new_size).expect("in range");
-            for old_size in 0..=new_size {
+            // From 1: a proof from the empty tree is refused, not built.
+            for old_size in 1..=new_size {
                 let old_head = log.head_at(old_size).expect("in range");
                 let proof = log
                     .consistency_proof_between(old_size, new_size)

@@ -1,7 +1,7 @@
 +++
 title = "Periods and seals"
 description = "Closing a period, chaining its seal, and proving one closing balance to an auditor without disclosing the rest of the books."
-weight = 11
+weight = 12
 +++
 
 ## The period lifecycle
@@ -66,6 +66,12 @@ The watermark closes the first. `check_sealable` closes the second: a period is
 sealable only once every **earlier** defined period is sealed, and only if it
 ends *after* the watermark.
 
+`define` refuses an unsealed period that ends at or below the watermark for the
+same reason: nothing could be booked into it and nothing could seal it, so its
+own state would say `open` while every date in it reported `sealed`. A period
+arriving already sealed is admitted in any order — that is the replay path a
+durable backend takes.
+
 ```rust
 // February is defined and open, so March is not sealable yet.
 assert!(matches!(
@@ -83,17 +89,17 @@ One rule, one place: `PeriodCalendar::check_sealable` is what the in-memory
 journal and every durable backend call, and the [conformance
 suite](@/docs/persistence.md) fails a backend that does not enforce it.
 
-### If you are adopting this into an existing ledger
+### What sealing sparsely costs
 
 The watermark narrows what `record` accepts: **seal any period and every earlier
 date is closed**, including dates in gaps and in months the calendar never
-mentioned. Seal sparsely — annually, or only for audited years — and bookings are
-refused across ranges you never sealed, arriving as an ordinary
+mentioned. Seal annually, or only for audited years, and bookings are refused
+across ranges you never sealed, arriving as an ordinary
 `ValidationError::ClosedPeriod`.
 
 That is the correct rule, because those dates fold into a sealed cumulative
 closing balance. Corrections into a closed range book into an open period
-carrying `original_booking_date`, exactly as they always have.
+carrying `original_booking_date`.
 
 The watermark is **derived, never stored**: each sealed period advances it as it
 is defined, so `PeriodCalendar::from_periods` and `ensure` reconstruct it from a
@@ -114,11 +120,15 @@ Each is a **head** — a size and a root — not a bare root. A proof is checked
 against both halves, because a proof's own index and size fields steer its walk
 rather than being checked by it. See [Proofs](@/docs/proofs.md#verify-against-a-head-never-a-bare-root).
 
-Plus `prev_seal`, which chains it to the seal before. Removing or reordering a
-sealed period breaks every seal after it.
+Plus two fields that relate it to the seal before: `prev_seal`, the predecessor's
+hash, and `prev_consistency`, a proof that the predecessor's log is a **prefix**
+of this one's. Removing or reordering a sealed period breaks every seal after it;
+*rewriting* one is what the second field is for, and it is worth its own section
+below.
 
 The whole thing is hashed into `seal_hash`, so editing any field invalidates the
-seal rather than restating it.
+seal rather than restating it — the consistency proof included, which is what
+stops it being swapped for one relating a different pair of trees.
 
 ### "Belongs to the period" means two different things
 
@@ -159,7 +169,7 @@ auditor is trying not to have to trust. A root lets one row be proven in
 use doubleentry::seal::TrialBalanceCommitment;
 
 // Rebuild the commitment from the same closing balances the seal was built over.
-let closing    = journal.trial_balance_through_date(date!(2026-03-31))?;
+let closing    = journal.trial_balance(BalanceQuery::through(date!(2026-03-31)))?;
 let commitment = TrialBalanceCommitment::of(&closing);
 assert_eq!(commitment.head(), seal.trial_balance);
 
@@ -216,14 +226,15 @@ a rebound handle repoints every posting row that names it.
 
 The classification, open window and balance limit are deliberately out of it.
 Those are master data: `close`, `reopen` and `set_limit` exist to change them,
-and like an account's open window they govern what may be booked next rather than
-what was booked already. Hashing them in meant that closing an account on a
-Tuesday invalidated every binding proof against every seal ever issued — a
-routine operation reading as evidence of tampering.
+and they govern what may be booked next rather than what was booked already.
+Hashing them in would mean that closing an account on a Tuesday invalidated every
+binding proof against every seal ever issued — a routine operation reading as
+evidence of tampering. What that leaves out of the ledger is covered under
+[master data](@/docs/accounts.md#what-that-costs).
 
-What the commitment does still pin is the thing that matters: re-registering the
-same paths in a different order renumbers every handle, and the `accounts` head
-moves, so the seal that named the old numbering stops matching.
+The identity is still pinned, which is the part that matters: renumber the
+handles and the `accounts` head moves, so the seal that named the old numbering
+stops matching.
 
 ### Proving it through a store
 
@@ -270,7 +281,7 @@ Both negatives are on the `Ok` side for a concrete reason, not tidiness. A
 the error path is unreachable from generic code over `S: LedgerStore<P>`.
 
 Note the fold it rebuilds with: a closing balance is cumulative by **booking
-date** (`trial_balance_through_date`), not a prefix of the log by position
+date** (`BalanceQuery::through`), not a prefix of the log by position
 (`trial_balance`). Sealing March in April is the normal case, so at the moment
 the seal is taken the log already holds April entries and the two answers
 differ.
@@ -283,6 +294,7 @@ differ.
 - Each references the previous seal's hash (`BrokenChain`).
 - Exactly the first seal may omit a predecessor (`MisplacedGenesis`).
 - Tree heads never shrink (`NonMonotonic`).
+- **Each seal's log provably extends its predecessor's** (`NotAPrefix`).
 - The account registry never shrinks (`ShrunkenRegistry`) — handles are dense
   positions and are never reissued, so a seal committing to *fewer* bindings than
   its predecessor is a registry rebuilt from a truncated set, which renumbers the
@@ -295,9 +307,66 @@ link it would later reject. Verification is linear in the number of seals, which
 matters for a ledger on daily periods: the periods seen so far are carried along
 rather than rescanned at every position.
 
+### Why the fifth rule is the load-bearing one
+
+Every other rule on that list is about the *seals*. Together they establish that
+the seals were issued in order and that none has been edited — and say nothing
+whatever about the entries underneath them.
+
+Consider two seals claiming tree sizes 100 and 200, with entirely unrelated
+roots. `prev_seal` matches. Both hash to their own contents. The sizes grow. The
+registry grows. The ledger matches. Without a consistency proof, a log rebuilt
+from scratch between two closes passes every check, and the chain verifies byte
+for byte over books that were replaced wholesale.
+
+So each seal carries `prev_consistency`, and `SealChain::verify` checks it. That
+turns "these commitments are in order" into "**this history was only ever appended
+to**" — and it does so *offline*: a recipient holding nothing but the seals, no
+log, no entries, no database, can check every link.
+
+`None` is admissible in exactly two places, and both are pinned rather than
+tolerated: the genesis seal, which has no predecessor, and a seal following one
+whose tree was **empty** — no proof from the empty tree exists, so the
+predecessor's root is checked against the empty root instead. Any other `None` is
+`MissingConsistency`. The field cannot be dropped to make a rewritten history
+verify.
+
+The cost is `O(log n)` hashes per seal — a billion-entry log adds under a
+kilobyte to each — and building the proof is `O(log n)` reads, because the log
+[stores its interior nodes](@/docs/proofs.md#cost) rather than only its leaves.
+Sealing's real cost is elsewhere and unavoidable: the closing trial balance folds
+every posting on or before the period's last day. That is a per-period operation,
+not a write-path one.
+
+### Verifying against the books
+
+`SealChain::verify` takes seals alone, which is exactly what a recipient has. But
+a complete, internally consistent chain can be assembled over a history *nobody
+holds*, and over a chart of accounts nobody holds — so when you do have them, do
+not settle for the weaker claim:
+
 ```rust
-journal.verify_seals()?;    // every seal, every link
+journal.verify_seals()?;                       // chain + log + registry
+
+// The same, given the pieces:
+chain.verify_against_log(&log)?;               // these seals describe THIS log
+chain.verify_against_accounts(&registry)?;     // …and THESE handles
 ```
+
+Two checks, because there are two ways a seal can be evidence about somebody
+else's books:
+
+- **The log.** Each seal's tree head is recomputed from the entries and compared.
+- **The registry.** Each seal's `accounts` head is recomputed from the bindings —
+  at the size the seal recorded, since the registry has grown since — and
+  compared. This is the [renumbering](#naming-the-account) that head exists to
+  expose; recording it makes the tampering detectable, and this is what looks.
+
+`Journal::verify_seals` runs both, and `Journal::audit` runs `verify_seals`. Run
+it after a restore, after a migration, and before handing a chain to anyone.
+Every `LedgerStore` backend is held to both — the conformance suite rebuilds the
+log from pages and the registry from its stored bindings, and checks the stored
+chain against each.
 
 ## What a seal does and does not do
 
@@ -310,3 +379,6 @@ Publishing a seal or a tree head — to an auditor, a timestamping service, or a
 append-only location — is what turns detectable tampering into tampering
 detectable *by someone else*. A seal you hold and never publish only protects you
 against your own future mistakes.
+
+And publishing has its own failure mode: an operator who publishes *two* chains,
+to two parties. Both verify. [Witnessing](@/docs/witness.md) is what closes that.

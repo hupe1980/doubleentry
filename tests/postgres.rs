@@ -30,7 +30,8 @@ use doubleentry::period::{LedgerId, Period, PeriodCalendar, PeriodId, PeriodStat
 use doubleentry::storage::postgres::{DEFAULT_SCHEMA, PostgresError, PostgresStore, Sequencing};
 use doubleentry::storage::{Cursor, EntryBatch, LedgerStore, PostingCursor};
 use doubleentry::{
-    AccountId, Amount, BalanceKey, Balanced, Currency, Entry, EntryId, IdempotencyKey, Layer,
+    AccountId, Amount, BalanceKey, BalanceQuery, Balanced, Currency, Entry, EntryId,
+    IdempotencyKey, Layer,
 };
 use sqlx::postgres::PgPoolOptions;
 use testcontainers::runners::AsyncRunner;
@@ -590,7 +591,7 @@ async fn concurrent_draws_cannot_together_breach_a_balance_limit() {
     assert_eq!(accepted, 2, "10.00 funds exactly two withdrawals of 4.00");
     let net = h
         .store
-        .balance(h.key(), None)
+        .balance(h.key(), BalanceQuery::all())
         .await
         .expect("reads")
         .signed_net()
@@ -647,12 +648,11 @@ async fn the_database_refuses_an_unbalanced_entry_directly() {
     let entry_id = uuid::Uuid::now_v7();
     sqlx::query(
         "INSERT INTO entries (log_index, entry_id, idempotency_key, content_hash, \
-         booking_date, value_date, tree_root) \
-         VALUES (0, $1, $2, $3, DATE '2026-03-15', DATE '2026-03-15', $4)",
+         booking_date, value_date) \
+         VALUES (0, $1, $2, $3, DATE '2026-03-15', DATE '2026-03-15')",
     )
     .bind(entry_id)
     .bind(vec![1u8])
-    .bind(vec![0u8; 32])
     .bind(vec![0u8; 32])
     .execute(&mut *tx)
     .await
@@ -679,6 +679,48 @@ async fn the_database_refuses_an_unbalanced_entry_directly() {
     );
 }
 
+/// A pending side offset by a settled one nets to zero per currency, and leaves
+/// both layers permanently out of balance. The trigger keys on the layer for
+/// exactly this shape.
+#[tokio::test]
+async fn the_database_refuses_an_entry_that_nets_across_layers() {
+    let h = Harness::start().await;
+    let mut tx = h.store.pool().begin().await.expect("begins");
+
+    let entry_id = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO entries (log_index, entry_id, idempotency_key, content_hash, \
+         booking_date, value_date) \
+         VALUES (0, $1, $2, $3, DATE '2026-03-15', DATE '2026-03-15')",
+    )
+    .bind(entry_id)
+    .bind(vec![2u8])
+    .bind(vec![0u8; 32])
+    .execute(&mut *tx)
+    .await
+    .expect("inserts the entry");
+
+    for (index, direction, layer) in [(0i16, "D", "pending"), (1, "C", "settled")] {
+        sqlx::query(
+            "INSERT INTO postings (entry_id, posting_index, account_index, direction, \
+             amount_minor, currency, layer) VALUES ($1, $2, $3, $4, 100, 'EUR', $5)",
+        )
+        .bind(entry_id)
+        .bind(index)
+        .bind(0i32)
+        .bind(direction)
+        .bind(layer)
+        .execute(&mut *tx)
+        .await
+        .expect("inserts the posting");
+    }
+
+    assert!(
+        tx.commit().await.is_err(),
+        "the deferred trigger must reject an entry that only balances across layers"
+    );
+}
+
 #[tokio::test]
 async fn balances_and_trial_balances_agree_with_the_log() {
     let h = Harness::start().await;
@@ -691,12 +733,20 @@ async fn balances_and_trial_balances_agree_with_the_log() {
             .expect("appends");
     }
 
-    let balance = h.store.balance(h.key(), None).await.expect("reads");
+    let balance = h
+        .store
+        .balance(h.key(), BalanceQuery::all())
+        .await
+        .expect("reads");
     assert_eq!(balance.debits, Eur::from_minor(500));
     assert_eq!(balance.credits, Eur::ZERO);
 
     // Gross totals survive netting.
-    let tb = h.store.trial_balance(None).await.expect("reads");
+    let tb = h
+        .store
+        .trial_balance(BalanceQuery::all())
+        .await
+        .expect("reads");
     let totals = tb
         .totals(Currency::EUR, Layer::Settled)
         .expect("no overflow");
@@ -704,7 +754,11 @@ async fn balances_and_trial_balances_agree_with_the_log() {
     assert_eq!(totals.debits, Eur::from_minor(500));
 
     // As-of reads reconstruct an earlier state.
-    let earlier = h.store.balance(h.key(), Some(2)).await.expect("reads");
+    let earlier = h
+        .store
+        .balance(h.key(), BalanceQuery::over_prefix(2))
+        .await
+        .expect("reads");
     assert_eq!(earlier.debits, Eur::from_minor(200));
 }
 
@@ -875,7 +929,11 @@ async fn open_items_track_partial_settlement() {
     assert_eq!(open.items[0].residual, Eur::from_minor(600));
 
     // Clearing is an assignment, never a movement.
-    let balance = h.store.balance(h.key(), None).await.expect("reads");
+    let balance = h
+        .store
+        .balance(h.key(), BalanceQuery::all())
+        .await
+        .expect("reads");
     assert_eq!(balance.debits, Eur::from_minor(1000));
     assert_eq!(balance.credits, Eur::from_minor(400));
 
@@ -1026,12 +1084,24 @@ async fn the_memory_and_postgres_backends_agree() {
         "both backends must commit to the same root"
     );
     assert_eq!(
-        h.store.balance(h.key(), None).await.expect("reads"),
-        memory.balance(h.key(), None).await.expect("reads"),
+        h.store
+            .balance(h.key(), BalanceQuery::all())
+            .await
+            .expect("reads"),
+        memory
+            .balance(h.key(), BalanceQuery::all())
+            .await
+            .expect("reads"),
     );
     assert_eq!(
-        h.store.trial_balance(None).await.expect("reads"),
-        memory.trial_balance(None).await.expect("reads"),
+        h.store
+            .trial_balance(BalanceQuery::all())
+            .await
+            .expect("reads"),
+        memory
+            .trial_balance(BalanceQuery::all())
+            .await
+            .expect("reads"),
     );
 }
 

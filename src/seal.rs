@@ -53,13 +53,15 @@
 //! What a seal detects is *alteration*, not *access*. Preventing writes is the
 //! storage layer's job; making a write recognisable afterwards is this one's.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::account::AccountBindingProof;
 use crate::balance::{Balance, BalanceKey, TrialBalance};
 use crate::canonical::{Canonical, CanonicalWriter};
 use crate::hash::{Hash, tag, tagged};
-use crate::merkle::{InclusionProof, MerkleLog, ProofError, TreeHead};
+use crate::merkle::{
+    ConsistencyProof, InclusionProof, MerkleLog, ProofError, TreeHead, empty_root,
+};
 use crate::period::{LedgerId, PeriodId};
 
 /// What a period turned out to contain.
@@ -146,42 +148,130 @@ pub struct Seal {
     pub trial_balance: TreeHead,
     /// Merkle head over the handle-to-account bindings in force at sealing.
     ///
-    /// A trial-balance leaf names an account by its handle — a dense integer,
-    /// cheap to compare and to index by, and meaningless on its own. Without
-    /// this field the handles would float: renumbering the registry after the
-    /// fact, or re-registering the same paths in a different order, would leave
-    /// every seal, every [`BalanceProof`] and the whole chain verifying exactly
-    /// as before, while every balance in them silently referred to a different
-    /// account. That is precisely the alteration a seal exists to make visible.
+    /// What pins the handle space a [`Seal::trial_balance`] leaf is keyed on —
+    /// see [Why the third root exists](self#why-the-third-root-exists) — and
+    /// what [`SealChain::verify_against_accounts`] checks it against.
     ///
-    /// It is also what makes selective disclosure complete. An
-    /// [`AccountBindingProof`] against this
-    /// head turns "handle `#7` held this balance" into "`Assets:Cash` held this
-    /// balance", without revealing any other account.
+    /// It is also what makes selective disclosure complete: an
+    /// [`AccountBindingProof`] against this head turns "handle `#7` held this
+    /// balance" into "`Assets:Cash` held this balance", revealing no other
+    /// account.
     pub accounts: TreeHead,
     /// Hash of the preceding seal, or `None` for the first.
     pub prev_seal: Option<Hash>,
+    /// Proof that the predecessor's log is a **prefix** of this seal's log.
+    ///
+    /// What turns "these commitments are in order" into "this history was only
+    /// ever appended to", checkable by a recipient holding nothing but the
+    /// seals. See [`SealChainError::NotAPrefix`] for what it catches.
+    ///
+    /// `None` in exactly two cases: the genesis seal, and one following a
+    /// predecessor whose tree was **empty** — no proof from the empty tree
+    /// exists, so its root is checked against
+    /// [`crate::merkle::empty_root`] instead. Any other `None` is
+    /// [`SealChainError::MissingConsistency`], so the field cannot be dropped to
+    /// make a rewritten history verify.
+    pub prev_consistency: Option<ConsistencyProof>,
     /// Hash over every other field.
+    ///
+    /// Covers [`prev_consistency`](Self::prev_consistency) too, so the proof
+    /// cannot be swapped for one relating a different pair of trees.
     pub seal_hash: Hash,
 }
 
 impl Seal {
-    /// Builds a seal, computing every root and the chaining hash.
+    /// Builds a seal from a log, computing every root, the chaining hash and the
+    /// consistency proof.
     ///
     /// `accounts` is an [`AccountRegistry::commitment`](crate::AccountRegistry::commitment)
     /// taken at the same moment as the trial balance. It has to be the registry
     /// the balances were computed against, or the seal commits to handles it
     /// does not explain.
-    #[must_use]
+    ///
+    /// `previous` is the seal this one chains onto. Both the predecessor's hash
+    /// and the consistency proof are derived from it, rather than passed
+    /// separately, because a hash paired with a proof of a different pair of
+    /// trees is the one combination that must not be expressible.
+    ///
+    /// A backend that reads its tree from storage rather than holding it uses
+    /// [`Seal::from_parts`], which checks what this derives.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SealChainError::NotAPrefix`] when `log` cannot produce a proof
+    /// from the predecessor's tree size — the log is shorter than a seal already
+    /// committed to, or does not extend it — and the other link errors from
+    /// [`Seal::from_parts`].
     pub fn build<const P: u8>(
         ledger: LedgerId,
         period: PeriodId,
         coverage: PeriodCoverage,
-        tree_head: TreeHead,
+        log: &MerkleLog,
         trial_balance: &TrialBalance<P>,
         accounts: TreeHead,
-        prev_seal: Option<Hash>,
-    ) -> Self {
+        previous: Option<&Self>,
+    ) -> Result<Self, SealChainError> {
+        let tree_head = log.head();
+        let prev_consistency = match previous {
+            // A proof from the empty tree is refused by construction, and there
+            // is nothing it could add: every log extends the empty one.
+            Some(prev) if prev.tree_head.size > 0 => Some(
+                log.consistency_proof_between(prev.tree_head.size, tree_head.size)
+                    .map_err(|_| SealChainError::NotAPrefix {
+                        period: period.clone(),
+                    })?,
+            ),
+            _ => None,
+        };
+        Self::from_parts(
+            ledger,
+            period,
+            coverage,
+            tree_head,
+            prev_consistency,
+            trial_balance,
+            accounts,
+            previous,
+        )
+    }
+
+    /// Builds a seal from parts a backend has already read out of storage.
+    ///
+    /// The durable counterpart to [`Seal::build`]. A SQL backend does not hold
+    /// its tree in memory — it reads `O(log n)` nodes to produce a head and
+    /// another `O(log n)` to produce a consistency proof — so it arrives with
+    /// the pieces rather than with a log to derive them from.
+    ///
+    /// **The pieces are checked, not trusted.** [`Seal::build`] guarantees the
+    /// head and the proof came from one tree by construction; here that has to
+    /// be re-established, so the proof is verified against both heads before
+    /// anything is hashed. A backend that read from two different trees is
+    /// refused at the point of sealing rather than when somebody verifies the
+    /// chain.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`SealChainError`] the parts violate:
+    /// [`NotAPrefix`](SealChainError::NotAPrefix) when the proof does not relate
+    /// the two heads, [`MissingConsistency`](SealChainError::MissingConsistency)
+    /// when a chained seal has none, and
+    /// [`UnexpectedConsistency`](SealChainError::UnexpectedConsistency) when one
+    /// is supplied where no proof can exist.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_parts<const P: u8>(
+        ledger: LedgerId,
+        period: PeriodId,
+        coverage: PeriodCoverage,
+        tree_head: TreeHead,
+        prev_consistency: Option<ConsistencyProof>,
+        trial_balance: &TrialBalance<P>,
+        accounts: TreeHead,
+        previous: Option<&Self>,
+    ) -> Result<Self, SealChainError> {
+        // The same rule the chain will apply, from the same function, so a seal
+        // that could never chain is never written in the first place.
+        check_extends(&period, previous, &tree_head, prev_consistency.as_ref())?;
+
         let trial_balance = trial_balance_head(trial_balance);
         let mut seal = Self {
             ledger,
@@ -192,11 +282,12 @@ impl Seal {
             tree_head,
             trial_balance,
             accounts,
-            prev_seal,
+            prev_seal: previous.map(|p| p.seal_hash),
+            prev_consistency,
             seal_hash: Hash::from_bytes([0u8; 32]),
         };
         seal.seal_hash = seal.compute_hash();
-        seal
+        Ok(seal)
     }
 
     /// Recomputes the hash over every field except `seal_hash` itself.
@@ -240,6 +331,7 @@ struct SealOwned {
     trial_balance: TreeHead,
     accounts: TreeHead,
     prev_seal: Option<Hash>,
+    prev_consistency: Option<ConsistencyProof>,
     seal_hash: Hash,
 }
 
@@ -265,6 +357,7 @@ impl<'de> serde::Deserialize<'de> for Seal {
             trial_balance: raw.trial_balance,
             accounts: raw.accounts,
             prev_seal: raw.prev_seal,
+            prev_consistency: raw.prev_consistency,
             seal_hash: raw.seal_hash,
         };
         if seal.is_self_consistent() {
@@ -298,6 +391,9 @@ impl Canonical for Seal {
         w.option(self.prev_seal.as_ref(), |w, v| {
             w.fixed(v.as_bytes());
         });
+        // Inside the preimage, so the proof cannot be swapped for one relating a
+        // different pair of trees while the seal hash goes on matching.
+        w.option(self.prev_consistency.as_ref(), |w, v| v.encode(w));
     }
 }
 
@@ -364,8 +460,10 @@ pub struct TrialBalanceCommitment<const P: u8> {
 impl<const P: u8> TrialBalanceCommitment<P> {
     /// Commits to a trial balance.
     ///
-    /// Leaves follow the trial balance's own deterministic order, so the root is
-    /// a pure function of the balances and not of how they were accumulated.
+    /// Leaves follow the trial balance's own deterministic order — ascending
+    /// [`BalanceKey`] — so the root is a pure function of the balances and not
+    /// of how they were accumulated, and [`prove`](Self::prove) can find a row
+    /// by binary search.
     #[must_use]
     pub fn of(tb: &TrialBalance<P>) -> Self {
         let rows: Vec<(BalanceKey, Balance<P>)> = tb.iter().map(|(k, b)| (*k, *b)).collect();
@@ -410,7 +508,11 @@ impl<const P: u8> TrialBalanceCommitment<P> {
     /// prove about it and a proof must not be manufactured.
     #[must_use]
     pub fn prove(&self, key: &BalanceKey) -> Option<BalanceProof<P>> {
-        let index = self.rows.iter().position(|(k, _)| k == key)?;
+        // Rows come out of a `TrialBalance` in key order, so this is a binary
+        // search rather than a scan. It matters: an auditor asking about a
+        // hundred accounts out of a hundred thousand should pay `O(k log n)`,
+        // not `O(k · n)`.
+        let index = self.rows.binary_search_by(|(k, _)| k.cmp(key)).ok()?;
         let (key, balance) = self.rows.get(index).copied()?;
         let proof = self.log.inclusion_proof(index as u64).ok()?;
         Some(BalanceProof {
@@ -744,6 +846,83 @@ pub enum SealChainError {
         /// The offending period.
         period: PeriodId,
     },
+    /// A seal did not carry the consistency proof its position requires.
+    ///
+    /// Only the genesis seal, and one following a predecessor whose tree was
+    /// empty, may omit it — see [`Seal::prev_consistency`]. Anywhere else a
+    /// missing proof is a chain that cannot say the log was appended to rather
+    /// than rewritten, and it is refused instead of being verified to a weaker
+    /// standard.
+    #[error(
+        "seal for period {period} carries no consistency proof from its \
+         predecessor's tree of {previous_size} entries"
+    )]
+    MissingConsistency {
+        /// The offending period.
+        period: PeriodId,
+        /// The predecessor's tree size, which the proof should have started at.
+        previous_size: u64,
+    },
+    /// A seal carried a consistency proof where none is admissible.
+    ///
+    /// The genesis seal has no predecessor to be consistent with, and a
+    /// predecessor whose tree was empty admits no proof at all. A value here is
+    /// therefore evidence about nothing, and accepting it would let a chain look
+    /// better checked than it is.
+    #[error("seal for period {period} carries a consistency proof it cannot have one for")]
+    UnexpectedConsistency {
+        /// The offending period.
+        period: PeriodId,
+    },
+    /// A seal's log is not a prefix of its predecessor's — the history was
+    /// rewritten between the two closes.
+    ///
+    /// **The rule the rest of the chain exists to support.** Hash-chaining the
+    /// seals proves they were issued in order and none was edited; it says
+    /// nothing about the entries underneath. Two seals claiming tree sizes 100
+    /// and 200 with unrelated roots satisfy every other check here. This is what
+    /// refuses them.
+    #[error("seal for period {period} does not prove its log extends its predecessor's")]
+    NotAPrefix {
+        /// The offending period.
+        period: PeriodId,
+    },
+    /// A predecessor claimed an empty tree whose root is not the empty root.
+    #[error("seal for period {period} follows a zero-size tree that is not the empty tree")]
+    NotTheEmptyTree {
+        /// The offending period.
+        period: PeriodId,
+    },
+    /// A seal's tree head is not the head the log had at that size.
+    ///
+    /// Only [`SealChain::verify_against_log`] can raise this, because only it
+    /// holds the log. The chain itself is internally consistent — it simply
+    /// describes a different history from the one in front of you.
+    #[error("seal for period {period} commits to root {expected}, but this log held {found}")]
+    HeadMismatch {
+        /// The offending period.
+        period: PeriodId,
+        /// The root the seal committed to.
+        expected: Hash,
+        /// The root the log actually had at that size.
+        found: Hash,
+    },
+    /// A seal commits to more entries than the log holds.
+    ///
+    /// Entries were removed after the period sealed, or the chain belongs to
+    /// other books. Either way the seal cannot be checked against this log.
+    #[error(
+        "seal for period {period} commits to {claimed} entries, but the log holds \
+         only {holds}"
+    )]
+    BeyondTheLog {
+        /// The offending period.
+        period: PeriodId,
+        /// How many entries the seal commits to.
+        claimed: u64,
+        /// How many the log actually holds.
+        holds: u64,
+    },
     /// The account registry shrank between two seals.
     ///
     /// An [`AccountRegistry`](crate::AccountRegistry) only ever grows: handles
@@ -765,6 +944,85 @@ pub enum SealChainError {
         /// How many this seal commits to.
         found: u64,
     },
+    /// A seal commits to more account bindings than the registry ever issued.
+    ///
+    /// The registry counterpart of [`BeyondTheLog`](Self::BeyondTheLog):
+    /// accounts were removed after the period sealed, or the chain belongs to
+    /// other books.
+    #[error(
+        "seal for period {period} commits to {claimed} account bindings, but the \
+         registry holds only {holds}"
+    )]
+    BeyondTheRegistry {
+        /// The offending period.
+        period: PeriodId,
+        /// How many bindings the seal commits to.
+        claimed: u64,
+        /// How many the registry actually holds.
+        holds: u64,
+    },
+    /// A seal's account commitment is not the one the registry produces.
+    ///
+    /// **The renumbering [`Seal::accounts`] exists to expose.** A trial-balance
+    /// leaf names its account by *handle*, so re-registering the same paths in a
+    /// different order leaves every seal and every balance proof verifying byte
+    /// for byte while each balance refers to a different account.
+    ///
+    /// Nothing about the seals themselves can see it, so only
+    /// [`SealChain::verify_against_accounts`] raises this.
+    #[error(
+        "seal for period {period} commits to account bindings {expected}, but the \
+         registry's first {size} handles hash to {found}"
+    )]
+    AccountsRebound {
+        /// The offending period.
+        period: PeriodId,
+        /// How many bindings the seal commits to.
+        size: u64,
+        /// The commitment the seal recorded.
+        expected: Hash,
+        /// The commitment the registry actually produces at that size.
+        found: Hash,
+    },
+}
+
+/// Whether `tree_head` provably extends `previous`, given the proof offered.
+///
+/// The one place the rule lives: [`Seal::from_parts`] runs it before writing a
+/// seal and [`SealChain::check_link`] before accepting one, so a chain cannot
+/// refuse a link it would itself have produced.
+fn check_extends(
+    period: &PeriodId,
+    previous: Option<&Seal>,
+    tree_head: &TreeHead,
+    proof: Option<&ConsistencyProof>,
+) -> Result<(), SealChainError> {
+    let at = || period.clone();
+    match (previous, proof) {
+        (None, None) => Ok(()),
+        (None, Some(_)) => Err(SealChainError::UnexpectedConsistency { period: at() }),
+        (Some(prev), proof) => match (prev.tree_head.size, proof) {
+            (0, None) => {
+                if prev.tree_head.root == empty_root() {
+                    Ok(())
+                } else {
+                    Err(SealChainError::NotTheEmptyTree { period: at() })
+                }
+            }
+            (0, Some(_)) => Err(SealChainError::UnexpectedConsistency { period: at() }),
+            (previous_size, None) => Err(SealChainError::MissingConsistency {
+                period: at(),
+                previous_size,
+            }),
+            (_, Some(proof)) => {
+                if proof.verify(&prev.tree_head, tree_head) {
+                    Ok(())
+                } else {
+                    Err(SealChainError::NotAPrefix { period: at() })
+                }
+            }
+        },
+    }
 }
 
 /// An ordered chain of period seals covering one ledger.
@@ -778,11 +1036,12 @@ pub enum SealChainError {
 pub struct SealChain {
     ledger: LedgerId,
     seals: Vec<Seal>,
-    /// The periods already in the chain, so the one-seal-per-period rule costs a
-    /// lookup rather than a scan. A ledger on daily periods reaches thousands of
-    /// seals within a decade, and scanning made [`SealChain::verify`] quadratic
-    /// in exactly the case an auditor runs it.
-    periods: BTreeSet<PeriodId>,
+    /// Period to position in `seals`, so the one-seal-per-period rule and
+    /// [`SealChain::get`] both cost a lookup rather than a scan. A ledger on
+    /// daily periods reaches thousands of seals within a decade, and scanning
+    /// made [`SealChain::verify`] quadratic in exactly the case an auditor runs
+    /// it.
+    periods: BTreeMap<PeriodId, usize>,
 }
 
 impl SealChain {
@@ -792,7 +1051,7 @@ impl SealChain {
         Self {
             ledger,
             seals: Vec::new(),
-            periods: BTreeSet::new(),
+            periods: BTreeMap::new(),
         }
     }
 
@@ -839,12 +1098,14 @@ impl SealChain {
     /// and re-checking cannot drift apart — a chain that accepted a link it
     /// would later reject, or the reverse, would be worse than either rule alone.
     ///
-    /// `seen` holds the periods already in the chain; the caller owns it so that
-    /// verifying a whole chain stays linear rather than rescanning the prefix at
-    /// every position.
+    /// `already_sealed` answers whether a period is in the chain already. It is
+    /// a predicate rather than a set so that appending can consult the index it
+    /// maintains while verifying consults one it rebuilds — verification that
+    /// trusted the cache would only be checking that the cache agreed with
+    /// itself, and appending that rebuilt the set each time would be quadratic.
     fn check_link(
         ledger: &LedgerId,
-        seen: &BTreeSet<PeriodId>,
+        already_sealed: impl Fn(&PeriodId) -> bool,
         previous: Option<&Seal>,
         seal: &Seal,
     ) -> Result<(), SealChainError> {
@@ -859,11 +1120,16 @@ impl SealChain {
                 found: seal.ledger.clone(),
             });
         }
-        if seen.contains(&seal.period) {
+        if already_sealed(&seal.period) {
             return Err(SealChainError::DuplicatePeriod { period: period() });
         }
         match (previous, seal.prev_seal) {
-            (None, None) => Ok(()),
+            (None, None) => check_extends(
+                &seal.period,
+                None,
+                &seal.tree_head,
+                seal.prev_consistency.as_ref(),
+            ),
             (Some(prev), Some(reference)) => {
                 if prev.seal_hash != reference {
                     return Err(SealChainError::BrokenChain { period: period() });
@@ -881,7 +1147,16 @@ impl SealChain {
                         found: seal.accounts.size,
                     });
                 }
-                Ok(())
+                // The check the rest of this function exists to support: the
+                // predecessor's log is a *prefix* of this one's. Everything
+                // above establishes that the seals are in order and unedited,
+                // and nothing above looks at the entries they commit to.
+                check_extends(
+                    &seal.period,
+                    previous,
+                    &seal.tree_head,
+                    seal.prev_consistency.as_ref(),
+                )
             }
             _ => Err(SealChainError::MisplacedGenesis { period: period() }),
         }
@@ -893,9 +1168,61 @@ impl SealChain {
     ///
     /// Returns the [`SealChainError`] the seal violates, having appended nothing.
     pub fn push(&mut self, seal: Seal) -> Result<(), SealChainError> {
-        Self::check_link(&self.ledger, &self.periods, self.seals.last(), &seal)?;
-        self.periods.insert(seal.period.clone());
+        Self::check_link(
+            &self.ledger,
+            |period| self.periods.contains_key(period),
+            self.seals.last(),
+            &seal,
+        )?;
+        self.periods.insert(seal.period.clone(), self.seals.len());
         self.seals.push(seal);
+        Ok(())
+    }
+
+    /// Verifies every seal's **account commitment** against a registry.
+    ///
+    /// The registry half of [`verify_against_log`](Self::verify_against_log),
+    /// and needed for the same reason: [`SealChain::verify`] takes seals alone,
+    /// so a complete chain can be assembled over a chart of accounts nobody
+    /// holds.
+    ///
+    /// This is what catches **renumbering**. A trial-balance leaf names its
+    /// account by handle, so re-registering the same paths in a different order
+    /// repoints every sealed balance while every hash in the chain goes on
+    /// matching. [`Seal::accounts`] is the commitment that exposes it; this is
+    /// the comparison.
+    ///
+    /// A registry only ever grows, so each seal is checked against the
+    /// registry's commitment *at the size the seal recorded*, not its current
+    /// one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SealChainError::BeyondTheRegistry`] when a seal names more
+    /// bindings than the registry holds, and
+    /// [`SealChainError::AccountsRebound`] when the two commitments differ.
+    pub fn verify_against_accounts(
+        &self,
+        accounts: &crate::account::AccountRegistry,
+    ) -> Result<(), SealChainError> {
+        self.verify()?;
+        for seal in &self.seals {
+            let Some(actual) = accounts.commitment_at(seal.accounts.size) else {
+                return Err(SealChainError::BeyondTheRegistry {
+                    period: seal.period.clone(),
+                    claimed: seal.accounts.size,
+                    holds: accounts.len() as u64,
+                });
+            };
+            if actual != seal.accounts {
+                return Err(SealChainError::AccountsRebound {
+                    period: seal.period.clone(),
+                    size: seal.accounts.size,
+                    expected: seal.accounts.root,
+                    found: actual.root,
+                });
+            }
+        }
         Ok(())
     }
 
@@ -914,9 +1241,55 @@ impl SealChain {
         let mut seen: BTreeSet<PeriodId> = BTreeSet::new();
         let mut previous: Option<&Seal> = None;
         for seal in &self.seals {
-            Self::check_link(&self.ledger, &seen, previous, seal)?;
+            Self::check_link(&self.ledger, |period| seen.contains(period), previous, seal)?;
             seen.insert(seal.period.clone());
             previous = Some(seal);
+        }
+        Ok(())
+    }
+
+    /// Verifies the chain, and then that it describes **this** log.
+    ///
+    /// [`verify`](Self::verify) is what a recipient runs: it takes seals alone
+    /// and establishes that they are in order, unedited, and that each period's
+    /// tree extends the one before it. What it cannot establish is that the tree
+    /// they describe is the tree you are holding — a complete, internally
+    /// consistent chain can be built over a history nobody has.
+    ///
+    /// This is the operator's counterpart. For each seal it recomputes the log's
+    /// head at that seal's size and compares. Passing means every seal in the
+    /// chain is a commitment to a prefix of this log, at the size it claims.
+    ///
+    /// Run it after a restore, after a migration, and before handing a chain to
+    /// anyone: it is the one check that ties the evidence to the books.
+    ///
+    /// `O(n·m)` for `m` seals over an `n`-entry log, since each head is a
+    /// recomputation. That is an audit-time cost, not a write-path one.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first [`SealChainError`] that does not hold, including
+    /// [`SealChainError::HeadMismatch`] when a seal's tree head is not the head
+    /// this log had at that size, and
+    /// [`SealChainError::BeyondTheLog`] when a seal commits to
+    /// more entries than the log holds.
+    pub fn verify_against_log(&self, log: &MerkleLog) -> Result<(), SealChainError> {
+        self.verify()?;
+        for seal in &self.seals {
+            let actual =
+                log.head_at(seal.tree_head.size)
+                    .map_err(|_| SealChainError::BeyondTheLog {
+                        period: seal.period.clone(),
+                        claimed: seal.tree_head.size,
+                        holds: log.len(),
+                    })?;
+            if actual != seal.tree_head {
+                return Err(SealChainError::HeadMismatch {
+                    period: seal.period.clone(),
+                    expected: seal.tree_head.root,
+                    found: actual.root,
+                });
+            }
         }
         Ok(())
     }
@@ -942,7 +1315,7 @@ impl SealChain {
     /// The seal covering a period, if it has been sealed.
     #[must_use]
     pub fn get(&self, period: &PeriodId) -> Option<&Seal> {
-        self.seals.iter().find(|s| s.period == *period)
+        self.seals.get(*self.periods.get(period)?)
     }
 }
 
@@ -950,6 +1323,7 @@ impl SealChain {
 mod tests {
     use super::*;
     use crate::account::{AccountId, AccountRegistry};
+    use crate::merkle::MerkleLog;
     use crate::money::{Amount, Currency};
     use crate::posting::{Direction, Layer};
     use time::macros::date;
@@ -969,6 +1343,38 @@ mod tests {
             size,
             root: Hash::from_bytes([byte; 32]),
         }
+    }
+
+    /// A real log of `n` leaves.
+    ///
+    /// Seals are built over a log rather than a bare head, because each one
+    /// derives a consistency proof from its predecessor's tree — so a chain can
+    /// only be assembled over leaves that actually exist. Invented roots would
+    /// have no prefixes to prove anything about.
+    fn log_of(n: u64) -> MerkleLog {
+        let mut log = MerkleLog::new();
+        for i in 0..n {
+            let mut bytes = [0u8; 32];
+            // A distinct leaf per position, so no two prefixes share a root.
+            if let Some(slot) = bytes.get_mut(..8) {
+                slot.copy_from_slice(&i.to_le_bytes());
+            }
+            log.append(Hash::from_bytes(bytes));
+        }
+        log
+    }
+
+    /// A seal edited after the fact and re-hashed so it is self-consistent.
+    ///
+    /// What an attacker with write access to the seal table actually produces:
+    /// `is_self_consistent` passes, because they recomputed the hash. It is the
+    /// *chain* rules that have to catch these, which is what the tests using
+    /// this assert.
+    fn forged(seal: &Seal, edit: impl FnOnce(&mut Seal)) -> Seal {
+        let mut forged = seal.clone();
+        edit(&mut forged);
+        forged.seal_hash = forged.compute_hash();
+        forged
     }
 
     /// A registry commitment for the tests that do not exercise bindings.
@@ -1018,11 +1424,12 @@ mod tests {
             lid(),
             pid("2026-03"),
             PeriodCoverage::spanning(0, 9, 10),
-            head(10, 1),
+            &log_of(10),
             &tb(&[(0, 100, 0)]),
             accounts_head(),
             None,
-        );
+        )
+        .expect("builds");
         assert!(seal.is_self_consistent());
         assert_eq!(seal.entry_count, 10);
     }
@@ -1033,11 +1440,12 @@ mod tests {
             lid(),
             pid("2026-03"),
             PeriodCoverage::spanning(0, 9, 10),
-            head(10, 1),
+            &log_of(10),
             &tb(&[(0, 100, 0)]),
             accounts_head(),
             None,
-        );
+        )
+        .expect("builds");
 
         let mut altered = original.clone();
         altered.last_index = Some(8);
@@ -1058,20 +1466,22 @@ mod tests {
             lid(),
             pid("p"),
             PeriodCoverage::spanning(0, 1, 0),
-            head(2, 1),
+            &log_of(2),
             &tb(&[(0, 100, 0)]),
             accounts_head(),
             None,
-        );
+        )
+        .expect("builds");
         let b = Seal::build(
             lid(),
             pid("p"),
             PeriodCoverage::spanning(0, 1, 0),
-            head(2, 1),
+            &log_of(2),
             &tb(&[(0, 101, 0)]),
             accounts_head(),
             None,
-        );
+        )
+        .expect("builds");
         assert_ne!(a.trial_balance, b.trial_balance);
     }
 
@@ -1082,20 +1492,22 @@ mod tests {
             lid(),
             pid("p"),
             PeriodCoverage::EMPTY,
-            head(0, 1),
+            &log_of(0),
             &tb(&[(0, 0, 0)]),
             accounts_head(),
             None,
-        );
+        )
+        .expect("builds");
         let busy = Seal::build(
             lid(),
             pid("p"),
             PeriodCoverage::EMPTY,
-            head(0, 1),
+            &log_of(0),
             &tb(&[(0, 500, 500)]),
             accounts_head(),
             None,
-        );
+        )
+        .expect("builds");
         assert_ne!(quiet.trial_balance, busy.trial_balance);
     }
 
@@ -1106,22 +1518,24 @@ mod tests {
             lid(),
             pid("2026-01"),
             PeriodCoverage::spanning(0, 4, 0),
-            head(5, 1),
+            &log_of(5),
             &tb(&[(0, 100, 0)]),
             accounts_head(),
             None,
-        );
+        )
+        .expect("builds");
         chain.push(first.clone()).expect("genesis");
 
         let second = Seal::build(
             lid(),
             pid("2026-02"),
             PeriodCoverage::spanning(5, 9, 5),
-            head(10, 2),
+            &log_of(10),
             &tb(&[(0, 200, 0)]),
             accounts_head(),
-            Some(first.seal_hash),
-        );
+            Some(&first),
+        )
+        .expect("builds");
         chain.push(second).expect("chains");
 
         assert_eq!(chain.len(), 2);
@@ -1143,11 +1557,12 @@ mod tests {
             LedgerId::new("someone-else").expect("valid"),
             pid("2026-01"),
             PeriodCoverage::EMPTY,
-            head(1, 1),
+            &log_of(1),
             &tb(&[]),
             accounts_head(),
             None,
-        );
+        )
+        .expect("builds");
         assert!(matches!(
             chain.push(foreign),
             Err(SealChainError::ForeignLedger { .. })
@@ -1164,20 +1579,22 @@ mod tests {
             lid(),
             pid("2026-01"),
             PeriodCoverage::spanning(0, 4, 5),
-            head(5, 1),
+            &log_of(5),
             &tb(&[(0, 100, 0)]),
             accounts_head(),
             None,
-        );
+        )
+        .expect("builds");
         let restated = Seal::build(
             lid(),
             pid("2026-01"),
             PeriodCoverage::spanning(0, 4, 5),
-            head(5, 1),
+            &log_of(5),
             &tb(&[(0, 999, 0)]),
             accounts_head(),
-            Some(first.seal_hash),
-        );
+            Some(&first),
+        )
+        .expect("builds");
 
         let mut chain = SealChain::new(lid());
         chain.push(first).expect("genesis");
@@ -1193,20 +1610,22 @@ mod tests {
             lid(),
             pid("2026-01"),
             PeriodCoverage::EMPTY,
-            head(1, 1),
+            &log_of(1),
             &tb(&[]),
             accounts_head(),
             None,
-        );
+        )
+        .expect("builds");
         let second = Seal::build(
             lid(),
             pid("2026-02"),
             PeriodCoverage::EMPTY,
-            head(2, 2),
+            &log_of(2),
             &tb(&[]),
             accounts_head(),
-            Some(first.seal_hash),
-        );
+            Some(&first),
+        )
+        .expect("builds");
 
         let chain = SealChain::from_seals(lid(), [first.clone(), second.clone()]).expect("chains");
         assert_eq!(chain.len(), 2);
@@ -1226,22 +1645,31 @@ mod tests {
             lid(),
             pid("a"),
             PeriodCoverage::spanning(0, 0, 1),
-            head(1, 1),
+            &log_of(1),
             &tb(&[]),
             accounts_head(),
             None,
-        );
-        chain.push(first).expect("genesis");
+        )
+        .expect("builds");
+        chain.push(first.clone()).expect("genesis");
 
-        let orphan = Seal::build(
-            lid(),
-            pid("b"),
-            PeriodCoverage::spanning(1, 1, 1),
-            head(2, 2),
-            &tb(&[]),
-            accounts_head(),
-            Some(Hash::from_bytes([7u8; 32])),
+        // A seal that chains onto something that is not the head: built legally
+        // against `first`, then re-pointed and re-hashed, so it is internally
+        // perfect and belongs to a chain nobody has.
+        let orphan = forged(
+            &Seal::build(
+                lid(),
+                pid("b"),
+                PeriodCoverage::spanning(1, 1, 1),
+                &log_of(2),
+                &tb(&[]),
+                accounts_head(),
+                Some(&first),
+            )
+            .expect("builds"),
+            |s| s.prev_seal = Some(Hash::from_bytes([7u8; 32])),
         );
+        assert!(orphan.is_self_consistent(), "re-hashed, as a forger would");
         assert!(matches!(
             chain.push(orphan),
             Err(SealChainError::BrokenChain { .. })
@@ -1252,26 +1680,30 @@ mod tests {
     fn only_the_first_seal_may_omit_a_predecessor() {
         let mut chain = SealChain::new(lid());
         chain
-            .push(Seal::build(
-                lid(),
-                pid("a"),
-                PeriodCoverage::EMPTY,
-                head(1, 1),
-                &tb(&[]),
-                accounts_head(),
-                None,
-            ))
+            .push(
+                Seal::build(
+                    lid(),
+                    pid("a"),
+                    PeriodCoverage::EMPTY,
+                    &log_of(1),
+                    &tb(&[]),
+                    accounts_head(),
+                    None,
+                )
+                .expect("builds"),
+            )
             .expect("genesis");
 
         let second_genesis = Seal::build(
             lid(),
             pid("b"),
             PeriodCoverage::EMPTY,
-            head(2, 2),
+            &log_of(2),
             &tb(&[]),
             accounts_head(),
             None,
-        );
+        )
+        .expect("builds");
         assert!(matches!(
             chain.push(second_genesis),
             Err(SealChainError::MisplacedGenesis { .. })
@@ -1281,14 +1713,18 @@ mod tests {
     #[test]
     fn a_first_seal_may_not_claim_a_predecessor() {
         let mut chain = SealChain::new(lid());
-        let bogus = Seal::build(
-            lid(),
-            pid("a"),
-            PeriodCoverage::EMPTY,
-            head(1, 1),
-            &tb(&[]),
-            accounts_head(),
-            Some(Hash::from_bytes([3u8; 32])),
+        let bogus = forged(
+            &Seal::build(
+                lid(),
+                pid("a"),
+                PeriodCoverage::EMPTY,
+                &log_of(1),
+                &tb(&[]),
+                accounts_head(),
+                None,
+            )
+            .expect("builds"),
+            |s| s.prev_seal = Some(Hash::from_bytes([3u8; 32])),
         );
         assert!(matches!(
             chain.push(bogus),
@@ -1303,21 +1739,29 @@ mod tests {
             lid(),
             pid("a"),
             PeriodCoverage::spanning(0, 9, 10),
-            head(10, 1),
+            &log_of(10),
             &tb(&[]),
             accounts_head(),
             None,
-        );
+        )
+        .expect("builds");
         chain.push(first.clone()).expect("genesis");
 
-        let shrunk = Seal::build(
-            lid(),
-            pid("b"),
-            PeriodCoverage::spanning(0, 4, 0),
-            head(5, 2),
-            &tb(&[]),
-            accounts_head(),
-            Some(first.seal_hash),
+        // A shrunken tree cannot be *built* — the log has no such prefix to
+        // prove — so this is the forged form: a legal seal edited down and
+        // re-hashed, which is what someone rewriting the seal table produces.
+        let shrunk = forged(
+            &Seal::build(
+                lid(),
+                pid("b"),
+                PeriodCoverage::spanning(0, 4, 0),
+                &log_of(10),
+                &tb(&[]),
+                accounts_head(),
+                Some(&first),
+            )
+            .expect("builds"),
+            |s| s.tree_head = head(5, 2),
         );
         assert!(matches!(
             chain.push(shrunk),
@@ -1336,28 +1780,30 @@ mod tests {
             lid(),
             pid("2026-01"),
             PeriodCoverage::spanning(0, 4, 5),
-            head(5, 1),
+            &log_of(5),
             &tb(&[(0, 100, 0)]),
             TreeHead {
                 size: 12,
                 root: Hash::from_bytes([0xa0; 32]),
             },
             None,
-        );
+        )
+        .expect("builds");
         chain.push(first.clone()).expect("genesis");
 
         let renumbered = Seal::build(
             lid(),
             pid("2026-02"),
             PeriodCoverage::spanning(5, 9, 5),
-            head(10, 2),
+            &log_of(10),
             &tb(&[(0, 200, 0)]),
             TreeHead {
                 size: 9,
                 root: Hash::from_bytes([0xa1; 32]),
             },
-            Some(first.seal_hash),
-        );
+            Some(&first),
+        )
+        .expect("builds");
         assert!(matches!(
             chain.push(renumbered),
             Err(SealChainError::ShrunkenRegistry {
@@ -1373,14 +1819,15 @@ mod tests {
                 lid(),
                 pid("2026-02"),
                 PeriodCoverage::spanning(5, 9, 5),
-                head(10, 2),
+                &log_of(10),
                 &tb(&[(0, 200, 0)]),
                 TreeHead {
                     size,
                     root: Hash::from_bytes([0xa2; 32]),
                 },
-                Some(first.seal_hash),
-            );
+                Some(&first),
+            )
+            .expect("builds");
             let mut fresh = SealChain::new(lid());
             fresh.push(first.clone()).expect("genesis");
             fresh.push(grown).expect("a registry that grew");
@@ -1395,22 +1842,26 @@ mod tests {
             lid(),
             pid("a"),
             PeriodCoverage::spanning(0, 4, 0),
-            head(5, 1),
+            &log_of(5),
             &tb(&[(0, 100, 0)]),
             accounts_head(),
             None,
-        );
+        )
+        .expect("builds");
         chain.push(first.clone()).expect("genesis");
         chain
-            .push(Seal::build(
-                lid(),
-                pid("b"),
-                PeriodCoverage::spanning(5, 9, 5),
-                head(10, 2),
-                &tb(&[(0, 200, 0)]),
-                accounts_head(),
-                Some(first.seal_hash),
-            ))
+            .push(
+                Seal::build(
+                    lid(),
+                    pid("b"),
+                    PeriodCoverage::spanning(5, 9, 5),
+                    &log_of(10),
+                    &tb(&[(0, 200, 0)]),
+                    accounts_head(),
+                    Some(&first),
+                )
+                .expect("builds"),
+            )
             .expect("chains");
         assert!(chain.verify().is_ok());
 
@@ -1432,11 +1883,12 @@ mod tests {
             lid(),
             pid("2026-03"),
             PeriodCoverage::spanning(0, 3, 4),
-            head(4, 1),
+            &log_of(4),
             &trial,
             accounts_head(),
             None,
-        );
+        )
+        .expect("builds");
 
         let commitment = TrialBalanceCommitment::of(&trial);
         assert_eq!(commitment.head(), seal.trial_balance);
@@ -1455,11 +1907,12 @@ mod tests {
             lid(),
             pid("p"),
             PeriodCoverage::EMPTY,
-            head(2, 1),
+            &log_of(2),
             &trial,
             accounts_head(),
             None,
-        );
+        )
+        .expect("builds");
         let key = BalanceKey {
             account: AccountId::from_index(0),
             currency: Currency::EUR,
@@ -1502,11 +1955,12 @@ mod tests {
             lid(),
             pid("2026-03"),
             PeriodCoverage::EMPTY,
-            head(2, 1),
+            &log_of(2),
             &march,
             accounts_head(),
             None,
-        );
+        )
+        .expect("builds");
         let key = BalanceKey {
             account: AccountId::from_index(0),
             currency: Currency::EUR,
@@ -1529,11 +1983,12 @@ mod tests {
             lid(),
             pid("2026-03"),
             PeriodCoverage::spanning(0, 1, 2),
-            head(2, 1),
+            &log_of(2),
             &trial,
             registry().commitment(),
             None,
-        );
+        )
+        .expect("builds");
 
         let mut renumbered = AccountRegistry::new();
         for path in ["Income:Sales", "Assets:Cash"] {
@@ -1546,6 +2001,68 @@ mod tests {
         assert_eq!(trial_balance_head(&trial), seal.trial_balance);
         // … but the handles they hang off are different, and the seal says so.
         assert_ne!(renumbered.commitment(), seal.accounts);
+
+        // And the difference is *checked*, not merely available to check. Before
+        // `verify_against_accounts` nothing compared the two on any routine
+        // path: the chain verified, the log verified, `audit` passed, and the
+        // renumbering surfaced only if somebody happened to ask for a sealed
+        // balance.
+        let mut chain = SealChain::new(lid());
+        chain.push(seal.clone()).expect("chains");
+
+        chain
+            .verify_against_accounts(&registry())
+            .expect("the registry the seal was taken against");
+
+        assert!(matches!(
+            chain.verify_against_accounts(&renumbered),
+            Err(SealChainError::AccountsRebound { size: 2, .. })
+        ));
+    }
+
+    #[test]
+    fn a_seal_is_checked_against_the_registry_as_it_stood_then() {
+        // The registry grows after a period seals — that is the normal case, and
+        // a check against its *current* commitment would fail for every seal but
+        // the last. It has to compare against the prefix the seal named.
+        let trial = tb(&[(0, 100, 0), (1, 0, 100)]);
+        let seal = Seal::build(
+            lid(),
+            pid("2026-03"),
+            PeriodCoverage::spanning(0, 1, 2),
+            &log_of(2),
+            &trial,
+            registry().commitment(),
+            None,
+        )
+        .expect("builds");
+        let mut chain = SealChain::new(lid());
+        chain.push(seal).expect("chains");
+
+        let mut grown = registry();
+        grown
+            .register_path("Expense:Rent", date!(2026 - 01 - 01))
+            .expect("registers");
+        assert_ne!(grown.commitment().size, 2, "the registry really did grow");
+
+        chain
+            .verify_against_accounts(&grown)
+            .expect("growth is not tampering");
+
+        // Losing bindings is, though: a seal cannot be checked against a
+        // registry that never reached the size it names.
+        let mut truncated = AccountRegistry::new();
+        truncated
+            .register_path("Assets:Cash", date!(2026 - 01 - 01))
+            .expect("registers");
+        assert!(matches!(
+            chain.verify_against_accounts(&truncated),
+            Err(SealChainError::BeyondTheRegistry {
+                claimed: 2,
+                holds: 1,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -1560,11 +2077,12 @@ mod tests {
             lid(),
             pid("2026-03"),
             PeriodCoverage::spanning(0, 1, 2),
-            head(2, 1),
+            &log_of(2),
             &trial,
             accounts.commitment(),
             None,
-        );
+        )
+        .expect("builds");
 
         let key = BalanceKey {
             account: cash,
@@ -1593,11 +2111,12 @@ mod tests {
             lid(),
             pid("2026-04"),
             PeriodCoverage::EMPTY,
-            head(2, 1),
+            &log_of(2),
             &trial,
             accounts_head(),
             None,
-        );
+        )
+        .expect("builds");
         assert!(!balance.verify_naming(&binding, &foreign));
     }
 
@@ -1622,11 +2141,12 @@ mod tests {
             lid(),
             pid("p"),
             PeriodCoverage::EMPTY,
-            head(1, 1),
+            &log_of(1),
             &tb(&[(0, 100, 0)]),
             accounts_head(),
             None,
-        );
+        )
+        .expect("builds");
         let json = serde_json::to_string(&seal).expect("serialises");
         assert_eq!(
             serde_json::from_str::<Seal>(&json).expect("round-trips"),
@@ -1647,11 +2167,12 @@ mod tests {
             lid(),
             pid("quiet"),
             PeriodCoverage::EMPTY,
-            head(0, 1),
+            &log_of(0),
             &tb(&[]),
             accounts_head(),
             None,
-        );
+        )
+        .expect("builds");
         assert_eq!(seal.entry_count, 0);
         assert!(seal.is_self_consistent());
     }

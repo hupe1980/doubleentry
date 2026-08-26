@@ -193,6 +193,25 @@ pub enum PeriodError {
         /// The greatest end date already sealed.
         sealed_through: Date,
     },
+    /// The period lies entirely at or below the sealed watermark.
+    ///
+    /// Its dates are already frozen, so nothing can ever be booked into it and
+    /// it can never be sealed — [`PeriodCalendar::check_sealable`] refuses a
+    /// period that ends at or before the watermark. Defining it would leave a
+    /// period whose own state says `open` while
+    /// [`PeriodCalendar::state_on`] says `sealed` for every date it covers.
+    #[error(
+        "period {id} ends on {ends}, at or before the sealed watermark of \
+         {sealed_through}; its dates are already frozen"
+    )]
+    DefinedBelowWatermark {
+        /// The period that cannot be defined.
+        id: PeriodId,
+        /// Its last booking date.
+        ends: Date,
+        /// The greatest end date already sealed.
+        sealed_through: Date,
+    },
     /// An earlier period is still unsealed.
     ///
     /// A seal's closing balance is cumulative through its period's last day, so
@@ -334,6 +353,23 @@ impl PeriodCalendar {
         if self.periods.contains_key(&period.id) {
             return Err(PeriodError::Duplicate { id: period.id });
         }
+        // A new *unsealed* period below the watermark can never be booked into
+        // and can never be sealed: its own state would say `open` while
+        // `state_on` said `sealed` for every date it covers.
+        //
+        // One arriving already sealed is the replay path — a backend hands its
+        // table back in whatever order it likes — so only the unsealed case is
+        // refused.
+        if period.state != PeriodState::Sealed
+            && let Some(through) = self.sealed_through
+            && period.end <= through
+        {
+            return Err(PeriodError::DefinedBelowWatermark {
+                id: period.id,
+                ends: period.end,
+                sealed_through: through,
+            });
+        }
         // With no overlaps among what is already defined, a new range can only
         // collide with its two neighbours by start date.
         let before = self
@@ -397,11 +433,24 @@ impl PeriodCalendar {
     /// # Errors
     ///
     /// Returns [`PeriodError::Duplicate`] when the identifier is already used
-    /// for a different range, and [`PeriodError::Overlap`] as [`Self::define`]
-    /// does.
+    /// for a different range, [`PeriodError::InvalidTransition`] when it would
+    /// reopen a sealed period — sealing is terminal on this path too — and
+    /// [`PeriodError::Overlap`] as [`Self::define`] does.
     pub fn ensure(&mut self, period: Period) -> Result<(), PeriodError> {
         match self.periods.get(&period.id) {
             Some(existing) if existing.start == period.start && existing.end == period.end => {
+                // Sealing is terminal, and this is a write path like any other.
+                // Without the guard a replay carrying a stale row would reopen a
+                // period the books have already been committed to — the one
+                // thing `transition` refuses outright, arrived at by the back
+                // door.
+                if existing.state == PeriodState::Sealed && period.state != PeriodState::Sealed {
+                    return Err(PeriodError::InvalidTransition {
+                        id: period.id,
+                        from: PeriodState::Sealed,
+                        to: period.state,
+                    });
+                }
                 self.mark_sealed_through(&period);
                 self.periods.insert(period.id.clone(), period);
                 Ok(())
@@ -491,9 +540,11 @@ impl PeriodCalendar {
     /// 2. Every **earlier** defined period is already sealed. A seal's closing
     ///    balance is cumulative through its period's last day, so an earlier
     ///    period still accepting postings can restate it afterwards.
-    /// 3. It ends **after** the sealed watermark. Sealing inside a range
-    ///    already frozen would be a second, conflicting commitment to the same
-    ///    dates.
+    /// 3. It ends **after** the sealed watermark. Sealing inside a range already
+    ///    frozen would be a second, conflicting commitment to the same dates.
+    ///    [`PeriodCalendar::define`] refuses such a period outright, so reaching
+    ///    this arm means the calendar was assembled some other way; it stays as
+    ///    the guard on the rule rather than as the only statement of it.
     ///
     /// # Errors
     ///
@@ -614,6 +665,88 @@ mod tests {
             .expect("ok");
         assert!(!c.accepts(date!(2026 - 03 - 15)));
         assert!(c.accepts(date!(2026 - 04 - 15)));
+    }
+
+    #[test]
+    fn a_period_below_the_watermark_cannot_be_defined() {
+        // Sealing March freezes February too, whether or not the calendar ever
+        // covered it. Defining February afterwards would produce a period whose
+        // own state says `open` while every date in it reports `sealed` — and
+        // which `check_sealable` would refuse forever.
+        let mut c = PeriodCalendar::new();
+        c.define(march()).expect("defines");
+        c.transition(&pid("2026-03"), PeriodState::Closing)
+            .expect("ok");
+        c.transition(&pid("2026-03"), PeriodState::Sealed)
+            .expect("ok");
+
+        let february = Period::new(pid("2026-02"), date!(2026 - 02 - 01), date!(2026 - 02 - 28))
+            .expect("valid range");
+        assert!(matches!(
+            c.define(february),
+            Err(PeriodError::DefinedBelowWatermark { .. })
+        ));
+
+        // Forward of the watermark is unaffected.
+        let april = Period::new(pid("2026-04"), date!(2026 - 04 - 01), date!(2026 - 04 - 30))
+            .expect("valid range");
+        assert!(c.define(april).is_ok());
+    }
+
+    #[test]
+    fn a_replay_cannot_reopen_a_sealed_period() {
+        // `transition` refuses `Sealed -> Open` outright. `ensure` is the replay
+        // path and must refuse it too, or a stale row would arrive at the same
+        // place by the back door — reopening books that have been committed to.
+        let mut c = PeriodCalendar::new();
+        c.define(march()).expect("defines");
+        c.transition(&pid("2026-03"), PeriodState::Closing)
+            .expect("ok");
+        c.transition(&pid("2026-03"), PeriodState::Sealed)
+            .expect("ok");
+
+        let mut stale = march();
+        stale.state = PeriodState::Open;
+        assert!(matches!(
+            c.ensure(stale),
+            Err(PeriodError::InvalidTransition {
+                from: PeriodState::Sealed,
+                to: PeriodState::Open,
+                ..
+            })
+        ));
+        assert_eq!(
+            c.get(&pid("2026-03")).map(|p| p.state),
+            Some(PeriodState::Sealed)
+        );
+
+        // Replaying it unchanged is still a no-op.
+        let mut sealed = march();
+        sealed.state = PeriodState::Sealed;
+        assert!(c.ensure(sealed).is_ok());
+    }
+
+    #[test]
+    fn a_period_table_replays_in_any_order() {
+        // The replay path a durable backend takes. A *sealed* period below the
+        // watermark is what a sealed history looks like, so it is admitted
+        // however late in the sequence it arrives — otherwise the first restart
+        // would refuse the very rows the engine wrote.
+        let mut sealed_march = march();
+        sealed_march.state = PeriodState::Sealed;
+        let mut sealed_february =
+            Period::new(pid("2026-02"), date!(2026 - 02 - 01), date!(2026 - 02 - 28))
+                .expect("valid range");
+        sealed_february.state = PeriodState::Sealed;
+
+        for order in [
+            vec![sealed_march.clone(), sealed_february.clone()],
+            vec![sealed_february, sealed_march],
+        ] {
+            let c = PeriodCalendar::from_periods(order).expect("replays");
+            assert_eq!(c.len(), 2);
+            assert_eq!(c.sealed_through(), Some(date!(2026 - 03 - 31)));
+        }
     }
 
     #[test]
@@ -829,10 +962,10 @@ mod tests {
 
     #[test]
     fn the_watermark_seals_the_gaps_a_calendar_never_defined() {
-        // The hole this closes: February is not a defined period at all, so it
-        // used to report `Open` and accept postings — after March had sealed a
-        // closing balance that folds every entry booked on or before 31 March.
-        // One legal February booking would then restate a sealed period.
+        // February is not a defined period at all. Without the watermark it
+        // would report `Open` and accept postings, and one legal February
+        // booking would restate March's sealed closing balance — which folds
+        // every entry booked on or before 31 March.
         let mut c = PeriodCalendar::new();
         seal(
             &mut c,
@@ -862,14 +995,16 @@ mod tests {
         );
         assert_eq!(c.sealed_through(), Some(date!(2026 - 04 - 30)));
 
-        // A period defined afterwards, entirely behind the watermark, does not
-        // drag it back — and abandoning a close cannot either, since only a
-        // seal advances it and sealing is terminal.
-        c.define(
-            Period::new(pid("2026-02"), date!(2026 - 02 - 01), date!(2026 - 02 - 28))
-                .expect("valid range"),
-        )
-        .expect("defines");
+        // A period entirely behind the watermark cannot be defined at all, so
+        // there is nothing to drag it back — and abandoning a close cannot
+        // either, since only a seal advances it and sealing is terminal.
+        assert!(matches!(
+            c.define(
+                Period::new(pid("2026-02"), date!(2026 - 02 - 01), date!(2026 - 02 - 28))
+                    .expect("valid range"),
+            ),
+            Err(PeriodError::DefinedBelowWatermark { .. })
+        ));
         assert_eq!(c.sealed_through(), Some(date!(2026 - 04 - 30)));
 
         c.define(
@@ -965,11 +1100,11 @@ mod tests {
     }
 
     #[test]
-    fn a_period_behind_the_watermark_can_never_be_sealed() {
-        // The other half of the ordering rule. February was not defined when
-        // March sealed, so there was no predecessor to complain about — but its
-        // dates are frozen, and a closing balance for it now would be a second
-        // commitment to days March already covered.
+    fn a_period_behind_the_watermark_is_refused_at_definition() {
+        // February was not defined when March sealed, so there was no
+        // predecessor to complain about — but its dates are frozen, and a
+        // closing balance for it now would be a second commitment to days March
+        // already covered. Refused at `define`, the earliest point it can be.
         let mut c = PeriodCalendar::new();
         seal(
             &mut c,
@@ -978,21 +1113,20 @@ mod tests {
             date!(2026 - 03 - 31),
         );
 
-        c.define(
-            Period::new(pid("2026-02"), date!(2026 - 02 - 01), date!(2026 - 02 - 28))
-                .expect("valid range"),
-        )
-        .expect("defines");
-        c.transition(&pid("2026-02"), PeriodState::Closing)
-            .expect("ok");
-
         assert!(matches!(
-            c.check_sealable(&pid("2026-02")),
-            Err(PeriodError::SealedOutOfOrder {
+            c.define(
+                Period::new(pid("2026-02"), date!(2026 - 02 - 01), date!(2026 - 02 - 28))
+                    .expect("valid range"),
+            ),
+            Err(PeriodError::DefinedBelowWatermark {
                 ends,
                 sealed_through,
                 ..
             }) if ends == date!(2026 - 02 - 28) && sealed_through == date!(2026 - 03 - 31)
         ));
+        assert!(
+            c.get(&pid("2026-02")).is_none(),
+            "a refused define wrote nothing"
+        );
     }
 }

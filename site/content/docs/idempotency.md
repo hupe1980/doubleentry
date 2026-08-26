@@ -1,7 +1,7 @@
 +++
 title = "Idempotency"
 description = "How a retry is made safe across an at-least-once delivery path, and why the key is resolved before validation runs."
-weight = 7
+weight = 8
 +++
 
 ## The contract

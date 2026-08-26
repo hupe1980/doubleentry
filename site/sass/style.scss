@@ -153,6 +153,8 @@ a:hover { text-decoration-thickness: 2px; }
   margin: 0 0 .75rem;
 }
 .band-lede { color: var(--fg-muted); max-width: var(--measure); margin: 0 0 2rem; }
+// A second lede inside one band, introducing a follow-on group of cards.
+.band-lede-sub { margin-top: 2rem; }
 .band-note { color: var(--fg-muted); max-width: var(--measure); margin-top: 1.5rem; }
 
 // 20rem keeps the six guarantee cards at three columns on a desktop width, so

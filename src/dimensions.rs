@@ -20,10 +20,12 @@
 //!
 //! What the engine does is bound them ([`MAX_DIMENSIONS`] axes, [`MAX_LABEL_LEN`]
 //! characters each), order them deterministically, fold them into the entry hash
-//! so they are covered by tamper evidence, and — through
+//! so they are covered by tamper evidence, let you insist that a posting carry
+//! the ones your books cannot be kept without — through
 //! [`LedgerPolicy::required_dimensions`](crate::entry::LedgerPolicy::required_dimensions)
-//! — let you insist that a posting carry the ones your books cannot be kept
-//! without. It never interprets a value.
+//! — and **report on them**: a [`DimensionFilter`] narrows any balance read, and
+//! [`Journal::dimension_values`](crate::Journal::dimension_values) says which
+//! values an axis actually takes. It never interprets one.
 //!
 //! ```
 //! use doubleentry::{Dimensions, Label};
@@ -267,6 +269,100 @@ impl<'de> serde::Deserialize<'de> for Dimensions {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let axes = <BTreeMap<Label, Label> as serde::Deserialize>::deserialize(d)?;
         Self::from_pairs(axes).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Which postings a report includes, by their dimensions.
+///
+/// A conjunction: every clause must hold.
+///
+/// - [`matching`](Self::matching): the axis is present and equal to this value.
+/// - [`missing`](Self::missing): the axis is not set at all.
+///
+/// The second is what makes a set of reports **exhaustive**. Slice by the values
+/// an axis takes and the totals will not reach the trial balance, because
+/// postings carrying no value land in none of the slices.
+/// [`LedgerPolicy::required_dimensions`](crate::entry::LedgerPolicy::required_dimensions)
+/// prevents that going forward; `missing` finds what slipped through before.
+///
+/// ```
+/// use doubleentry::{DimensionFilter, Dimensions, Label};
+///
+/// let network = Dimensions::none()
+///     .with(Label::new("activity")?, Label::new("Network")?)?
+///     .with(Label::new("segment")?, Label::new("Electricity")?)?;
+///
+/// let filter = DimensionFilter::any()
+///     .matching(Label::new("activity")?, Label::new("Network")?)
+///     .missing(Label::new("fund")?);
+///
+/// assert!(filter.matches(&network));
+/// assert!(DimensionFilter::any().matches(&Dimensions::none()));
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DimensionFilter {
+    /// `Some(value)` requires equality; `None` requires the axis to be absent.
+    clauses: BTreeMap<Label, Option<Label>>,
+}
+
+impl DimensionFilter {
+    /// A filter that includes every posting.
+    #[must_use]
+    pub fn any() -> Self {
+        Self::default()
+    }
+
+    /// Requires `axis` to be present and equal to `value`.
+    ///
+    /// Naming the same axis twice replaces the earlier clause: a posting carries
+    /// at most one value per axis, so a conjunction of two different values for
+    /// one axis could only ever match nothing, and silently returning an empty
+    /// report is worse than taking the last word.
+    #[must_use]
+    pub fn matching(mut self, axis: Label, value: Label) -> Self {
+        self.clauses.insert(axis, Some(value));
+        self
+    }
+
+    /// Requires `axis` to be absent.
+    #[must_use]
+    pub fn missing(mut self, axis: Label) -> Self {
+        self.clauses.insert(axis, None);
+        self
+    }
+
+    /// True when this filter constrains nothing.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.clauses.is_empty()
+    }
+
+    /// Number of clauses.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.clauses.len()
+    }
+
+    /// Every clause, in axis order: `Some(value)` for an equality, `None` for an
+    /// absence.
+    ///
+    /// Ordered so a backend building a query from it produces the same SQL for
+    /// the same filter, which is what lets a statement cache do its job.
+    pub fn clauses(&self) -> impl ExactSizeIterator<Item = (&Label, Option<&Label>)> {
+        self.clauses.iter().map(|(a, v)| (a, v.as_ref()))
+    }
+
+    /// True when `dimensions` satisfies every clause.
+    #[must_use]
+    pub fn matches(&self, dimensions: &Dimensions) -> bool {
+        self.clauses.iter().all(|(axis, expected)| {
+            match (dimensions.get(axis.as_str()), expected.as_ref()) {
+                (Some(actual), Some(want)) => actual == want,
+                (None, None) => true,
+                _ => false,
+            }
+        })
     }
 }
 

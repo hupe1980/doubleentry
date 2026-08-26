@@ -72,7 +72,7 @@ A `TrialBalance` maps `(account, currency, layer)` to a `Balance`. Iteration
 order is deterministic, so any report or hash derived from one is reproducible.
 
 ```rust
-let tb = journal.trial_balance(None)?;
+let tb = journal.trial_balance(BalanceQuery::all())?;
 
 // The classic check: debits equal credits across every account.
 let totals = tb.totals(Currency::EUR, Layer::Settled)?;
@@ -84,7 +84,18 @@ are totalled separately and never net against each other — reporting a
 reservation as though the money had moved is exactly the error the layer exists
 to prevent.
 
+That is also why [validation](@/docs/entries.md#each-layer-balances-on-its-own)
+requires an entry to balance within each layer rather than merely per currency
+across both: an entry whose pending side were offset by a settled one would
+falsify the check below permanently, and an append-only log has no way back.
+
 `journal.verify_balanced()` runs this check across every currency and layer at
 once; `journal.verify_balances()` goes further and recomputes the maintained
 balances from the entries, proving the incremental state has not drifted from
 what it claims to summarise.
+
+## Gross totals survive the fold
+
+A [hierarchical report](@/docs/reporting.md) sums debits and credits separately
+at every level, never the net — so a parent whose children carry heavy offsetting
+turnover reports it rather than the quiet zero a net would give.

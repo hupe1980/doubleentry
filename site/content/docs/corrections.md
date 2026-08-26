@@ -1,7 +1,7 @@
 +++
 title = "Corrections"
 description = "Reversals as the only correction mechanism, the rules the engine enforces on them, and how a sealed period is corrected."
-weight = 8
+weight = 9
 +++
 
 ## Postings are immutable
@@ -87,7 +87,7 @@ log and the seals show, truthfully, that it was booked in April.
 A reversal nets the original to zero and leaves **both gross totals standing**:
 
 ```rust
-let after = journal.balance(&cash_key, None)?;
+let after = journal.balance(&cash_key, BalanceQuery::all())?;
 assert_eq!(after.signed_net()?, Eur::ZERO);
 assert_eq!(after.debits,  Eur::parse("42.00")?);
 assert_eq!(after.credits, Eur::parse("42.00")?);

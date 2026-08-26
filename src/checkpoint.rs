@@ -19,7 +19,7 @@
 
 use time::Date;
 
-use crate::balance::{Balance, BalanceKey};
+use crate::balance::{Balance, BalanceKey, BalanceQuery, DateBasis};
 use crate::merkle::TreeHead;
 use crate::money::{Amount, MoneyError};
 use crate::posting::Direction;
@@ -96,12 +96,17 @@ pub enum CheckpointError {
 
 /// Which state of the books an assertion is evaluated against.
 ///
-/// The two are genuinely different questions, and picking the wrong one is the
+/// These are genuinely different questions, and picking the wrong one is the
 /// classic reconciliation mistake. A log position is exact and reproducible but
 /// only meaningful inside this system. A date is what every external source
 /// speaks — a bank statement says "as at 31 March", not "after 4,812 entries" —
-/// and it folds by *booking date* regardless of when an entry was recorded, so a
+/// and it folds by date regardless of when an entry was *recorded*, so a
 /// backdated entry lands where it economically belongs.
+///
+/// Which date is the second half of the same question. The books are kept on
+/// booking dates; a bank is not. See [`DateBasis`], and
+/// [`BalanceAssertion::on_value_date`] for the form to check an external
+/// statement with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum AssertAt {
@@ -114,11 +119,36 @@ pub enum AssertAt {
         /// Number of entries folded in.
         size: u64,
     },
-    /// Every entry booked on or before `date`, whenever it was recorded.
+    /// Every entry dated on or before `date`, whenever it was recorded.
     OnDate {
-        /// The last booking date folded in, inclusive.
+        /// The last date folded in, inclusive.
         date: Date,
+        /// Which of the entry's two dates the bound applies to.
+        ///
+        /// A bank statement is value-dated and a trial balance is booking-dated,
+        /// and reconciling one against the other is the mistake this field
+        /// exists to make impossible to write by accident. See [`DateBasis`].
+        basis: DateBasis,
     },
+}
+
+impl AssertAt {
+    /// The [`BalanceQuery`] this evaluates against.
+    ///
+    /// `AssertAt` is the serialisable form — an assertion travels, and a
+    /// borrowed dimension filter cannot — so this is the bridge to the query
+    /// every balance read actually takes.
+    #[must_use]
+    pub fn query(self) -> BalanceQuery<'static> {
+        match self {
+            Self::Now => BalanceQuery::all(),
+            Self::Prefix { size } => BalanceQuery::over_prefix(size),
+            Self::OnDate { date, basis } => match basis {
+                DateBasis::Booking => BalanceQuery::through(date),
+                DateBasis::Value => BalanceQuery::through(date).by_value_date(),
+            },
+        }
+    }
 }
 
 /// A claim that an account holds a particular balance at a point in the books.
@@ -168,12 +198,32 @@ impl<const P: u8> BalanceAssertion<P> {
         self
     }
 
-    /// Evaluates the assertion over everything booked on or before `date`.
+    /// Evaluates the assertion over everything **booked** on or before `date`.
     ///
-    /// This is the form to reconcile against an external statement.
+    /// The form to reconcile against a figure taken from the books — a trial
+    /// balance, a period close, a prior-year comparative.
     #[must_use]
     pub fn on_date(mut self, date: Date) -> Self {
-        self.at = AssertAt::OnDate { date };
+        self.at = AssertAt::OnDate {
+            date,
+            basis: DateBasis::Booking,
+        };
+        self
+    }
+
+    /// Evaluates the assertion over everything **valued** on or before `date`.
+    ///
+    /// The form to reconcile against a figure taken from outside — a bank
+    /// statement, a custodian position, a counterparty confirmation. Those are
+    /// value-dated, and checking one against a booking-dated fold is the classic
+    /// reconciliation mistake: the two differ by the entries booked in one month
+    /// and settling in the next.
+    #[must_use]
+    pub fn on_value_date(mut self, date: Date) -> Self {
+        self.at = AssertAt::OnDate {
+            date,
+            basis: DateBasis::Value,
+        };
         self
     }
 
@@ -345,7 +395,15 @@ mod tests {
         assert_eq!(
             a.on_date(date!(2026 - 03 - 31)).at,
             AssertAt::OnDate {
-                date: date!(2026 - 03 - 31)
+                date: date!(2026 - 03 - 31),
+                basis: DateBasis::Booking,
+            }
+        );
+        assert_eq!(
+            a.on_value_date(date!(2026 - 03 - 31)).at,
+            AssertAt::OnDate {
+                date: date!(2026 - 03 - 31),
+                basis: DateBasis::Value,
             }
         );
     }

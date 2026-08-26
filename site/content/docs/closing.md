@@ -1,7 +1,7 @@
 +++
 title = "Closing entries"
 description = "Flattening income and expense into equity at year end, as ordinary postings that still go through validation."
-weight = 13
+weight = 14
 +++
 
 ## What closing does
@@ -16,7 +16,7 @@ stays with you.
 ```rust
 use doubleentry::{closing_postings, AccountKind, Layer};
 
-let closing = journal.trial_balance_through_date(date!(2026-12-31))?;
+let closing = journal.trial_balance(BalanceQuery::through(date!(2026-12-31)))?;
 
 let postings = closing_postings(
     &closing,
@@ -54,7 +54,8 @@ who.
 One posting per account with a non-zero net, on the side that flattens it,
 followed by one balancing posting on the equity account **per currency**.
 
-The postings balance per currency by construction, so sealing succeeds unless
+Every posting is in the layer you asked for, so the set balances per currency
+*and* per layer — which is what validation requires. Sealing succeeds unless
 something else about the draft is wrong.
 
 Accounts that already net to zero are skipped — a posting of zero carries no

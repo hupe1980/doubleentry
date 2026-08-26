@@ -7,9 +7,316 @@
 
 use std::collections::BTreeMap;
 
+use time::Date;
+
 use crate::account::AccountId;
+use crate::dimensions::DimensionFilter;
 use crate::money::{Amount, Currency, MoneyError};
 use crate::posting::{Direction, Layer, Posting};
+
+/// Which of an entry's two dates a date-bounded query folds by.
+///
+/// An entry carries both, and they answer different questions. Neither is a
+/// default that is right everywhere, so a query says which one it means.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum DateBasis {
+    /// The date the entry was **booked into the books**.
+    ///
+    /// The default, and the only basis the engine itself uses. A period covers
+    /// booking dates, a seal's closing balance is cumulative through a booking
+    /// date, and the sealed watermark freezes booking dates — so this is what a
+    /// closing balance, a trial balance and a set of financial statements mean.
+    #[default]
+    Booking,
+    /// The date the money is treated as having **moved**.
+    ///
+    /// What an outside party speaks. A bank statement, an interest accrual and a
+    /// cash-position report are all value-dated: an invoice booked on the 28th
+    /// with value the 2nd of the next month is in this month's books and next
+    /// month's cash.
+    ///
+    /// Reporting on this basis is a read: it changes nothing about which period
+    /// an entry belongs to, what a seal committed to, or what may be booked
+    /// next. Otherwise a value date could reopen a sealed period.
+    Value,
+}
+
+impl std::fmt::Display for DateBasis {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Booking => "booking date",
+            Self::Value => "value date",
+        })
+    }
+}
+
+/// The two dates an entry carries.
+///
+/// Passed together to [`BalanceQuery::includes_entry`] so the query picks the one
+/// its [`DateBasis`] names. Two bare `Date` arguments in a row can be swapped
+/// without the compiler noticing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EntryDates {
+    /// When the entry was booked into the books.
+    pub booking: Date,
+    /// When the money is treated as having moved.
+    pub value: Date,
+}
+
+impl EntryDates {
+    /// Both dates the same, which is the default an entry is built with.
+    #[must_use]
+    pub const fn on(date: Date) -> Self {
+        Self {
+            booking: date,
+            value: date,
+        }
+    }
+
+    /// The date `basis` names.
+    #[must_use]
+    pub const fn by(&self, basis: DateBasis) -> Date {
+        match basis {
+            DateBasis::Booking => self.booking,
+            DateBasis::Value => self.value,
+        }
+    }
+}
+
+/// Which postings a balance report folds.
+///
+/// Every field narrows; [`BalanceQuery::all`] folds everything.
+///
+/// # Two orderings, and they are not interchangeable
+///
+/// [`over_prefix`](Self::over_prefix) counts **entries in log order** — the same
+/// number a [`TreeHead::size`](crate::TreeHead::size) carries, so it is the form
+/// to pair with a proof.
+///
+/// [`through`](Self::through) and [`between`](Self::between) fold by date, so a
+/// backdated entry lands where it economically belongs. That is the form to
+/// reconcile against anything outside the ledger, and what a period's closing
+/// balance means.
+///
+/// The two differ whenever a period is sealed after the next has begun, which is
+/// the normal case. Confusing them is the classic reconciliation mistake.
+///
+/// # And two dates
+///
+/// A date-bounded query folds by **booking date** unless
+/// [`by_value_date`](Self::by_value_date) says otherwise — see [`DateBasis`].
+/// The basis is a reporting choice and nothing more: it never moves an entry
+/// between periods and never affects what a seal committed to.
+///
+/// ```
+/// # use doubleentry::{BalanceQuery, DimensionFilter, Label};
+/// # use time::macros::date;
+/// // Everything.
+/// let all = BalanceQuery::all();
+///
+/// // A period's activity, not the cumulative position — what a P&L needs.
+/// let march = BalanceQuery::between(date!(2026 - 03 - 01), date!(2026 - 03 - 31));
+///
+/// // The same, sliced to one reporting axis.
+/// let filter = DimensionFilter::any().matching(Label::new("segment")?, Label::new("Retail")?);
+/// let retail_in_march = march.matching(&filter);
+///
+/// // The cash that actually moved in March, which is not the same set.
+/// let cash_in_march = march.by_value_date();
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BalanceQuery<'a> {
+    prefix: Option<u64>,
+    from: Option<Date>,
+    to: Option<Date>,
+    basis: DateBasis,
+    dimensions: Option<&'a DimensionFilter>,
+}
+
+impl<'a> BalanceQuery<'a> {
+    /// Every posting recorded.
+    #[must_use]
+    pub fn all() -> Self {
+        Self::default()
+    }
+
+    /// The first `size` entries in log order.
+    ///
+    /// A count, not an index: `0` is the empty ledger and `2` is the journal as
+    /// it stood after two entries.
+    #[must_use]
+    pub fn over_prefix(size: u64) -> Self {
+        Self {
+            prefix: Some(size),
+            ..Self::default()
+        }
+    }
+
+    /// Everything booked on or before `end`.
+    ///
+    /// The cumulative position — what a period's closing balance means.
+    #[must_use]
+    pub fn through(end: Date) -> Self {
+        Self {
+            to: Some(end),
+            ..Self::default()
+        }
+    }
+
+    /// Everything booked between `start` and `end`, both inclusive.
+    ///
+    /// The period's **activity** rather than the position it leaves behind,
+    /// which is the difference between an income statement and a balance sheet.
+    #[must_use]
+    pub fn between(start: Date, end: Date) -> Self {
+        Self {
+            from: Some(start),
+            to: Some(end),
+            ..Self::default()
+        }
+    }
+
+    /// Narrows to entries booked on or after `start`.
+    #[must_use]
+    pub fn from(mut self, start: Date) -> Self {
+        self.from = Some(start);
+        self
+    }
+
+    /// Narrows to entries booked on or before `end`.
+    #[must_use]
+    pub fn to(mut self, end: Date) -> Self {
+        self.to = Some(end);
+        self
+    }
+
+    /// Narrows to the first `size` entries in log order.
+    #[must_use]
+    pub fn within_prefix(mut self, size: u64) -> Self {
+        self.prefix = Some(size);
+        self
+    }
+
+    /// Narrows to postings whose dimensions satisfy `filter`.
+    #[must_use]
+    pub fn matching(mut self, filter: &'a DimensionFilter) -> Self {
+        self.dimensions = Some(filter);
+        self
+    }
+
+    /// Folds the date bounds by **value date** rather than booking date.
+    ///
+    /// A reporting choice — see [`DateBasis::Value`]. It has no effect on a
+    /// query with no date bounds.
+    #[must_use]
+    pub fn by_value_date(mut self) -> Self {
+        self.basis = DateBasis::Value;
+        self
+    }
+
+    /// Folds the date bounds by **booking date**, which is the default.
+    #[must_use]
+    pub fn by_booking_date(mut self) -> Self {
+        self.basis = DateBasis::Booking;
+        self
+    }
+
+    /// Which date the bounds are applied to.
+    #[must_use]
+    pub fn basis(&self) -> DateBasis {
+        self.basis
+    }
+
+    /// The log-prefix bound, if one was set.
+    #[must_use]
+    pub fn prefix(&self) -> Option<u64> {
+        self.prefix
+    }
+
+    /// The earliest booking date included, if one was set.
+    #[must_use]
+    pub fn start(&self) -> Option<Date> {
+        self.from
+    }
+
+    /// The latest booking date included, if one was set.
+    #[must_use]
+    pub fn end(&self) -> Option<Date> {
+        self.to
+    }
+
+    /// The dimension filter, if one was set and it constrains anything.
+    #[must_use]
+    pub fn dimensions(&self) -> Option<&'a DimensionFilter> {
+        self.dimensions.filter(|f| !f.is_empty())
+    }
+
+    /// True when this query narrows nothing, so the answer is the whole ledger.
+    ///
+    /// The fast path a backend takes to serve a maintained total rather than
+    /// re-folding: [`Journal`](crate::Journal) keeps current balances as entries
+    /// arrive, and this is what says the maintained one is the answer.
+    #[must_use]
+    pub fn is_unrestricted(&self) -> bool {
+        self.prefix.is_none()
+            && self.from.is_none()
+            && self.to.is_none()
+            && self.dimensions().is_none()
+    }
+
+    /// The query an **opening** balance is folded over: everything this query
+    /// selects that was booked strictly *before* its window opens.
+    ///
+    /// `None` when the query has no start date, because then there is nothing to
+    /// carry in and the opening balance is zero. A statement scoped to March
+    /// carries February in on its first line; an unscoped statement opens at
+    /// nothing.
+    ///
+    /// Every *other* narrowing still applies — the log prefix and the dimension
+    /// filter — because an opening balance for one reporting axis is over that
+    /// axis. The upper date bound is dropped along with the lower one: it is
+    /// implied, since every entry in the carry set is already below the window.
+    ///
+    /// The set is defined by **date**, never by log position. Entries are
+    /// appended in recording order, so a position bound would fold a later-dated
+    /// entry into the middle of the statement and leave a backdated one out of
+    /// the opening.
+    #[must_use]
+    pub fn opening(&self) -> Option<Self> {
+        // `previous_day` is `None` only at `Date::MIN`, where nothing can
+        // precede the window and the opening balance is zero either way.
+        let before = self.from?.previous_day()?;
+        Some(Self {
+            prefix: self.prefix,
+            from: None,
+            to: Some(before),
+            basis: self.basis,
+            dimensions: self.dimensions,
+        })
+    }
+
+    /// True when the entry at `index` carrying `dates` is included.
+    ///
+    /// The date bounds are applied to whichever of the two [`basis`](Self::basis)
+    /// names. The entry-level half of the predicate; the posting-level half is
+    /// the dimension filter, which needs the posting.
+    #[must_use]
+    pub fn includes_entry(&self, index: u64, dates: EntryDates) -> bool {
+        let on = dates.by(self.basis);
+        self.prefix.is_none_or(|size| index < size)
+            && self.from.is_none_or(|start| on >= start)
+            && self.to.is_none_or(|end| on <= end)
+    }
+
+    /// True when `posting` satisfies the dimension filter, if there is one.
+    #[must_use]
+    pub fn includes_posting<const P: u8>(&self, posting: &Posting<P>) -> bool {
+        self.dimensions()
+            .is_none_or(|filter| filter.matches(&posting.dimensions))
+    }
+}
 
 /// Gross debit and credit totals, and the net derived from them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

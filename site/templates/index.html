@@ -55,11 +55,39 @@
       </p>
     </article>
     <article class="card">
+      <h3>Witnessable</h3>
+      <p>
+        Every proof is relative to a tree head — so an independent cosigner
+        remembers the last head it vouched for and refuses a second history at
+        the same size, in the format Certificate Transparency already speaks.
+      </p>
+    </article>
+    <article class="card">
       <h3>Gross-preserving</h3>
       <p>
         Balances carry debit <em>and</em> credit totals. An account showing zero
         may have seen no activity or heavy offsetting turnover, and a net alone
         cannot tell them apart.
+      </p>
+    </article>
+
+    <article class="guarantee">
+      <h3>Hierarchical</h3>
+      <p>
+        Accounts are a tree and only leaves are postable — so a node's balance is
+        one defensible number, not two. A rollup folds a trial balance up it,
+        infers the grouping nodes from the paths that exist, and summarises to
+        any depth.
+      </p>
+    </article>
+
+    <article class="guarantee">
+      <h3>The books, or the cash</h3>
+      <p>
+        Every entry carries a booking date and a value date, and any balance or
+        statement folds by either. Reconcile a trial balance on one and a bank
+        statement on the other — without a settlement instruction ever being able
+        to reopen a sealed period.
       </p>
     </article>
     <article class="card">
@@ -97,8 +125,20 @@
       <p>This account held this balance when the period closed, proven from the seal alone and named without disclosing the chart.</p>
     </article>
   </div>
+  <p class="band-lede band-lede-sub">
+    And the question none of those can answer on their own: <em>“is this the same
+    history you showed everybody else?”</em>
+  </p>
+  <div class="grid grid-3">
+    <article class="card">
+      <h3>Witnessing</h3>
+      <p>An independent cosigner that will not vouch for a second history at a size it has already vouched for — the one attack a proof cannot see.</p>
+    </article>
+  </div>
   <p class="band-note">
     <a href="{{ get_url(path='@/docs/proofs.md') }}">How the proofs work →</a>
+    &nbsp;·&nbsp;
+    <a href="{{ get_url(path='@/docs/witness.md') }}">Witnessing →</a>
   </p>
 </section>
 
@@ -113,9 +153,9 @@
       <h3>Periods and seals</h3>
       <p>Close a period, chain its seal, and prove one balance to an auditor.</p>
     </a>
-    <a class="card card-link" href="{{ get_url(path='@/docs/persistence.md') }}">
-      <h3>Persistence</h3>
-      <p>SQLite and PostgreSQL backends, and the conformance suite that decides what counts as one.</p>
+    <a class="card card-link" href="{{ get_url(path='@/docs/witness.md') }}">
+      <h3>Witnessing</h3>
+      <p>The split-view attack proofs cannot see, and the cosigner that refuses to take part in it.</p>
     </a>
   </div>
 </section>

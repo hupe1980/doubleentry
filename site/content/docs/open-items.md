@@ -1,7 +1,7 @@
 +++
 title = "Open items and clearing"
 description = "Matching receivables against payments, partial application, residual tracking, and resetting a clearing that matched the wrong items."
-weight = 9
+weight = 10
 +++
 
 ## The problem
@@ -98,6 +98,19 @@ It is unbounded on purpose: it is the read `open_items` is paged to avoid,
 offered because some questions have no bounded answer. Page when you are
 rendering; drain when a partial answer would be a wrong one.
 
+### Open items are as they stand *now*
+
+Unlike a [balance or a statement](@/docs/statements.md#historical-reads), an
+open-item list takes no `BalanceQuery`. A residual is the posting's amount less
+everything ever applied to it, so "what was open as at 31 March" is a different
+question — it needs the clearings replayed to that date, not the postings
+filtered — and the engine does not answer it.
+
+The pieces are on file: `ClearingRegister::events` is the ordered record, and
+every `Clearing` carries the date it was made and the date it was released. An
+aged-debt report as at a past date is a fold over those events, and it belongs
+where the ageing buckets are defined, which is not here.
+
 Note what a partial read does **not** cost, since it is the obvious worry: it
 cannot clear a newer item ahead of an older one. Pages come oldest first, so the
 first page *is* the oldest items and FIFO over it is correct FIFO. What it costs
@@ -122,6 +135,19 @@ The **layer** constraint deserves its own note. A reservation and a settled
 payment are different claims on the same account. Netting one against the other
 would report an open item as closed while the money had not moved. Both layers
 clear the same way; they just do not clear against each other.
+
+### Clearing is the reservation lifecycle
+
+Because it is layer-scoped, clearing over `Layer::Pending` answers "which release
+discharged which hold": a reservation is an open item, a release or settlement is
+applied against it, over-application is refused, and `open_items` on the pending
+key lists what is outstanding — residuals included, so a partly consumed hold
+reports its remainder like any other item.
+
+That is the same machinery invoices and payments use. See
+[Pending and settled](@/docs/entries.md#pending-and-settled) for the rest,
+in particular that only a [balance limit](@/docs/accounts.md#balance-limits)
+refuses a doubled release.
 
 ## Partial application
 

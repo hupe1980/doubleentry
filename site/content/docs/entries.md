@@ -52,9 +52,9 @@ The checks a `seal` runs:
 | No zero amounts | A zero posting carries no information |
 | No negative amounts | The side is carried by the direction, not the sign |
 | Account is registered | A handle from another registry names nothing here |
-| Account is a leaf | Posting to a node and its descendants double-counts every rollup |
+| Account is a leaf | An account that is both a bucket and a container has two defensible balances, and no report can un-mix them |
 | Booking date inside the account's open window | |
-| Debits equal credits, **per currency** | A cross-currency entry balances each currency independently |
+| Debits equal credits, **per currency and layer** | Each currency balances independently, and so does each layer — see [below](#pending-and-settled) |
 | Booking date's period accepts postings | A sealed period has been committed to |
 | Policy: currency, required dimensions, value-date drift | Ledger-wide rules you opted into |
 
@@ -65,7 +65,7 @@ because both are questions about the books rather than about the entry: the
 same entry is legal or not depending on what has already been recorded, so no
 amount of inspecting it in isolation can answer them.
 
-## Per-currency balance
+## Balancing, per currency and per layer
 
 An entry may move more than one currency, and each balances independently:
 
@@ -81,7 +81,14 @@ let entry = Entry::new(id, key, date!(2026-03-15))
 
 The engine never converts between currencies. A rate is a business decision with
 a source, a timestamp and a policy behind it, and a library that guessed one
-would be wrong in a way no downstream report could detect.
+would be wrong in a way no downstream report could detect. What it does give you
+is the arithmetic in the middle: `Amount::checked_mul_ratio` applies a rate with
+an explicit rounding mode, exactly, and `rescale` crosses between the precision
+a rate was published in and the one your books are kept in — see
+[Money](@/docs/money.md#rates-tax-and-conversion).
+
+The [layer](#pending-and-settled) balances independently too, for the same
+reason and with more teeth: every balance the engine reports is keyed on it.
 
 ## Ledger policy
 
@@ -163,21 +170,96 @@ so a reservation and a settled movement are totalled apart and never net against
 each other. Reporting a reservation as though the money had moved is exactly the
 error the layer exists to prevent.
 
-What the engine does *not* do is model a reservation's lifecycle. It ships no
-`post`/`void` operation, no expiry, and no link from a settling entry back to the
-hold it discharges. Resolving a reservation is an ordinary append — reverse the
-pending entry to release it, and book the settled entry when the money moves —
-and the pieces you need to keep that honest are already here:
+### Each layer balances on its own
 
-- **At-most-once release.** An entry can be reversed at most once, and a reversal
-  cannot itself be reversed, so a hold cannot be released twice.
-- **Residuals.** [Clearing](@/docs/open-items.md) works within the pending layer,
-  so a partially consumed hold reports its remainder like any other open item.
-- **Reservation totals.** `trial_balance` and `balance` both key on the layer, so
-  "how much is currently held" is a read, not a computation.
+Because every balance the engine reports is keyed on the layer, **an entry has to
+balance within each layer separately** — not merely per currency across both.
 
-That boundary is deliberate. Expiry needs a clock, and this engine reads none;
-and a `post`/`void` vocabulary would have to choose whether a partial settlement
-releases the remainder — a policy question with different right answers in
-payments, in trading and in inventory. Both belong to the layer above, and both
-are straightforward to build on the guarantees above.
+```rust
+// Refused. It nets to zero in EUR and leaves both layers out of balance.
+Entry::new(id, key, date!(2026-03-15))
+    .post(Posting::debit(cash, Eur::parse("50.00")?, Currency::EUR).in_layer(Layer::Pending))
+    .post(Posting::credit(revenue, Eur::parse("50.00")?, Currency::EUR))
+```
+
+Accepting it would falsify `journal.verify_balanced()` permanently: that check
+totals every currency and layer independently, both totals would be wrong, and an
+append-only log has no way to take the entry back. The error names both layers.
+
+### Resolving a reservation
+
+The rule is what makes a hold and its discharge expressible as **one atomic
+entry**: release the reservation in the pending layer, book the movement in the
+settled one, and each side balances.
+
+```rust
+Entry::new(id, key, date!(2026-03-20))
+    // Release the hold …
+    .post(Posting::credit(cash, Eur::parse("50.00")?, Currency::EUR).in_layer(Layer::Pending))
+    .post(Posting::debit(holds, Eur::parse("50.00")?, Currency::EUR).in_layer(Layer::Pending))
+    // … and move the money.
+    .debit(cash, Eur::parse("50.00")?, Currency::EUR)
+    .credit(revenue, Eur::parse("50.00")?, Currency::EUR)
+```
+
+Releasing a hold without settling it is the pending inverse on its own, which is
+what `Entry::reverse` builds. Settling *part* of it is the same entry with a
+smaller settled leg and a partial pending inverse; the remainder stays reserved.
+
+None of that needs an operation the crate does not already have. Two questions
+are worth answering plainly, though.
+
+**What stops a hold being released twice?** A
+[balance limit](@/docs/accounts.md#balance-limits), and only that. The engine
+cannot tell a release from a fresh hold the other way — they are the same
+posting. It *can* tell that a cash box may not go credit, and a limit folds both
+layers, so a doubled release drives the fold below zero and is refused inside the
+write:
+
+```rust
+journal.set_account_limit(cash, BalanceLimit::NoCreditBalance)?;
+// … hold 100, release 100, and a second release is `LimitBreached`.
+```
+
+On an unlimited account a doubled release is accepted, like any other credit to
+cash you do not have. **Limit the accounts you hold reservations on.**
+
+**Which release discharged which hold?** [Clearing](@/docs/open-items.md) is
+scoped to a layer, so open-item matching over the pending layer answers it: each
+reservation is an open item, a release is applied against it, over-application is
+refused, and `open_items` lists what is outstanding — the same machinery invoices
+and payments use.
+
+### No timeouts, and no post/void
+
+A reservation does not expire on its own. Expiry needs a clock, and a hold that
+vanished without an entry would be a balance change nothing in the log accounts
+for. Book the release from your scheduler instead.
+
+A `post`/`void` vocabulary is absent for a different reason: it would have to
+decide whether a partial settlement releases the remainder, and that has
+different right answers in payments, in trading and in inventory.
+
+## Booking date and value date
+
+Every entry carries two dates. The **booking date** is when it went into the
+books: it decides which [period](@/docs/periods-and-seals.md) the entry belongs
+to, whether that period still accepts postings, and what a
+[seal](@/docs/periods-and-seals.md) commits to. The **value date** is when the
+money is treated as having moved, and it defaults to the booking date.
+
+```rust
+let entry = Entry::new(id, key, date!(2026-03-28))
+    .with_value_date(date!(2026-04-02))     // booked in March, settles in April
+    // … postings …
+    .seal(&journal.context())?;
+```
+
+Any balance, trial balance or statement can be folded by the value date instead —
+see [Two dates](@/docs/statements.md#two-dates-and-which-one-a-report-means).
+What it never does is decide period membership; if it could, a settlement
+instruction could reopen sealed books.
+
+`LedgerPolicy::with_max_value_date_drift` bounds how far the two may sit apart,
+for ledgers where a large gap means a data-entry error rather than a genuine
+forward value.

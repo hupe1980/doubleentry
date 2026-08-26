@@ -24,20 +24,20 @@
 //!
 //! # What pruning costs
 //!
-//! Step 4 is optional, and it is not free. A store's inclusion and consistency
-//! proofs are built from the leaves it holds, so removing a prefix renumbers
-//! every leaf after it and the store can no longer build a proof for **any**
-//! entry — not just the archived ones. The tree head is unaffected, since it is
-//! read from the last row's stored root, so the two would disagree silently.
+//! Step 4 is optional, and it does not cost proofs. The SQL backends keep the
+//! Merkle tree in its own table, so archiving a prefix of the entries leaves it
+//! untouched: the log keeps its length and its root, and inclusion and
+//! consistency proofs keep working across the archived range. The proof comes
+//! from the hot store and the leaf it is checked against comes from Iceberg,
+//! which is the arrangement an archive is for.
 //!
-//! The SQL backends therefore check that the log they read back is dense from
-//! zero and refuse with a `LogNotDense` error naming the hole. Proofs over an
-//! archived period come from the archive and its seal after that; the seal is in
-//! the snapshot summary precisely so they can.
+//! What it costs is the entry bodies. [`get`](crate::LedgerStore::get) stops
+//! finding them, a statement stops listing them, and a balance folded over the
+//! pruned range comes out short. Those answers live in the archive.
 //!
-//! Keeping the rows is the default for a reason. Compaction is worth doing on
-//! its own — a queryable columnar mirror that any engine can read — and pruning
-//! is a separate decision you make afterwards, if at all.
+//! Compaction is worth doing on its own, as a queryable columnar mirror any
+//! engine can read; pruning is a separate decision you make afterwards, if at
+//! all.
 //!
 //! # The seal travels with the data
 //!

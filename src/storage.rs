@@ -34,10 +34,10 @@ use std::sync::Mutex;
 use time::Date;
 
 use crate::account::{AccountId, AccountRecord};
-use crate::balance::{Balance, BalanceKey, TrialBalance};
+use crate::balance::{Balance, BalanceKey, BalanceQuery, TrialBalance};
 use crate::checkpoint::Checkpoint;
 use crate::clearing::{Clearing, ClearingId, OpenItem, PostingPosition};
-use crate::entry::{Balanced, Entry, EntryId};
+use crate::entry::{Balanced, Entry, EntryId, IdempotencyKey};
 use crate::hash::Hash;
 use crate::journal::{Journal, JournalError, LogIndex, NotSequenced, Recorded};
 use crate::merkle::{ConsistencyProof, InclusionProof, TreeHead};
@@ -218,62 +218,93 @@ impl<const P: u8> Page<P> {
 ///
 /// # Contract
 ///
-/// Implementations must guarantee all of the following. The [`conformance`]
-/// suite checks each one.
+/// The [`conformance`] suite checks every rule below except the first, which no
+/// test can establish: it is a claim about what a backend never does. Enforce
+/// that one underneath the application — PostgreSQL can revoke `UPDATE` and
+/// `DELETE`, which is the difference between a convention and a property.
+///
+/// The reasoning behind each rule is in the
+/// [persistence guide](https://hupe1980.github.io/doubleentry/docs/persistence/).
 ///
 /// 1. **Append-only.** Recorded entries are never modified, and the store never
-///    removes one of its own accord.
-///
-///    An operator may still prune a prefix that has been archived to a
-///    [cold tier](iceberg) — that is a retention decision with legal weight and
-///    no library should make it for you. What it costs is worth knowing before
-///    you make it: proofs are built from the stored leaves, so a hole renumbers
-///    every leaf after it and the store can no longer build *any* inclusion or
-///    consistency proof. The SQL backends detect the hole and name it rather
-///    than returning a proof for the wrong entry.
+///    removes one of its own accord. An operator may still prune a prefix
+///    archived to a [cold tier](iceberg) at no cost to its proofs: the SQL
+///    backends store the Merkle tree separately from the entries, so inclusion
+///    and consistency proofs keep working and the archive supplies the leaf they
+///    are checked against.
 /// 2. **Atomic batches.** Every entry in a batch lands, or none does.
-/// 3. **Idempotent.** Re-appending an entry whose idempotency key is already
-///    present with identical content is a no-op returning the original outcome.
-///    The same key with different content is an error, never an overwrite.
-///    The uniqueness check must be part of the write itself, not a prior read —
-///    a read-then-write races under concurrency and duplicates the entry.
-/// 4. **Dense, ordered indices.** Log indices start at zero and increase by one
-///    per entry, with no gaps, in commit order. A backend may assign them during
-///    the append or afterwards; if afterwards, [`LedgerStore::append`] returns
-///    `index: None` until [`LedgerStore::sequence`] has run.
-/// 5. **Stable reads.** A record read twice returns the same bytes and the same
-///    content hash — every field of it, including the entry's `kind` and each
-///    posting's dimensions, because those are covered by that hash. A backend
-///    that drops one does not under-report; it makes the entry unreadable.
-/// 6. **Master data survives a restart.** An account comes back at the handle it
-///    was issued, and a period comes back in the state it was left in. Both are
-///    ledger state: a repointed handle rewrites which account history refers to,
-///    and a sealed period that reopens accepts postings into books already
-///    committed to.
-/// 7. **Seals chain.** [`LedgerStore::seals`] returns them in chain order, and
-///    what comes back reproduces a chain that verifies.
-/// 8. **Seals bind their account handles.** A seal's
-///    [`accounts`](Seal::accounts) is the commitment over the account
-///    bindings the store itself holds. A backend that skips it leaves every
-///    handle in the trial-balance root floating, so renumbering the accounts
-///    table would keep the chain verifying while every balance in it referred to
-///    a different account.
-/// 9. **Periods seal in date order.** A seal's closing balance is cumulative
-///    through its period's last day, so sealing one while an earlier period is
-///    still open would let an ordinary later booking restate it — with the seal,
-///    its proofs and the whole chain still verifying. Enforce it with
-///    [`PeriodCalendar::check_sealable`](crate::PeriodCalendar::check_sealable)
-///    rather than by hand, so every backend applies the same rule.
+/// 3. **Idempotent.** Re-appending an entry whose key is present with identical
+///    content is a no-op returning the original outcome; the same key with
+///    different content is an error, never an overwrite. The uniqueness check is
+///    part of the write — a read-then-write races.
+/// 4. **Dense, ordered indices.** From zero, one per entry, no gaps, in commit
+///    order. Assigned during the append or afterwards; if afterwards,
+///    [`append`](LedgerStore::append) returns `index: None` until
+///    [`sequence`](LedgerStore::sequence) has run.
+/// 5. **Stable reads.** A record read twice returns the same bytes and content
+///    hash — `kind` and each posting's dimensions included, because the hash
+///    covers them.
+/// 6. **Master data survives a restart, and can change.** An account returns at
+///    the handle it was issued; a period returns in the state it was left in.
+///    Re-registering a handle updates its classification, open window and limit,
+///    and refuses a *different* path.
+/// 7. **Balance limits are enforced inside the write.** A limit checked
+///    beforehand reads a pre-image two concurrent appends both see.
+/// 8. **A posted-to leaf cannot gain a child.**
+///    [`register_account`](LedgerStore::register_account) refuses a path beneath
+///    an account that already carries postings.
+/// 9. **Seals chain, and the chain describes this store's log.**
+///    [`seals`](LedgerStore::seals) returns them in chain order, reproducing a
+///    chain that verifies against the store's own ledger — and against the log
+///    itself, via [`SealChain::verify_against_log`](crate::SealChain::verify_against_log).
+///    The second half is not redundant: a chain can be internally perfect over a
+///    history nobody holds, which is what a rebuilt log looks like.
+/// 10. **Seals bind their account handles.** A seal's
+///     [`accounts`](Seal::accounts) is the commitment over the bindings the
+///     store itself holds.
+/// 11. **Periods seal in date order.** Enforced with
+///     [`PeriodCalendar::check_sealable`](crate::PeriodCalendar::check_sealable)
+///     rather than by hand, so every backend applies the same rule.
+/// 12. **A sealed balance stays provable and nameable.**
+///     [`prove_sealed_balance`](LedgerStore::prove_sealed_balance) keeps
+///     answering after the registry grows, an account closes and a limit
+///     changes, and refuses rather than proving when the rebuilt closing balance
+///     does not match the seal.
+/// 13. **Archived heads stay checkable, in `O(log n)`.**
+///     [`head_at`](LedgerStore::head_at),
+///     [`prove_inclusion_at`](LedgerStore::prove_inclusion_at) and
+///     [`prove_consistency_between`](LedgerStore::prove_consistency_between)
+///     answer for a head published in the past — and answer it from a
+///     logarithmic number of reads, not a replay. A backend that rebuilds the
+///     tree per proof passes the suite and falls over at scale, so the cost is
+///     part of the contract: store the interior nodes, and serve a
+///     [`nodes`](crate::merkle::nodes) plan.
+/// 14. **Entries are findable by their idempotency key**, through
+///     [`get_by_key`](LedgerStore::get_by_key).
+/// 15. **Balances slice by dimension and by date, on either date.** A
+///     [`BalanceQuery`] narrows any balance read by reporting axis, date range
+///     or log prefix, and the narrowings compose. The range applies to the
+///     booking date by default and to the value date when the query says so —
+///     see [`DateBasis`](crate::DateBasis). A backend that stores a value date
+///     but cannot filter by it has a write-only column.
+/// 16. **A statement scopes to a period and opens at the right figure.**
+///     [`StatementPage::opening`] carries in everything dated *before* the
+///     query's window plus everything the earlier pages showed, so `opening`
+///     plus the page's movements is the last line's
+///     [`running`](StatementLine::running) — whatever order the entries were
+///     recorded in.
+/// 17. **Checkpoints never go backwards.**
+///     [`save_checkpoint`](LedgerStore::save_checkpoint) leaves a later stored
+///     checkpoint in place, so the write is idempotent and order-independent.
 ///
 /// # Sequencing
 ///
-/// Assigning positions inline means serialising appends: the next index cannot
-/// be read until the previous writer has committed. Assigning them out of band
-/// lets writers insert concurrently and leaves ordering to a single sequencer —
-/// at the cost of a window in which an entry is durable but not yet provable.
-///
-/// Both are legitimate. The contract covers both, and [`LedgerStore::sequence`]
-/// is a no-op for backends that need none.
+/// Inline assignment serialises appends: the next index cannot be read until the
+/// previous writer has committed. Deferred assignment lets writers insert
+/// concurrently and leaves ordering to a single sequencer, at the cost of a
+/// window in which an entry is durable but not yet provable. Both are
+/// legitimate, and [`sequence`](LedgerStore::sequence) is a no-op for backends
+/// that need none.
 pub trait LedgerStore<const P: u8>: Send + Sync {
     /// The backend's failure type.
     ///
@@ -325,6 +356,21 @@ pub trait LedgerStore<const P: u8>: Send + Sync {
         id: EntryId,
     ) -> impl Future<Output = Result<Option<StoredEntry<P>>, Self::Error>> + Send;
 
+    /// Fetches one entry by its idempotency key.
+    ///
+    /// The lookup the key is *for*. The guidance is to derive a key from the
+    /// source transaction — a message id, an external document reference, a
+    /// `(run, line)` pair from a batch import — and the question that follows is
+    /// "did we already book message X?". Without this the only way to ask was to
+    /// rebuild the whole entry and re-submit it, which answers by writing.
+    ///
+    /// Backed by the same unique index that makes the append idempotent, so it
+    /// is a lookup rather than a scan.
+    fn get_by_key(
+        &self,
+        key: &IdempotencyKey,
+    ) -> impl Future<Output = Result<Option<StoredEntry<P>>, Self::Error>> + Send;
+
     /// Reads a page of the log.
     fn page(&self, cursor: Cursor) -> impl Future<Output = Result<Page<P>, Self::Error>> + Send;
 
@@ -354,43 +400,70 @@ pub trait LedgerStore<const P: u8>: Send + Sync {
         async { self.len().await.map(|n| n == 0) }
     }
 
-    /// One account balance, optionally over a prefix of the log.
+    /// One account balance over the postings a query selects.
     ///
-    /// `size` is a **count of entries**, not an index: `Some(0)` is the empty
-    /// ledger and `None` is everything recorded so far. It is the same number a
-    /// [`TreeHead::size`] carries, so a balance and the root it belongs with are
-    /// always named the same way.
+    /// See [`BalanceQuery`] for the ways a report narrows, for why a log prefix
+    /// and a date range are different questions, and for which of an entry's two
+    /// dates the range applies to.
     fn balance(
         &self,
         key: BalanceKey,
-        size: Option<u64>,
+        query: BalanceQuery<'_>,
     ) -> impl Future<Output = Result<Balance<P>, Self::Error>> + Send;
 
-    /// The trial balance, optionally over a prefix of the log.
+    /// The trial balance over the postings a query selects.
     ///
-    /// `size` counts entries, exactly as in [`LedgerStore::balance`].
+    /// One method rather than one per predicate, because they are the same fold.
+    /// Three shapes carry their weight:
+    ///
+    /// - [`BalanceQuery::over_prefix`] takes a prefix of the log in *recording*
+    ///   order — the form that pairs with a [`TreeHead`].
+    /// - [`BalanceQuery::through`] is cumulative through a booking date. This is
+    ///   what [`Seal::trial_balance`] commits to, which makes it the only way to
+    ///   rebuild a seal's commitment and prove a row out of it — see
+    ///   [`prove_sealed_balance`](Self::prove_sealed_balance), which does that
+    ///   for you and checks the rebuild against the seal.
+    /// - [`BalanceQuery::between`] is a period's *activity* rather than the
+    ///   position it leaves behind, which is the difference between an income
+    ///   statement and a balance sheet.
+    ///
+    /// Any of them may be narrowed to a reporting axis with
+    /// [`BalanceQuery::matching`], and any of them folds by value date rather
+    /// than booking date with [`BalanceQuery::by_value_date`].
+    ///
+    /// # The hierarchical report
+    ///
+    /// A trial balance is flat. Folding it up the account tree —
+    /// [`Rollup`](crate::Rollup) — needs the registry as well, and both come
+    /// from this store, so no backend method is added for it:
+    ///
+    /// ```ignore
+    /// let registry = AccountRegistry::from_records(store.accounts().await?)?;
+    /// let balances = store.trial_balance(BalanceQuery::through(as_at)).await?;
+    /// let sheet = Rollup::of(&balances, &registry, Currency::EUR, Layer::Settled)?;
+    /// ```
+    ///
+    /// The fold is pure over those two values, so a report built this way and one
+    /// from [`Journal::rollup`](crate::Journal::rollup) are the same report.
     fn trial_balance(
         &self,
-        size: Option<u64>,
+        query: BalanceQuery<'_>,
     ) -> impl Future<Output = Result<TrialBalance<P>, Self::Error>> + Send;
 
-    /// The trial balance over everything booked on or before `end`.
+    /// Every value an axis takes across the ledger, in order.
     ///
-    /// Folds by **booking date**, not by log position, and that is the whole
-    /// distinction: [`trial_balance`](Self::trial_balance) takes a prefix of the
-    /// log in *recording* order, while a period's closing balance is cumulative
-    /// through its last day. Sealing March in April is the normal case, so at
-    /// the moment a seal is taken the log already holds April entries and the
-    /// two answers differ.
+    /// What a report needs before it can slice by that axis: the values are the
+    /// caller's, the engine never interprets one, and nothing else knows which
+    /// are actually in use.
     ///
-    /// This is what [`Seal::trial_balance`] commits to, which makes it the only
-    /// way to rebuild a seal's commitment and prove a row out of it — see
-    /// [`prove_sealed_balance`](Self::prove_sealed_balance), which does that for
-    /// you and checks the rebuild against the seal.
-    fn trial_balance_through_date(
+    /// Postings carrying no value for the axis are **not** represented. Reach
+    /// them with [`DimensionFilter::missing`](crate::DimensionFilter::missing),
+    /// and do reach them — a set of slices that ignores the unattributed
+    /// postings does not add up to the trial balance.
+    fn dimension_values(
         &self,
-        end: Date,
-    ) -> impl Future<Output = Result<TrialBalance<P>, Self::Error>> + Send;
+        axis: &str,
+    ) -> impl Future<Output = Result<Vec<crate::dimensions::Label>, Self::Error>> + Send;
 
     /// The tree head as of an earlier size.
     ///
@@ -418,10 +491,10 @@ pub trait LedgerStore<const P: u8>: Send + Sync {
 
     /// Proves the log at `old_size` is a prefix of the current log.
     ///
-    /// A proof from `old_size == 0` is **vacuous** — every log extends the empty
-    /// tree, so it constrains nothing about the newer one and verifies against
-    /// any root at the right size. See
-    /// [`ConsistencyProof::is_vacuous`](crate::ConsistencyProof::is_vacuous).
+    /// A proof from `old_size == 0` is **refused**, not returned: every log
+    /// extends the empty tree, so it would constrain nothing about the newer one
+    /// and its `true` would mean nothing. See
+    /// [`ConsistencyProof::verify`](crate::ConsistencyProof::verify).
     fn prove_consistency(
         &self,
         old_size: u64,
@@ -432,10 +505,10 @@ pub trait LedgerStore<const P: u8>: Send + Sync {
     /// The general form, for two auditors holding different archived heads and
     /// neither holding the current one.
     ///
-    /// A proof from `old_size == 0` is **vacuous** — every log extends the empty
-    /// tree, so it constrains nothing about the newer one and verifies against
-    /// any root at the right size. See
-    /// [`ConsistencyProof::is_vacuous`](crate::ConsistencyProof::is_vacuous).
+    /// A proof from `old_size == 0` is **refused**, not returned: every log
+    /// extends the empty tree, so it would constrain nothing about the newer one
+    /// and its `true` would mean nothing. See
+    /// [`ConsistencyProof::verify`](crate::ConsistencyProof::verify).
     fn prove_consistency_between(
         &self,
         old_size: u64,
@@ -479,6 +552,14 @@ pub trait LedgerStore<const P: u8>: Send + Sync {
     ///
     /// The period must be in [`PeriodState::Closing`]. On success it advances to
     /// [`PeriodState::Sealed`] and the seal is appended to the chain.
+    ///
+    /// # Cost
+    ///
+    /// `O(n)` in the log, for two reasons that were always going to be one: the
+    /// closing trial balance folds every posting, and the seal's consistency
+    /// proof is built from a replayed tree — the SQL backends persist the
+    /// subtree cover, not the interior nodes, so a path has to be recomputed.
+    /// Sealing is a per-period operation, not a write-path one.
     fn seal_period(
         &self,
         period: &PeriodId,
@@ -528,7 +609,9 @@ pub trait LedgerStore<const P: u8>: Send + Sync {
 
             // One recipe, one place: `SealedBalance::assemble` is what the
             // in-memory journal calls too, so a backend cannot drift from it.
-            let closing = self.trial_balance_through_date(definition.end).await?;
+            let closing = self
+                .trial_balance(BalanceQuery::through(definition.end))
+                .await?;
             let accounts = crate::account::AccountRegistry::from_records(self.accounts().await?)?;
             Ok(SealedBalance::assemble(seal, &closing, &accounts, key)?)
         }
@@ -613,17 +696,23 @@ pub trait LedgerStore<const P: u8>: Send + Sync {
         accounts: &[AccountId],
         currency: Currency,
         layer: Layer,
-        size: Option<u64>,
+        query: BalanceQuery<'_>,
     ) -> impl Future<Output = Result<BTreeMap<AccountId, Balance<P>>, Self::Error>> + Send;
 
     /// One account's movements, with the running balance after each.
     ///
     /// A balance says where an account ended up and nothing about how it got
     /// there. Paged, because an account statement over ten years is not a
-    /// response body.
+    /// response body — and narrowed by the same [`BalanceQuery`] every balance
+    /// read takes, so "this account, March, this reporting axis" is one query
+    /// rather than the whole history filtered by the caller.
+    ///
+    /// [`StatementPage::opening`] is the balance carried into the page, so a
+    /// date-scoped statement opens at the right figure instead of at zero.
     fn statement(
         &self,
         key: BalanceKey,
+        query: BalanceQuery<'_>,
         cursor: PostingCursor,
     ) -> impl Future<Output = Result<StatementPage<P>, Self::Error>> + Send;
 
@@ -632,12 +721,23 @@ pub trait LedgerStore<const P: u8>: Send + Sync {
     /// A checkpoint is a cache for a definition — the fold over the journal — so
     /// it is only safe if it can be re-derived. It carries the log position and
     /// the tree head it was taken against for exactly that reason.
+    ///
+    /// **Monotone.** Saving a checkpoint *earlier* than the one already stored
+    /// leaves the stored one in place. Overwriting would not record anything, it
+    /// would lose work — the next reader re-folds from further back — and it
+    /// would make the outcome of two racing writers depend on arrival order.
+    /// With the rule, the write is idempotent and order-independent, which is
+    /// what lets a caller checkpoint from more than one place without
+    /// coordinating.
     fn save_checkpoint(
         &self,
         checkpoint: &Checkpoint<P>,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
-    /// The most recent checkpoint for a key, if one was ever taken.
+    /// The furthest-advanced checkpoint for a key, if one was ever taken.
+    ///
+    /// "Furthest" rather than "last written", and the two are the same thing
+    /// because [`save_checkpoint`](Self::save_checkpoint) never goes backwards.
     fn load_checkpoint(
         &self,
         key: BalanceKey,
@@ -653,6 +753,12 @@ pub struct StatementLine<const P: u8> {
     pub posting: crate::clearing::PostingRef,
     /// The entry's booking date.
     pub booking_date: Date,
+    /// The entry's value date — when the money is treated as having moved.
+    ///
+    /// Carried alongside the booking date rather than instead of it, because a
+    /// statement folded [by value date](crate::DateBasis::Value) still has to
+    /// say which period each line belongs to.
+    pub value_date: Date,
     /// Which side the movement fell on.
     pub direction: crate::posting::Direction,
     /// The movement.
@@ -740,6 +846,29 @@ impl PostingCursor {
 /// A page of statement lines.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatementPage<const P: u8> {
+    /// The balance the account carried into this page.
+    ///
+    /// Two disjoint folds added together:
+    ///
+    /// 1. **What came before the window.** Every posting the query narrows to
+    ///    that was booked *before* its start date — see
+    ///    [`BalanceQuery::opening`]. That is what makes a March statement open
+    ///    at February's closing figure rather than at zero. Every other
+    ///    narrowing still applies: an opening balance for one reporting axis is
+    ///    over that axis.
+    /// 2. **What the earlier pages showed.** The statement's own lines up to and
+    ///    including the cursor this page resumed from.
+    ///
+    /// So `opening` plus the page's lines is the last line's
+    /// [`running`](StatementLine::running), and on the first page of a
+    /// date-scoped statement it is exactly the figure the period opened at.
+    ///
+    /// The first fold is by **date**, never by log position: entries are
+    /// appended in recording order, so a position bound would fold a later-dated
+    /// entry into the middle of the statement and leave a backdated one out of
+    /// the opening. See
+    /// [`Journal::statement_opening`](crate::Journal::statement_opening).
+    pub opening: Balance<P>,
     /// The lines, in log order.
     pub lines: Vec<StatementLine<P>>,
     /// Cursor for the next page, or `None` at the end.
@@ -795,12 +924,12 @@ pub trait DynLedgerStore<const P: u8>: Send + Sync {
     /// The current tree head.
     fn head_boxed(&self) -> BoxFuture<'_, Result<TreeHead, Self::Error>>;
 
-    /// One account balance, optionally as of a log position.
-    fn balance_boxed(
-        &self,
+    /// One account balance over the postings a query selects.
+    fn balance_boxed<'a>(
+        &'a self,
         key: BalanceKey,
-        size: Option<u64>,
-    ) -> BoxFuture<'_, Result<Balance<P>, Self::Error>>;
+        query: BalanceQuery<'a>,
+    ) -> BoxFuture<'a, Result<Balance<P>, Self::Error>>;
 }
 
 impl<const P: u8, S> DynLedgerStore<P> for S
@@ -828,12 +957,12 @@ where
         Box::pin(self.head())
     }
 
-    fn balance_boxed(
-        &self,
+    fn balance_boxed<'a>(
+        &'a self,
         key: BalanceKey,
-        size: Option<u64>,
-    ) -> BoxFuture<'_, Result<Balance<P>, Self::Error>> {
-        Box::pin(self.balance(key, size))
+        query: BalanceQuery<'a>,
+    ) -> BoxFuture<'a, Result<Balance<P>, Self::Error>> {
+        Box::pin(self.balance(key, query))
     }
 }
 
@@ -929,7 +1058,7 @@ impl<const P: u8> LedgerStore<P> for MemoryStore<P> {
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         let record = record.clone();
         let result = self.with_mut(|journal| {
-            journal.accounts_mut().restore(record)?;
+            journal.restore_account(record)?;
             Ok(())
         });
         async move { result }
@@ -958,6 +1087,24 @@ impl<const P: u8> LedgerStore<P> for MemoryStore<P> {
     ) -> impl Future<Output = Result<Option<StoredEntry<P>>, Self::Error>> + Send {
         let result = self.with(|journal| {
             let found = journal.index_of(id).and_then(|index| {
+                journal.at(index).map(|entry| StoredEntry {
+                    index: Some(index),
+                    entry: entry.clone(),
+                    content_hash: entry.content_hash(),
+                })
+            });
+            Ok(found)
+        });
+        async move { result }
+    }
+
+    fn get_by_key(
+        &self,
+        key: &IdempotencyKey,
+    ) -> impl Future<Output = Result<Option<StoredEntry<P>>, Self::Error>> + Send {
+        let key = key.clone();
+        let result = self.with(|journal| {
+            let found = journal.index_of_key(&key).and_then(|index| {
                 journal.at(index).map(|entry| StoredEntry {
                     index: Some(index),
                     entry: entry.clone(),
@@ -1015,25 +1162,25 @@ impl<const P: u8> LedgerStore<P> for MemoryStore<P> {
     fn balance(
         &self,
         key: BalanceKey,
-        size: Option<u64>,
+        query: BalanceQuery<'_>,
     ) -> impl Future<Output = Result<Balance<P>, Self::Error>> + Send {
-        let result = self.with(|journal| Ok(journal.balance(&key, size)?));
+        let result = self.with(|journal| Ok(journal.balance(&key, query)?));
         async move { result }
     }
 
     fn trial_balance(
         &self,
-        size: Option<u64>,
+        query: BalanceQuery<'_>,
     ) -> impl Future<Output = Result<TrialBalance<P>, Self::Error>> + Send {
-        let result = self.with(|journal| Ok(journal.trial_balance(size)?));
+        let result = self.with(|journal| Ok(journal.trial_balance(query)?));
         async move { result }
     }
 
-    fn trial_balance_through_date(
+    fn dimension_values(
         &self,
-        end: Date,
-    ) -> impl Future<Output = Result<TrialBalance<P>, Self::Error>> + Send {
-        let result = self.with(|journal| Ok(journal.trial_balance_through_date(end)?));
+        axis: &str,
+    ) -> impl Future<Output = Result<Vec<crate::dimensions::Label>, Self::Error>> + Send {
+        let result = self.with(|journal| Ok(journal.dimension_values(axis)));
         async move { result }
     }
 
@@ -1156,11 +1303,11 @@ impl<const P: u8> LedgerStore<P> for MemoryStore<P> {
         accounts: &[AccountId],
         currency: Currency,
         layer: Layer,
-        size: Option<u64>,
+        query: BalanceQuery<'_>,
     ) -> impl Future<Output = Result<BTreeMap<AccountId, Balance<P>>, Self::Error>> + Send {
         let wanted: Vec<AccountId> = accounts.to_vec();
         let result = self.with(|journal| {
-            let tb = journal.trial_balance(size)?;
+            let tb = journal.trial_balance(query)?;
             let mut out = BTreeMap::new();
             for account in wanted {
                 let key = BalanceKey {
@@ -1180,10 +1327,11 @@ impl<const P: u8> LedgerStore<P> for MemoryStore<P> {
     fn statement(
         &self,
         key: BalanceKey,
+        query: BalanceQuery<'_>,
         cursor: PostingCursor,
     ) -> impl Future<Output = Result<StatementPage<P>, Self::Error>> + Send {
         let result = self.with(|journal| {
-            let all = journal.statement(&key)?;
+            let all = journal.statement(&key, query)?;
             // Resume after a *posting*, not after an entry: one entry may put
             // several postings on this account, so a page can end inside one.
             let start = cursor.after.map_or(0usize, |after| {
@@ -1200,6 +1348,7 @@ impl<const P: u8> LedgerStore<P> for MemoryStore<P> {
                     index: l.index,
                     posting: l.posting,
                     booking_date: l.booking_date,
+                    value_date: l.value_date,
                     direction: l.direction,
                     amount: l.amount,
                     running: l.running,
@@ -1213,7 +1362,15 @@ impl<const P: u8> LedgerStore<P> for MemoryStore<P> {
                     after: Some(l.position()),
                     limit: cursor.limit,
                 });
-            Ok(StatementPage { lines, next })
+            // The cursor, not the first line: an exhausted cursor must still
+            // open at the figure the window closed at, and a page with no lines
+            // has no first line to bound with.
+            let opening = journal.statement_opening(&key, query, cursor.after)?;
+            Ok(StatementPage {
+                opening,
+                lines,
+                next,
+            })
         });
         async move { result }
     }
@@ -1224,7 +1381,14 @@ impl<const P: u8> LedgerStore<P> for MemoryStore<P> {
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
         let checkpoint = *checkpoint;
         let mut guard = self.checkpoints.lock().unwrap_or_else(|e| e.into_inner());
-        guard.insert(checkpoint.key, checkpoint);
+        // Never backwards: a checkpoint is a cache, and replacing a later one
+        // with an earlier one loses work rather than recording any.
+        let keep = guard
+            .get(&checkpoint.key)
+            .is_some_and(|stored| stored.size() > checkpoint.size());
+        if !keep {
+            guard.insert(checkpoint.key, checkpoint);
+        }
         async move { Ok(()) }
     }
 
@@ -1272,10 +1436,9 @@ mod tests {
 
     #[test]
     fn a_sealed_balance_is_provable_and_nameable_long_after_the_books_move_on() {
-        // The integration failure this exists for: `Seal::accounts` is the
-        // registry commitment as of the seal, and a proof built against the
-        // *current* registry does not verify under it. Onboard one customer and
-        // every already-sealed balance became unnameable.
+        // `Seal::accounts` is the registry commitment as of the seal, so a
+        // proof built against the *current* registry does not verify under it.
+        // Onboarding one customer must not make a sealed balance unnameable.
         use crate::account::BalanceLimit;
         use crate::money::{Amount, Currency};
         use crate::period::{Period, PeriodId, PeriodState};
@@ -1287,11 +1450,9 @@ mod tests {
         let (cash, revenue) = {
             let mut journal = store.snapshot();
             let cash = journal
-                .accounts_mut()
                 .register_path("Assets:Cash", date!(2026 - 01 - 01))
                 .expect("registers");
             let revenue = journal
-                .accounts_mut()
                 .register_path("Income:Sales", date!(2026 - 01 - 01))
                 .expect("registers");
             for record in journal.account_records() {
@@ -1343,20 +1504,17 @@ mod tests {
         conformance::block_on(store.transition_period(&march, PeriodState::Closing)).expect("ok");
         let seal = conformance::block_on(store.seal_period(&march)).expect("seals");
 
-        // Now the books move on, in every way that used to break the proof.
+        // Now the books move on, in every way that bears on the proof.
         {
             let mut journal = store.snapshot();
             journal
-                .accounts_mut()
                 .register_path("Assets:Bank", date!(2026 - 05 - 01))
                 .expect("registers");
             journal
-                .accounts_mut()
-                .close(cash, date!(2026 - 05 - 31))
+                .close_account(cash, date!(2026 - 05 - 31))
                 .expect("registered");
             journal
-                .accounts_mut()
-                .set_limit(revenue, BalanceLimit::NoDebitBalance)
+                .set_account_limit(revenue, BalanceLimit::NoDebitBalance)
                 .expect("registered");
             for record in journal.account_records() {
                 conformance::block_on(store.register_account(&record)).expect("restores");
@@ -1438,11 +1596,9 @@ mod tests {
         let (ar, revenue) = {
             let mut journal = store.snapshot();
             let ar = journal
-                .accounts_mut()
                 .register_path("Assets:AR", date!(2026 - 01 - 01))
                 .expect("registers");
             let revenue = journal
-                .accounts_mut()
                 .register_path("Income:Sales", date!(2026 - 01 - 01))
                 .expect("registers");
             for record in journal.account_records() {
@@ -1520,11 +1676,9 @@ mod tests {
         let (cash, revenue) = {
             let mut journal = store.snapshot();
             let cash = journal
-                .accounts_mut()
                 .register_path("Assets:Cash", date!(2026 - 01 - 01))
                 .expect("registers");
             let revenue = journal
-                .accounts_mut()
                 .register_path("Income:Sales", date!(2026 - 01 - 01))
                 .expect("registers");
             for record in journal.account_records() {
@@ -1570,9 +1724,13 @@ mod tests {
             currency: Currency::EUR,
             layer: Layer::Settled,
         };
-        let whole = conformance::block_on(store.statement(key, PostingCursor::start()))
-            .expect("reads")
-            .lines;
+        let whole = conformance::block_on(store.statement(
+            key,
+            BalanceQuery::all(),
+            PostingCursor::start(),
+        ))
+        .expect("reads")
+        .lines;
         assert_eq!(whole.len(), 3, "three postings hit this account");
 
         // Every page size must reproduce the one-page answer exactly, running
@@ -1581,7 +1739,8 @@ mod tests {
             let mut paged = Vec::new();
             let mut cursor = Some(PostingCursor::start().with_limit(limit));
             while let Some(c) = cursor {
-                let page = conformance::block_on(store.statement(key, c)).expect("reads");
+                let page = conformance::block_on(store.statement(key, BalanceQuery::all(), c))
+                    .expect("reads");
                 assert!(
                     !page.lines.is_empty() || page.next.is_none(),
                     "an empty page handed back another cursor"

@@ -27,8 +27,8 @@ use doubleentry::clearing::{Clearing, ClearingId};
 use doubleentry::entry::Draft;
 use doubleentry::period::{LedgerId, Period, PeriodId, PeriodState};
 use doubleentry::{
-    AccountId, AccountPath, Amount, BalanceKey, Currency, Description, Entry, EntryId, Hash,
-    IdempotencyKey, Journal, JournalError, Label, Layer,
+    AccountId, AccountPath, Amount, BalanceKey, BalanceQuery, Currency, Description, Entry,
+    EntryId, Hash, IdempotencyKey, Journal, JournalError, Label, Layer,
 };
 use proptest::prelude::*;
 use time::macros::date;
@@ -63,14 +63,33 @@ enum Op {
     SealPeriod,
     /// Append an entry backdated into an earlier month.
     ///
-    /// The operation that used to be able to restate a sealed period: a legal
+    /// The operation that could otherwise restate a sealed period: a legal
     /// booking whose date falls in a month a later seal already closed over,
     /// including months the calendar never defined as periods.
     AppendBackdated { amount: i64, month: u8, day: u8 },
-    /// Fund the limited account, or try to draw against it.
-    MoveLimited { amount: i64, into: bool },
+    /// Fund the limited account, or try to draw against it — settled, or as a
+    /// reservation in the pending layer. Both draw on the same headroom.
+    MoveLimited {
+        amount: i64,
+        into: bool,
+        reserve: bool,
+    },
     /// Impose or lift the limited account's balance limit.
     SetLimit { on: bool },
+    /// Reserve an amount: a balanced pair in the **pending** layer.
+    Hold { amount: i64 },
+    /// Discharge an earlier hold: release it in the pending layer and move the
+    /// money in the settled one, as one atomic entry.
+    Settle { which: usize },
+    /// Try to book an entry that only balances by netting one layer against the
+    /// other. Must always be refused.
+    NetAcrossLayers { amount: i64 },
+    /// Append an entry whose value date sits away from its booking date.
+    ///
+    /// The straddling booking — in one month's books and another's cash. It is
+    /// what separates the two date bases, so without it every value-dated
+    /// assertion below would check the booking-dated answer twice.
+    AppendStraddling { amount: i64, drift: i8 },
 }
 
 fn op_strategy() -> impl Strategy<Value = Op> {
@@ -90,9 +109,19 @@ fn op_strategy() -> impl Strategy<Value = Op> {
         // sealed month without ever touching a defined period.
         4 => (1i64..1_000_000, 1u8..7, 1u8..32)
             .prop_map(|(amount, month, day)| Op::AppendBackdated { amount, month, day }),
-        4 => (1i64..1_000_000, any::<bool>())
-            .prop_map(|(amount, into)| Op::MoveLimited { amount, into }),
+        4 => (1i64..1_000_000, any::<bool>(), any::<bool>())
+            .prop_map(|(amount, into, reserve)| Op::MoveLimited { amount, into, reserve }),
         1 => any::<bool>().prop_map(|on| Op::SetLimit { on }),
+        // Two-phase money. The pending layer is a second set of balances over
+        // the same accounts, and every rule that keys on `(account, currency,
+        // layer)` has to hold in it independently.
+        3 => (1i64..1_000_000).prop_map(|amount| Op::Hold { amount }),
+        3 => (0usize..32).prop_map(|which| Op::Settle { which }),
+        2 => (1i64..1_000_000).prop_map(|amount| Op::NetAcrossLayers { amount }),
+        // Drift in both directions and across the month boundary the statement
+        // window below is scoped to, so the two bases genuinely disagree.
+        3 => (1i64..1_000_000, -40i8..40)
+            .prop_map(|(amount, drift)| Op::AppendStraddling { amount, drift }),
     ]
 }
 
@@ -110,6 +139,8 @@ struct World {
     all_ids: Vec<EntryId>,
     /// Clearings recorded so far.
     clearings: Vec<ClearingId>,
+    /// Holds placed and not yet discharged, as the amounts they reserved.
+    holds: Vec<i64>,
     /// Periods already sealed.
     sealed: usize,
     next_key: u64,
@@ -119,15 +150,12 @@ impl World {
     fn new() -> Self {
         let mut journal = Journal::<2>::new(test_ledger());
         let left = journal
-            .accounts_mut()
             .register_path("Sim:Left", date!(2000 - 01 - 01))
             .expect("registers");
         let right = journal
-            .accounts_mut()
             .register_path("Sim:Right", date!(2000 - 01 - 01))
             .expect("registers");
         let limited = journal
-            .accounts_mut()
             .register_path("Sim:Limited", date!(2000 - 01 - 01))
             .expect("registers");
         Self {
@@ -138,6 +166,7 @@ impl World {
             recorded: Vec::new(),
             all_ids: Vec::new(),
             clearings: Vec::new(),
+            holds: Vec::new(),
             sealed: 0,
             next_key: 0,
         }
@@ -148,12 +177,22 @@ impl World {
         format!("sim-{}", self.next_key).into_bytes()
     }
 
-    fn limited_key(&self) -> BalanceKey {
-        BalanceKey {
-            account: self.limited,
-            currency: Currency::EUR,
-            layer: Layer::Settled,
-        }
+    /// The limited account's settled and pending balances — both, because a
+    /// limit is one question about the two together.
+    fn limited_balances(&self) -> (doubleentry::Balance<2>, doubleentry::Balance<2>) {
+        let at = |layer| {
+            self.journal
+                .balance(
+                    &BalanceKey {
+                        account: self.limited,
+                        currency: Currency::EUR,
+                        layer,
+                    },
+                    BalanceQuery::all(),
+                )
+                .expect("no overflow")
+        };
+        (at(Layer::Settled), at(Layer::Pending))
     }
 
     fn build(&self, key: &[u8], amount: i64) -> Option<Entry<Draft, 2>> {
@@ -292,26 +331,31 @@ impl World {
                 let _ = self.journal.reset_clearing(id, date!(2026 - 07 - 01));
             }
 
-            Op::MoveLimited { amount, into } => {
+            Op::MoveLimited {
+                amount,
+                into,
+                reserve,
+            } => {
                 let key = self.key();
                 let Ok(k) = IdempotencyKey::new(key) else {
                     return;
                 };
                 let amount = Eur::from_minor(*amount);
-                let draft = Entry::<Draft, 2>::new(EntryId::generate(), k, date!(2026 - 06 - 15));
-                let draft = if *into {
-                    draft.debit(self.limited, amount, Currency::EUR).credit(
-                        self.right,
-                        amount,
-                        Currency::EUR,
-                    )
+                let layer = if *reserve {
+                    Layer::Pending
                 } else {
-                    draft.credit(self.limited, amount, Currency::EUR).debit(
-                        self.right,
-                        amount,
-                        Currency::EUR,
-                    )
+                    Layer::Settled
                 };
+                let (debit, credit) = if *into {
+                    (self.limited, self.right)
+                } else {
+                    (self.right, self.limited)
+                };
+                let draft = Entry::<Draft, 2>::new(EntryId::generate(), k, date!(2026 - 06 - 15))
+                    .post(doubleentry::Posting::debit(debit, amount, Currency::EUR).in_layer(layer))
+                    .post(
+                        doubleentry::Posting::credit(credit, amount, Currency::EUR).in_layer(layer),
+                    );
                 let id = draft.id();
                 let limit = self.journal.accounts().limit_of(self.limited);
                 match self.journal.record(draft) {
@@ -324,13 +368,11 @@ impl World {
                         // exact — a limit imposed later on an account already
                         // past it is legal and does not retroactively falsify
                         // anything that was booked before.
-                        let balance = self
-                            .journal
-                            .balance(&self.limited_key(), None)
-                            .expect("no overflow");
+                        let (settled, pending) = self.limited_balances();
                         assert!(
-                            limit.permits(&balance),
-                            "an accepted entry breached a {limit} limit: {balance:?}"
+                            limit.permits(&settled, &pending),
+                            "an accepted entry breached a {limit} limit: \
+                             settled {settled:?}, pending {pending:?}"
                         );
                     }
                     // The limit and a sealed period are the only refusals a
@@ -349,9 +391,119 @@ impl World {
                 // Imposing a limit is master data and always succeeds, even on
                 // an account already past it: it governs the next booking only.
                 self.journal
-                    .accounts_mut()
-                    .set_limit(self.limited, limit)
+                    .set_account_limit(self.limited, limit)
                     .expect("the account is registered");
+            }
+
+            Op::Hold { amount } => {
+                let key = self.key();
+                let Ok(idem) = IdempotencyKey::new(key) else {
+                    return;
+                };
+                let draft =
+                    Entry::<Draft, 2>::new(EntryId::generate(), idem, date!(2026 - 06 - 15))
+                        .post(
+                            doubleentry::Posting::debit(
+                                self.left,
+                                Eur::from_minor(*amount),
+                                Currency::EUR,
+                            )
+                            .in_layer(Layer::Pending),
+                        )
+                        .post(
+                            doubleentry::Posting::credit(
+                                self.right,
+                                Eur::from_minor(*amount),
+                                Currency::EUR,
+                            )
+                            .in_layer(Layer::Pending),
+                        );
+                if self.journal.record(draft).is_ok() {
+                    self.holds.push(*amount);
+                }
+            }
+
+            Op::Settle { which } => {
+                if self.holds.is_empty() {
+                    return;
+                }
+                let index = *which % self.holds.len();
+                let amount = self.holds[index];
+                let key = self.key();
+                let Ok(idem) = IdempotencyKey::new(key) else {
+                    return;
+                };
+                // One entry, four postings: the hold comes off in the pending
+                // layer and the money moves in the settled one. Each layer
+                // balances on its own, which is what validation requires.
+                let draft =
+                    Entry::<Draft, 2>::new(EntryId::generate(), idem, date!(2026 - 06 - 15))
+                        .post(
+                            doubleentry::Posting::credit(
+                                self.left,
+                                Eur::from_minor(amount),
+                                Currency::EUR,
+                            )
+                            .in_layer(Layer::Pending),
+                        )
+                        .post(
+                            doubleentry::Posting::debit(
+                                self.right,
+                                Eur::from_minor(amount),
+                                Currency::EUR,
+                            )
+                            .in_layer(Layer::Pending),
+                        )
+                        .debit(self.left, Eur::from_minor(amount), Currency::EUR)
+                        .credit(self.right, Eur::from_minor(amount), Currency::EUR);
+                if self.journal.record(draft).is_ok() {
+                    self.holds.remove(index);
+                }
+            }
+
+            Op::NetAcrossLayers { amount } => {
+                let key = self.key();
+                let Ok(idem) = IdempotencyKey::new(key) else {
+                    return;
+                };
+                let before = self.journal.len();
+                let draft =
+                    Entry::<Draft, 2>::new(EntryId::generate(), idem, date!(2026 - 06 - 15))
+                        .post(
+                            doubleentry::Posting::debit(
+                                self.left,
+                                Eur::from_minor(*amount),
+                                Currency::EUR,
+                            )
+                            .in_layer(Layer::Pending),
+                        )
+                        .credit(self.right, Eur::from_minor(*amount), Currency::EUR);
+
+                // It nets to zero in EUR and leaves both layers out of balance.
+                // Accepting it would falsify `verify_balanced` permanently, and
+                // an append-only log has no way back.
+                assert!(
+                    matches!(self.journal.record(draft), Err(JournalError::Invalid(_))),
+                    "an entry that only balances across layers was accepted"
+                );
+                assert_eq!(self.journal.len(), before, "a refused entry still appended");
+            }
+
+            Op::AppendStraddling { amount, drift } => {
+                let booked = date!(2026 - 06 - 15);
+                let Some(valued) = booked.checked_add(time::Duration::days(i64::from(*drift)))
+                else {
+                    return;
+                };
+                let key = self.key();
+                let Some(entry) = self.build_on(&key, *amount, booked) else {
+                    return;
+                };
+                let entry = entry.with_value_date(valued);
+                let id = entry.id();
+                if self.journal.record(entry).is_ok() {
+                    self.all_ids.push(id);
+                }
             }
 
             Op::AppendBackdated { amount, month, day } => {
@@ -443,6 +595,29 @@ impl World {
             );
         }
 
+        // The model's view of the pending layer must match the journal's. A
+        // hold reserves without moving, and discharging it releases exactly what
+        // it reserved — so the outstanding reservations are the pending net,
+        // and `verify_balanced` above has already said each layer balances on
+        // its own.
+        let outstanding: i64 = self.holds.iter().sum();
+        let pending = self
+            .journal
+            .balance(
+                &BalanceKey {
+                    account: self.left,
+                    currency: Currency::EUR,
+                    layer: Layer::Pending,
+                },
+                BalanceQuery::all(),
+            )
+            .expect("no overflow");
+        assert_eq!(
+            pending.signed_net().expect("no overflow"),
+            Eur::from_minor(outstanding),
+            "the pending layer disagrees with the holds still outstanding"
+        );
+
         // A checkpoint taken now must still verify now, and one taken over the
         // empty prefix must verify however far the log has grown.
         for account in [self.left, self.limited] {
@@ -481,7 +656,7 @@ impl World {
                 .expect("a sealed period stays defined");
             let recomputed = self
                 .journal
-                .trial_balance_through_date(period.end)
+                .trial_balance(BalanceQuery::through(period.end))
                 .expect("no overflow");
             assert_eq!(
                 doubleentry::seal::trial_balance_head(&recomputed),
@@ -509,6 +684,77 @@ impl World {
                         "entry {i} was booked on {} — at or before the sealed \
                          watermark of {through} — after the last seal was taken",
                         entry.booking_date()
+                    );
+                }
+            }
+        }
+
+        // A hierarchical report redistributes the trial balance and never
+        // changes it: every own-balance sits under exactly one root, so the
+        // roots reproduce the totals. `Sim` is never registered, so this also
+        // pins that an inferred grouping node collects its children.
+        for layer in [Layer::Settled, Layer::Pending] {
+            let sheet = self
+                .journal
+                .rollup(BalanceQuery::all(), Currency::EUR, layer)
+                .expect("no overflow");
+            let flat = self
+                .journal
+                .trial_balance(BalanceQuery::all())
+                .expect("no overflow");
+            assert_eq!(
+                sheet.total().expect("no overflow"),
+                flat.totals(Currency::EUR, layer).expect("no overflow"),
+                "the rollup stopped adding up to the trial balance"
+            );
+            for node in sheet.nodes() {
+                let mut folded = node.own;
+                for child in sheet.nodes() {
+                    if child.path.parent().as_ref() == Some(&node.path) {
+                        folded = folded
+                            .checked_add(&child.subtree)
+                            .expect("a subset of the books cannot overflow");
+                    }
+                }
+                assert_eq!(
+                    folded, node.subtree,
+                    "{} is not its own balance plus its children",
+                    node.path
+                );
+            }
+        }
+
+        // A statement opens where the window before it closed, on either date
+        // basis — the identity that makes a statement a statement.
+        for account in [self.left, self.right, self.limited] {
+            let key = BalanceKey {
+                account,
+                currency: Currency::EUR,
+                layer: Layer::Settled,
+            };
+            let window = BalanceQuery::between(date!(2026 - 06 - 01), date!(2026 - 06 - 30));
+            for query in [window, window.by_value_date()] {
+                let lines = self.journal.statement(&key, query).expect("no overflow");
+                let opening = self
+                    .journal
+                    .statement_opening(&key, query, None)
+                    .expect("no overflow");
+                let mut folded = opening;
+                for line in &lines {
+                    folded
+                        .add(line.direction, line.amount)
+                        .expect("a subset of the books cannot overflow");
+                    assert_eq!(
+                        folded, line.running,
+                        "the running balance left the fold behind"
+                    );
+                    // Resuming after any line reproduces that line's total, so a
+                    // page opens where the previous one closed.
+                    assert_eq!(
+                        self.journal
+                            .statement_opening(&key, query, Some(line.position()))
+                            .expect("no overflow"),
+                        line.running
                     );
                 }
             }
@@ -563,7 +809,7 @@ proptest! {
                 expected.apply(posting).expect("no overflow");
             }
         }
-        prop_assert_eq!(world.journal.trial_balance(None).expect("ok"), expected);
+        prop_assert_eq!(world.journal.trial_balance(BalanceQuery::all()).expect("ok"), expected);
     }
 }
 

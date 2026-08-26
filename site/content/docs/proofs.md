@@ -72,6 +72,8 @@ The boundary: a head has to come from somewhere the verifier already trusts. Han
 the walk a fabricated head that agrees with a forged proof and it is satisfied —
 that is what "published head" means, and why publishing one to an auditor or an
 append-only location is the step that makes any of this evidence.
+[Witnessing](@/docs/witness.md) is how that step is made to hold against an
+operator who would rather publish two.
 
 ## Proving against an archived head
 
@@ -112,9 +114,34 @@ This is what makes a published tree head useful. Publishing a head — to an
 auditor, a timestamping service, or any append-only location — turns detectable
 tampering into tampering detectable *by someone else*.
 
-Consistency with the empty tree is a special case the verifier still checks: it
-confirms the root it was handed *is* the empty root, so nobody can "prove"
-consistency with a history that never existed.
+### Never from the empty tree
+
+`old_size == 0` is refused at both ends: `consistency_proof(0)` returns
+`ProofError::EmptyOldTree`, and a hand-built proof with `old_size: 0` fails
+`verify`.
+
+The statement such a proof makes is *true of every history that has ever
+existed* — each one extends the empty tree — so it constrains neither the new
+root nor anything else. An auditor who archived a head **before the first entry**
+would get `true` back from a check that examined nothing, and nothing in that
+`true` distinguishes it from a genuine verification.
+
+Refusing at construction alone would not be enough, because a proof arrives over
+a wire and its fields are public. Both ends refuse, so a `true` from `verify`
+always means something was checked.
+
+[RFC 9162 §2.1.4.2](https://www.rfc-editor.org/rfc/rfc9162#section-2.1.4.2)
+defines consistency only for `0 < m ≤ n`, and Go's `tlog.ProveTree` refuses
+`m < 1` for the same reason. Archive a head with at least one entry in it.
+
+### The one attack this cannot see
+
+Which leaves a gap the walk is powerless against: an operator who publishes *two*
+heads, to two parties, with a complete and internally consistent log behind each.
+Every proof either party checks verifies, because there is nothing wrong inside
+either view. That is a **split view**, and closing it needs a party who is not the
+operator and who remembers what they were shown before — see
+[witnessing](@/docs/witness.md).
 
 ## What is hashed
 
@@ -174,19 +201,51 @@ for an entry hash.
 
 ## Cost
 
-Appending is amortised `O(1)`: the log keeps the roots of the perfect subtrees
-covering its leaves — one node per set bit in the size — and a new leaf merges
-with any equal-sized subtree already on the stack. Reading the current root is
-`O(log n)`.
+Everything is logarithmic, because **the log stores the tree** rather than only
+the leaves.
 
-Historical roots and proofs are derived from the stored leaves and cost `O(n)`.
-They are audit-time operations, not write-path ones. The SQL backends are the
-exception for `head_at`, which is a single indexed row read: every entry stores
-the root as of its own sequencing, so a historical head never needs a replay.
+| Operation | Cost |
+|---|---|
+| Append | amortised `O(1)` — one node per subtree that closes |
+| Current root or head | `O(log n)` |
+| Historical root or head | `O(log n)` |
+| Inclusion proof | `O(log n)` |
+| Consistency proof | `O(log n)` |
+| Whole-log structural check | `O(n)`, audit-time |
 
-A durable backend persists only the subtree stack (`MerkleAccumulator`), which
-lets it answer "what is the root now" from `O(log n)` rows rather than rebuilding
-the tree from every content hash it has ever stored. Restoring that stack checks
-its *shape* against the claimed size rather than trusting it, so a row lost,
-duplicated or returned out of order is caught rather than producing a
-plausible-looking wrong root.
+Storage is `2n − popcount(n)` hashes: just under two per entry.
+
+### Why store interior nodes
+
+A proof is `O(log n)` hashes, but *producing* one from leaves alone means
+rebuilding every interior node on the way — reading back every content hash in
+the ledger and holding them at once. At a hundred million entries that is
+gigabytes of memory to answer a question whose answer is under a kilobyte.
+
+A node whose subtree is complete can never change in an append-only log, so it is
+written once and read back forever; only the ragged right edge is folded at read
+time. The SQL backends keep those nodes in a `log_nodes` table with an integer
+primary key, INSERT-only and monotonic like `entries` itself, and a proof reads
+at most `1 + ⌈log₂ n⌉` rows — 28 for a hundred million entries.
+
+This is the layout Certificate Transparency, Trillian and Go's `sumdb/tlog` use,
+and the numbering is `tlog`'s exactly, so it is one other transparency-log
+tooling already understands.
+
+### One algorithm, two homes
+
+The in-memory log and the SQL backends run *the same* plan-and-assemble
+functions: a plan names the `O(log n)` node positions, the caller fetches them
+however it likes, and a pure fold turns them into a proof. A proof from a
+database and a proof from memory are therefore the same proof.
+
+RFC 6962's definitions — `MTH`, `PATH`, `SUBPROOF` — are kept, transcribed
+literally, as a test-only reference. The fast path is compared against them
+exhaustively over every size and position up to 130 leaves, and the golden
+vectors pin the answer they agree on.
+
+### Pruning does not break it
+
+Because the tree lives apart from the entries, archiving a prefix to a
+[cold tier](@/docs/cold-tier.md) leaves proofs working. The log keeps its length
+and its root; the archive supplies the leaf a proof is checked against.

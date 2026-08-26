@@ -1,7 +1,7 @@
 +++
 title = "Cold tier"
 description = "Compacting sealed periods into Apache Iceberg so the operational database stays small and the archive stays verifiable."
-weight = 15
+weight = 16
 +++
 
 ## Why archive at all
@@ -69,33 +69,29 @@ It does not delete anything from the operational store. Pruning hot storage is a
 retention decision with legal weight, and a library that made it for you would be
 making it wrongly for someone.
 
-## If you do prune, know what it costs
+## If you do prune, the tree survives it
 
 Compaction is worth doing on its own — a queryable columnar mirror any engine can
 read — and pruning is a separate decision you make afterwards, if at all.
 
-A store builds its inclusion and consistency proofs from the leaves it holds. So
-removing an archived prefix renumbers every leaf after it, and the store can no
-longer build a proof for **any** entry — not only the archived ones. The tree
-head does not notice: it is read from the last row's stored root, so head and
-proofs would disagree silently.
+When you do, **proofs keep working**. The SQL backends keep the Merkle tree in
+its own table (`log_nodes`), so archiving a prefix of `entries` leaves it
+untouched: the log keeps its length and its root, and an inclusion proof for an
+archived entry is built and verified exactly as before.
 
-That is the shape of failure this crate refuses to ship, so the SQL backends
-check that the log they read back is dense from zero and return `LogNotDense`,
-naming the hole:
+That is the arrangement an archive is *for*. The proof comes from the hot store;
+the entry it is checked against comes from Iceberg:
 
-```text
-the log is missing entries: expected log index 0, found 5;
-proofs are built from the stored leaves and a hole renumbers every one after it
+```rust
+let proof = store.prove_inclusion_at(index, archived_head.size).await?;
+// … the leaf comes from the Parquet file, not from the pruned row …
+assert!(proof.verify(&archived_entry.content_hash(), &archived_head));
 ```
 
-Without the check, an index past the shortened set reported `IndexOutOfRange` for
-an index that is genuinely in range, and one *inside* it returned a proof for a
-different entry — caught only if the caller verified before handing it to an
-auditor.
-
-Proofs over an archived period come from the archive and its seal after that.
-The seal is in the snapshot summary precisely so they can.
+What pruning costs is the entry bodies: `get` stops finding them, a
+statement stops listing them, and a balance folded over the pruned range comes
+out short. Those answers live in the archive now — which is why the seal is in
+the snapshot summary.
 
 The cold tier is off by default — it pulls in Arrow, Parquet and object storage,
 which is a large dependency surface for a feature most deployments do not need.

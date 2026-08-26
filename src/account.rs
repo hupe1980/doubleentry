@@ -8,9 +8,20 @@
 //! Two rules are enforced, because both are structural rather than
 //! jurisdictional:
 //!
-//! - **Only leaves are postable.** An account with children is an aggregation
-//!   path. Posting to both a node and its descendants makes rollups
-//!   double-count, and no reporting layer can repair it afterwards.
+//! - **Only leaves are postable.** An account with registered descendants is an
+//!   aggregation path. An account that is both a bucket and a container has two
+//!   defensible balances — its own postings, and its subtree's — and every
+//!   report has to pick one silently. Nothing downstream can un-mix them,
+//!   because both readings are of the same rows.
+//!
+//!   The rule is checked when an entry is validated, and again when an account
+//!   is registered: a leaf that has been posted to cannot acquire a child.
+//!   Without the second half the first is a trap — registering the child turns
+//!   the parent into a node, every later entry on it is refused *including the
+//!   reversal that would correct it*, and the balance already there can never be
+//!   moved. The registry cannot see that, since it holds no postings, so the
+//!   check lives on [`Journal`](crate::Journal) and on every
+//!   [`LedgerStore`](crate::LedgerStore).
 //! - **Postings fall inside the account's open window.** An account has an
 //!   opening date and an optional closing date.
 //!
@@ -314,8 +325,9 @@ impl AccountKind {
 /// that must never carry the wrong sign.
 ///
 /// The limit is checked when an entry is recorded, against the balance the entry
-/// would leave behind, **per currency and per layer independently**. It is a
-/// rule about what may be written next, exactly like an account's open window:
+/// would leave behind, **per currency**, folding the settled and pending layers
+/// into one answer — see [`headroom_minor`](BalanceLimit::headroom_minor). It is
+/// a rule about what may be written next, exactly like an account's open window:
 /// it never invalidates what is already recorded, and an entry that breaches it
 /// is refused whole rather than partly applied.
 ///
@@ -341,19 +353,62 @@ pub enum BalanceLimit {
 }
 
 impl BalanceLimit {
-    /// True when `balance` satisfies this limit.
+    /// How much room is left under this limit, in minor units.
     ///
-    /// Decided by comparing the gross totals rather than by netting them, which
-    /// is the same question — the net crosses zero exactly when the totals cross
-    /// each other — and is total: there is no subtraction to overflow, so no
-    /// balance exists that this cannot answer for.
+    /// Negative when the limit is breached, and the magnitude is what would have
+    /// to come back the other way to restore it. `None` for
+    /// [`Unlimited`](BalanceLimit::Unlimited), which has no room to run out of.
+    ///
+    /// # What the reservations do
+    ///
+    /// The settled net alone is not the answer, because a reservation is money
+    /// already promised. Both layers are folded, but **asymmetrically**: a
+    /// pending net working *against* the limit consumes room, and one working
+    /// *for* it grants none. An outflow you have committed to is gone; an inflow
+    /// you have merely reserved has not arrived.
+    ///
+    /// So a wallet limited to [`NoDebitBalance`](BalanceLimit::NoDebitBalance),
+    /// funded with 100 and holding a reservation of 30, has 70 left — and a
+    /// second reservation of 80 is refused, which is the whole point of putting
+    /// a limit on a wallet. Discharging the first reservation nets its pending
+    /// side back to zero and the room returns.
+    ///
+    /// Computed in `i128` from two `i64` totals, so it is **total**: no balance
+    /// exists that this cannot answer for, and there is no overflow to report.
     #[must_use]
-    pub fn permits<const P: u8>(self, balance: &Balance<P>) -> bool {
+    // Every operand is an `i64` widened to `i128`, so each net is bounded by
+    // `2^64` and the sum of two by `2^65` — six orders of magnitude short of
+    // `i128::MAX`. Nothing here can overflow, which is what makes the answer
+    // total, and routing it through `checked_*` would return an `Option` that
+    // is never `None` and obscure that.
+    #[allow(clippy::arithmetic_side_effects)]
+    pub fn headroom_minor<const P: u8>(
+        self,
+        settled: &Balance<P>,
+        pending: &Balance<P>,
+    ) -> Option<i128> {
+        // Signed nets, debit positive.
+        let s = i128::from(settled.debits.to_minor()) - i128::from(settled.credits.to_minor());
+        let q = i128::from(pending.debits.to_minor()) - i128::from(pending.credits.to_minor());
         match self {
-            Self::Unlimited => true,
-            Self::NoCreditBalance => balance.debits >= balance.credits,
-            Self::NoDebitBalance => balance.credits >= balance.debits,
+            Self::Unlimited => None,
+            // The net must stay on the debit side. A pending *credit* net is the
+            // adverse direction, so only that is subtracted.
+            Self::NoCreditBalance => Some(s + q.min(0)),
+            // Mirrored: the net must stay on the credit side, and a pending
+            // *debit* net is the adverse one.
+            Self::NoDebitBalance => Some(-(s + q.max(0))),
         }
+    }
+
+    /// True when `settled` and `pending` together satisfy this limit.
+    ///
+    /// See [`headroom_minor`](Self::headroom_minor) for how the two layers are
+    /// folded, and why the fold is asymmetric.
+    #[must_use]
+    pub fn permits<const P: u8>(self, settled: &Balance<P>, pending: &Balance<P>) -> bool {
+        self.headroom_minor(settled, pending)
+            .is_none_or(|room| room >= 0)
     }
 
     /// True for [`BalanceLimit::Unlimited`].
@@ -489,11 +544,10 @@ impl Canonical for Account {
 
 /// Encodes a date as year, month, day.
 ///
-/// The year is a signed `i32`, which is the type [`Date::year`] returns and
-/// covers every date `time` can represent under any feature set. An earlier
-/// revision split it into a magnitude and a sign bit, which needed a clamp — and
-/// a clamp inside a hash preimage is a silent collision waiting for someone to
-/// enable a wider date range.
+/// The year is a signed `i32` — the type [`Date::year`] returns, covering every
+/// date `time` can represent under any feature set. Splitting it into a magnitude
+/// and a sign bit would need a clamp, and a clamp inside a hash preimage is a
+/// silent collision waiting for a wider date range to be enabled.
 pub(crate) fn encode_date(w: &mut CanonicalWriter, d: Date) {
     w.i32(d.year());
     w.u8(u8::from(d.month()));
@@ -536,15 +590,21 @@ impl Canonical for AccountRecord {
 /// *out*. They are master data — the registry's own mutators
 /// ([`AccountRegistry::close`], [`AccountRegistry::reopen`],
 /// [`AccountRegistry::set_limit`]) exist to change them, and they govern what
-/// may be booked next rather than what was booked already. Hashing them in made
-/// the commitment move every time an account was legitimately closed, which
-/// retroactively invalidated every binding proof against every earlier seal:
-/// a normal Tuesday afternoon read as evidence of tampering.
+/// may be booked next rather than what was booked already. Hashing them in would
+/// move the commitment every time an account was legitimately closed,
+/// invalidating every binding proof against every earlier seal: a normal Tuesday
+/// afternoon reading as evidence of tampering.
 ///
-/// This is the same rule the crate already applies to entries — an entry stays
-/// readable after its account closes, because validation is about what may be
-/// written next, not about what was written. A seal names handles; it is not a
-/// snapshot of the chart of accounts.
+/// A seal names handles; it is not a snapshot of the chart of accounts.
+///
+/// # What that costs
+///
+/// The ledger therefore records master data's **current** state, not its
+/// history: nothing says when an account was closed or by whom, and none of it
+/// is tamper-evident. Keep that history where you keep your other administrative
+/// events. What *is* guaranteed is narrower — a handle's path is immutable, and
+/// renumbering the handle space is caught against every seal by
+/// [`SealChain::verify_against_accounts`](crate::SealChain::verify_against_accounts).
 #[must_use]
 pub fn account_binding_leaf(id: AccountId, path: &AccountPath) -> Hash {
     let mut w = CanonicalWriter::new();
@@ -566,12 +626,8 @@ pub fn account_binding_leaf(id: AccountId, path: &AccountPath) -> Hash {
 /// `Assets:Cash` — without disclosing any other account, balance, or entry.
 ///
 /// It carries the handle and the path and no other account field, because those
-/// are the only ones it establishes. An earlier revision carried the whole
-/// [`Account`], of which the proof vouched for everything; the leaf then moved
-/// whenever master data did, so historical proofs stopped verifying. Returning
-/// fields a proof does not cover would be the opposite mistake — a verifier
-/// reading `closed_on` off a "verified" proof would be reading whatever the
-/// prover put there.
+/// are the only ones it establishes. A verifier reading `closed_on` off a
+/// "verified" proof would be reading whatever the prover put there.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct AccountBindingProof {
@@ -910,6 +966,38 @@ impl AccountRegistry {
         self.binding_log().head()
     }
 
+    /// The commitment the registry had when it held `size` handles.
+    ///
+    /// A registry only ever grows — handles are dense positions and are never
+    /// reissued — so its history is exactly its own prefixes, and this
+    /// reconstructs any of them.
+    ///
+    /// A [`Seal`](crate::Seal) records
+    /// [`accounts`](crate::Seal::accounts) as it stood when the period closed,
+    /// and the registry has grown since — so comparing against the *current*
+    /// commitment would fail for every seal but the last.
+    /// [`SealChain::verify_against_accounts`](crate::SealChain::verify_against_accounts)
+    /// compares against this.
+    ///
+    /// `None` when the registry has not issued that many handles: it cannot
+    /// speak for a size it never reached.
+    #[must_use]
+    pub fn commitment_at(&self, size: u64) -> Option<TreeHead> {
+        let n = usize::try_from(size).ok()?;
+        let prefix = self.accounts.get(..n)?;
+        let leaves = prefix
+            .iter()
+            .enumerate()
+            .map(|(i, account)| {
+                account_binding_leaf(
+                    AccountId(u32::try_from(i).unwrap_or(u32::MAX)),
+                    &account.path,
+                )
+            })
+            .collect();
+        Some(MerkleLog::from_leaves(leaves).head())
+    }
+
     /// The Merkle log the commitment is the root of.
     ///
     /// Leaves are in handle order, so a handle is its own leaf index — which is
@@ -1075,6 +1163,55 @@ mod tests {
         let ancestors: Vec<String> = p.ancestors().iter().map(ToString::to_string).collect();
         assert_eq!(ancestors, vec!["A", "A:B"]);
         assert!(AccountPath::parse("A").expect("valid").parent().is_none());
+    }
+
+    #[test]
+    fn a_historical_commitment_is_the_registry_that_stopped_there() {
+        let mut registry = reg();
+        for path in ["A:One", "B:Two", "C:Three"] {
+            registry
+                .register_path(path, date!(2020 - 01 - 01))
+                .expect("registers");
+        }
+        for n in 0..=3usize {
+            let mut partial = reg();
+            for path in ["A:One", "B:Two", "C:Three"].iter().take(n) {
+                partial
+                    .register_path(path, date!(2020 - 01 - 01))
+                    .expect("registers");
+            }
+            assert_eq!(
+                registry
+                    .commitment_at(n as u64)
+                    .expect("within the registry"),
+                partial.commitment(),
+                "at {n} handles"
+            );
+        }
+        // It cannot speak for a size it never reached.
+        assert!(registry.commitment_at(4).is_none());
+    }
+
+    #[test]
+    fn master_data_does_not_move_the_commitment() {
+        // The property the whole design of the binding leaf rests on: closing an
+        // account on a Tuesday must not invalidate every binding proof against
+        // every seal ever issued.
+        let mut registry = reg();
+        let id = registry
+            .register_path("Assets:Cash", date!(2020 - 01 - 01))
+            .expect("registers");
+        registry
+            .register_path("Income:Sales", date!(2020 - 01 - 01))
+            .expect("registers");
+        let before = registry.commitment();
+
+        registry.close(id, date!(2026 - 06 - 30)).expect("closes");
+        registry
+            .set_limit(id, BalanceLimit::NoCreditBalance)
+            .expect("limits");
+        assert_eq!(registry.commitment(), before);
+        assert_eq!(registry.commitment_at(2).expect("in range"), before);
     }
 
     #[test]
@@ -1335,35 +1472,93 @@ mod tests {
         assert!(r.prove_binding_at(AccountId::from_index(0), 99).is_none());
     }
 
+    /// Builds a balance from `(debit, credit)` gross totals in minor units.
+    fn bal(debits: i64, credits: i64) -> Balance<2> {
+        Balance {
+            debits: crate::money::Amount::<2>::from_minor(debits),
+            credits: crate::money::Amount::<2>::from_minor(credits),
+        }
+    }
+
     #[test]
     fn a_limit_constrains_the_net_and_ignores_the_gross() {
-        use crate::money::Amount;
-        use crate::posting::Direction;
-
-        let mut heavy = Balance::<2>::ZERO;
-        heavy
-            .add(Direction::Debit, Amount::<2>::from_minor(1_000))
-            .expect("ok");
-        heavy
-            .add(Direction::Credit, Amount::<2>::from_minor(1_000))
-            .expect("ok");
-
         // Turnover in both directions, net zero: every limit tolerates it.
+        let heavy = bal(1_000, 1_000);
         for limit in [
             BalanceLimit::Unlimited,
             BalanceLimit::NoCreditBalance,
             BalanceLimit::NoDebitBalance,
         ] {
-            assert!(limit.permits(&heavy), "{limit} should permit a zero net");
+            assert!(
+                limit.permits(&heavy, &Balance::ZERO),
+                "{limit} should permit a zero net"
+            );
         }
 
-        let mut overdrawn = Balance::<2>::ZERO;
-        overdrawn
-            .add(Direction::Credit, Amount::<2>::from_minor(1))
-            .expect("ok");
-        assert!(BalanceLimit::Unlimited.permits(&overdrawn));
-        assert!(!BalanceLimit::NoCreditBalance.permits(&overdrawn));
-        assert!(BalanceLimit::NoDebitBalance.permits(&overdrawn));
+        let overdrawn = bal(0, 1);
+        assert!(BalanceLimit::Unlimited.permits(&overdrawn, &Balance::ZERO));
+        assert!(!BalanceLimit::NoCreditBalance.permits(&overdrawn, &Balance::ZERO));
+        assert!(BalanceLimit::NoDebitBalance.permits(&overdrawn, &Balance::ZERO));
+    }
+
+    #[test]
+    fn a_reservation_consumes_headroom_and_an_expected_inflow_does_not() {
+        // A wallet funded with 100, limited so it cannot be drawn past what it
+        // holds. This is the case the whole two-layer fold exists for.
+        let funded = bal(0, 100);
+        let limit = BalanceLimit::NoDebitBalance;
+        assert_eq!(limit.headroom_minor(&funded, &Balance::ZERO), Some(100));
+
+        // A reservation of 30 is money already promised: it takes 30 of room.
+        let held = bal(30, 0);
+        assert_eq!(limit.headroom_minor(&funded, &held), Some(70));
+        assert!(limit.permits(&funded, &held));
+
+        // A second reservation of 80 would put it 10 past the limit.
+        assert_eq!(limit.headroom_minor(&funded, &bal(110, 0)), Some(-10));
+        assert!(!limit.permits(&funded, &bal(110, 0)));
+
+        // Discharging the first reservation nets its pending side to zero and
+        // moves 30 into the settled layer. The room comes back.
+        assert_eq!(limit.headroom_minor(&bal(30, 100), &bal(30, 30)), Some(70));
+
+        // A reservation the *other* way is an inflow that has not arrived, and
+        // grants no room at all.
+        assert_eq!(limit.headroom_minor(&funded, &bal(0, 500)), Some(100));
+    }
+
+    #[test]
+    fn the_two_limits_are_mirror_images() {
+        // Same arithmetic, opposite side: a cash box that cannot be overdrawn.
+        let funded = bal(500, 0);
+        let limit = BalanceLimit::NoCreditBalance;
+        assert_eq!(limit.headroom_minor(&funded, &Balance::ZERO), Some(500));
+        // A reserved outflow from an asset is a pending credit.
+        assert_eq!(limit.headroom_minor(&funded, &bal(0, 100)), Some(400));
+        assert_eq!(limit.headroom_minor(&funded, &bal(0, 550)), Some(-50));
+        // A reserved inflow grants nothing until it settles.
+        assert_eq!(limit.headroom_minor(&funded, &bal(900, 0)), Some(500));
+        // And an unlimited account has no room to run out of.
+        assert_eq!(
+            BalanceLimit::Unlimited.headroom_minor(&funded, &bal(0, 9_999)),
+            None
+        );
+    }
+
+    #[test]
+    fn headroom_is_total_at_the_extremes() {
+        // Every path is `i128` arithmetic over two `i64`s, so no balance exists
+        // that this cannot answer for — including ones that would overflow if
+        // the totals were added in `i64`.
+        let extreme = bal(i64::MAX, i64::MIN);
+        for limit in [
+            BalanceLimit::Unlimited,
+            BalanceLimit::NoCreditBalance,
+            BalanceLimit::NoDebitBalance,
+        ] {
+            let _ = limit.headroom_minor(&extreme, &extreme);
+            let _ = limit.permits(&extreme, &extreme);
+        }
     }
 
     #[test]

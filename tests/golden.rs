@@ -8,23 +8,13 @@
 //! These vectors are the tripwire. A change here is either a mistake, or a
 //! deliberate format revision.
 //!
-//! A deliberate revision now means three things, because the crate is published
-//! and ledgers exist that were written by earlier versions:
+//! Ledgers exist that were written by earlier versions, so a deliberate revision
+//! means three things:
 //!
 //! 1. Regenerating these values — `just golden-emit` prints them.
 //! 2. **Bumping the encoding version in the domain tag** for whatever moved, so
-//!    a root computed under the old rule and one computed under the new rule are
-//!    not both labelled `v1`.
-//! 3. Writing down in `CHANGELOG.md` what an existing ledger has to do.
-//!
-//! Two revisions shipped *without* step 2, and the tags are correspondingly
-//! ambiguous across published versions: the entry encoding moved in `0.3.0`
-//! under `doubleentry/entry/v1`, and the account-binding leaf moved in `0.5.0`
-//! under `doubleentry/accountbinding/v1`. Neither can cause a misreading — the
-//! preimages differ in length, so verification simply fails rather than
-//! accepting the wrong thing — and re-tagging them now would break every ledger
-//! written since for a relabelling. They are recorded here rather than repaired,
-//! and the rule binds from `0.6.0` on.
+//!    two roots computed under different rules are not both labelled `v1`.
+//! 3. Recording in `CHANGELOG.md` what an existing ledger has to do.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
@@ -32,10 +22,10 @@ use doubleentry::account::{AccountId, AccountRegistry};
 use doubleentry::balance::TrialBalance;
 use doubleentry::canonical::Canonical;
 use doubleentry::entry::{Draft, LedgerPolicy, SealContext};
-use doubleentry::merkle::TreeHead;
+use doubleentry::merkle::ConsistencyProof;
 use doubleentry::merkle::{MerkleLog, empty_root, leaf_hash};
 use doubleentry::period::{LedgerId, PeriodCalendar, PeriodId};
-use doubleentry::seal::{PeriodCoverage, Seal};
+use doubleentry::seal::{PeriodCoverage, Seal, SealChain, SealChainError};
 use doubleentry::{
     Amount, Balanced, Currency, Description, Dimensions, DocumentRef, Entry, EntryId, Hash,
     IdempotencyKey, Label, Posting, Provenance,
@@ -146,6 +136,30 @@ fn the_reference_entry_content_hash_is_unchanged() {
     );
 }
 
+/// The predecessor the reference seal chains onto.
+///
+/// A real seal over the first two leaves of [`reference_log`]. A seal carries a
+/// consistency proof from its predecessor's tree, so the vector pins that
+/// proof's encoding as well as the rest of the preimage — which a fabricated
+/// predecessor hash could not.
+fn reference_predecessor() -> Seal {
+    Seal::build::<2>(
+        LedgerId::new("golden-ledger").expect("valid"),
+        PeriodId::new("2026-02").expect("valid"),
+        PeriodCoverage::spanning(0, 1, 2),
+        &MerkleLog::from_leaves((0..2u64).map(leaf).collect()),
+        &TrialBalance::<2>::new(),
+        AccountRegistry::new().commitment(),
+        None,
+    )
+    .expect("builds")
+}
+
+/// The log the reference seals are taken over.
+fn reference_log() -> MerkleLog {
+    MerkleLog::from_leaves((0..4u64).map(leaf).collect())
+}
+
 /// The reference seal.
 ///
 /// Built from fixed inputs rather than from a journal, so the vector pins the
@@ -176,16 +190,113 @@ fn reference_seal() -> Seal {
         LedgerId::new("golden-ledger").expect("valid"),
         PeriodId::new("2026-03").expect("valid"),
         PeriodCoverage::spanning(0, 3, 4),
-        TreeHead {
-            size: 4,
-            root: Hash::from_bytes([0x44; 32]),
-        },
+        &reference_log(),
         &tb,
         // The registry the balances above are keyed on. Pinned through the seal
         // hash, so a change to the account-binding encoding shows up here too.
         accounts.commitment(),
-        Some(Hash::from_bytes([0x55; 32])),
+        Some(&reference_predecessor()),
     )
+    .expect("builds")
+}
+
+/// The consistency proof a chained seal carries is part of its preimage.
+///
+/// Pinned separately from the seal hash so a change to the proof's canonical
+/// encoding is reported as what it is, rather than as an unexplained seal-hash
+/// drift. The encoding also has to survive a database round trip, which is what
+/// the decode half checks.
+#[test]
+fn the_reference_seals_consistency_proof_is_unchanged() {
+    let seal = reference_seal();
+    let proof = seal
+        .prev_consistency
+        .as_ref()
+        .expect("a chained seal carries one");
+    assert_eq!(proof.old_size, 2);
+    assert_eq!(proof.new_size, 4);
+    assert_eq!(
+        path_hex(&proof.path),
+        "90c8784125097b93c6fad57be10970c4d937e8e70171d23215c5a31372dfeb71",
+        "the consistency path a seal commits to changed"
+    );
+
+    let bytes = proof.to_canonical_bytes();
+    assert_eq!(
+        ConsistencyProof::from_canonical_bytes(&bytes).as_ref(),
+        Ok(proof),
+        "the encoding a backend stores has to decode back to the same proof"
+    );
+    assert!(
+        ConsistencyProof::from_canonical_bytes(&bytes[..bytes.len() - 1]).is_err(),
+        "a truncated encoding must be refused, not silently shortened"
+    );
+}
+
+/// The chain check that the seal hash alone cannot make.
+///
+/// The scenario is the one that matters: a seal has already been **published**,
+/// so it cannot be retracted, and the operator wants to rewrite history that
+/// falls before it and carry on sealing.
+///
+/// Every rule the chain had before consistency proofs is satisfiable in that
+/// position. The next seal can name the published one's hash, hash correctly to
+/// its own contents, grow its tree size, and grow its registry. What it cannot
+/// do is *prove* that its log extends the published one's — because it does not.
+#[test]
+fn a_chain_over_a_rewritten_history_is_refused() {
+    let ledger = LedgerId::new("golden-ledger").expect("valid");
+
+    // Published, and therefore fixed: an auditor holds this.
+    let published = reference_predecessor();
+    let chain = SealChain::from_seals(ledger.clone(), [published.clone(), reference_seal()])
+        .expect("the real chain verifies");
+    assert!(chain.verify().is_ok());
+    assert!(chain.verify_against_log(&reference_log()).is_ok());
+
+    // The books are rewritten underneath it: same sizes, different second leaf.
+    let mut rewritten = MerkleLog::new();
+    rewritten.append(leaf(0));
+    rewritten.append(leaf(9_999));
+    for i in 2..4u64 {
+        rewritten.append(leaf(i));
+    }
+    assert_eq!(rewritten.len(), reference_log().len());
+    assert_ne!(rewritten.root(), reference_log().root());
+
+    // The next seal cannot even be *built* against the published predecessor:
+    // the rewritten log has no prefix that is the published tree.
+    let attempt = Seal::build::<2>(
+        ledger.clone(),
+        PeriodId::new("2026-03").expect("valid"),
+        PeriodCoverage::spanning(0, 3, 4),
+        &rewritten,
+        &TrialBalance::<2>::new(),
+        AccountRegistry::new().commitment(),
+        Some(&published),
+    );
+    assert!(
+        matches!(attempt, Err(SealChainError::NotAPrefix { .. })),
+        "a seal that could never chain must not be constructible, got {attempt:?}"
+    );
+
+    // Nor by hand. This is what an attacker with write access produces: a real
+    // seal, re-pointed at a different predecessor and re-hashed, so it is
+    // internally perfect and names the published seal correctly.
+    let mut forged = reference_seal();
+    forged.tree_head = rewritten.head();
+    forged.prev_seal = Some(published.seal_hash);
+    forged.seal_hash = forged.compute_hash();
+    assert!(forged.is_self_consistent(), "re-hashed, as a forger would");
+    assert_eq!(forged.prev_seal, Some(published.seal_hash));
+    assert!(forged.tree_head.size >= published.tree_head.size);
+
+    let mut chain = SealChain::new(ledger);
+    chain.push(published).expect("the published seal stands");
+    assert!(
+        matches!(chain.push(forged), Err(SealChainError::NotAPrefix { .. })),
+        "every other rule passes; the consistency proof is what refuses this"
+    );
 }
 
 #[test]
@@ -195,7 +306,7 @@ fn the_reference_seal_hash_is_unchanged() {
     // issued, so it is pinned separately from the entry encoding.
     assert_eq!(
         reference_seal().seal_hash.to_hex(),
-        "5dbfe84f0637f0f6e5a3670a7675c1a46f5c97b8887fb68d38bf1b008f4d2b65",
+        "08a34f13c9fc43a1d7babb8053dc3d877a24b405b84f96c402b947a2b0b1cda8",
         "the seal hash changed; see this file's module docs"
     );
 }
@@ -229,9 +340,8 @@ fn master_data_does_not_move_the_binding_commitment() {
     // The leaf covers the handle and the path — identity — and nothing else.
     // A limit, a classification and an open window are master data: mutable by
     // design, governing what may be booked next rather than what was booked
-    // already. Hashing them in made every routine close or limit change
-    // retroactively invalidate every binding proof against every earlier seal,
-    // which is why this vector asserts the opposite of what it once did.
+    // already. Hashing them in would make every routine close or limit change
+    // retroactively invalidate every binding proof against every earlier seal.
     let mut changed = reference_registry();
     changed
         .set_limit(
@@ -399,6 +509,14 @@ fn emit_vectors() {
     println!("ENCODING={hex}");
     println!("ENTRY_HASH={}", e.content_hash().to_hex());
     println!("SEAL_HASH={}", reference_seal().seal_hash.to_hex());
+    println!(
+        "SEAL_PREV_CONSISTENCY={}",
+        reference_seal()
+            .prev_consistency
+            .as_ref()
+            .map(|p| path_hex(&p.path))
+            .unwrap_or_default()
+    );
     println!(
         "ACCOUNTS_ROOT={}",
         reference_registry().commitment().root.to_hex()

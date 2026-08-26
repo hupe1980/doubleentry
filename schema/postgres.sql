@@ -146,25 +146,12 @@ CREATE TABLE IF NOT EXISTS entries (
     reverses                UUID,
     original_booking_date   DATE,
 
-    -- The Merkle tree root *after* this entry, so a head query is a single row
-    -- read rather than a rebuild from every content hash ever stored. Historical
-    -- heads are equally cheap, which is what pins a checkpoint to one history.
-    --
-    -- NULL until the entry is sequenced: a root only means something once the
-    -- entry has a position.
-    tree_root           BYTEA,
-
     -- When the row was written. Audit metadata only: ordering is by log_index,
     -- because a wall clock is neither monotonic nor agreed between writers.
     recorded_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
 
     CONSTRAINT entries_log_index_non_negative CHECK (log_index IS NULL OR log_index >= 0),
     CONSTRAINT entries_content_hash_width CHECK (octet_length(content_hash) = 32),
-    CONSTRAINT entries_tree_root_width CHECK (
-        tree_root IS NULL OR octet_length(tree_root) = 32
-    ),
-    -- A position and a root are assigned together or not at all.
-    CONSTRAINT entries_sequenced_pair CHECK ((log_index IS NULL) = (tree_root IS NULL)),
     PRIMARY KEY (entry_id),
     UNIQUE (log_index),
     UNIQUE (idempotency_key),
@@ -183,6 +170,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS entries_one_reversal_each
     ON entries (reverses) WHERE reverses IS NOT NULL;
 
 CREATE INDEX IF NOT EXISTS entries_booking_date ON entries (booking_date);
+-- Both dates are queryable: a `BalanceQuery` folds by booking date by default
+-- and by value date when asked, and the two answer different questions — the
+-- books versus the cash. An index on one and not the other would make the
+-- second a sequential scan.
+CREATE INDEX IF NOT EXISTS entries_value_date ON entries (value_date);
 CREATE INDEX IF NOT EXISTS entries_log_order ON entries (log_index)
     WHERE log_index IS NOT NULL;
 -- The sequencer's working set: everything not yet placed, oldest transaction
@@ -190,24 +182,33 @@ CREATE INDEX IF NOT EXISTS entries_log_order ON entries (log_index)
 CREATE INDEX IF NOT EXISTS entries_unsequenced ON entries (insert_xid, entry_id)
     WHERE log_index IS NULL;
 
--- ── merkle accumulator ──────────────────────────────────────────────────────
+-- ── merkle nodes ────────────────────────────────────────────────────────────
 --
--- The perfect-subtree roots covering the log: one row per set bit in the size,
--- so `O(log n)` rows. Updated inside the append, which is already serialised.
+-- The tree, and the only thing that defines it. A completed subtree never
+-- changes in an append-only log, so this table is INSERT-only with a monotonic
+-- key: record `n` appends `1 + trailing_zeros(n + 1)` rows at consecutive
+-- positions. Storage is `2n - popcount(n)` rows; a proof reads at most
+-- `1 + ceil(log2 n)` of them.
 --
--- This is derived state — it can always be rebuilt from `entries.content_hash`
--- in log order — but keeping it means an append costs `O(log n)` instead of
--- rebuilding the whole tree.
+-- Numbering is Go `sumdb/tlog`'s. See `merkle::nodes` for it and for why the
+-- interior nodes are stored at all.
+--
+-- Two consequences worth knowing before changing anything here. There is no
+-- subtree-cover table and no root column on `entries`, because both are the same
+-- `O(log n)` lookup and a second copy of a derived value can stop agreeing with
+-- the first. And because the tree lives here rather than in `entries`, archiving
+-- a prefix of `entries` to a cold tier costs no proofs.
 
-CREATE TABLE IF NOT EXISTS log_subtrees (
-    -- Height of the perfect subtree, 0 for a single leaf.
-    height          SMALLINT    NOT NULL,
+CREATE TABLE IF NOT EXISTS log_nodes (
+    -- Dense position in the order nodes become complete. Level 0 is a leaf hash;
+    -- a level-L node covers 2^L consecutive records. `merkle::nodes::index_of`
+    -- and `split_index` are the two directions of the mapping.
+    node_index      BIGINT      NOT NULL,
     node            BYTEA       NOT NULL,
-    -- Ordering position, largest subtree first.
-    position        SMALLINT    NOT NULL,
 
-    CONSTRAINT log_subtrees_width CHECK (octet_length(node) = 32),
-    PRIMARY KEY (height)
+    CONSTRAINT log_nodes_width CHECK (octet_length(node) = 32),
+    CONSTRAINT log_nodes_index_non_negative CHECK (node_index >= 0),
+    PRIMARY KEY (node_index)
 );
 
 -- ── postings ────────────────────────────────────────────────────────────────
@@ -265,26 +266,38 @@ CREATE INDEX IF NOT EXISTS posting_dimensions_lookup
 -- application-level and database-level enforcement fail independently, and this
 -- is the invariant worth paying for twice. DEFERRED so an entry's postings may
 -- be inserted in any order within one transaction.
-CREATE OR REPLACE FUNCTION postings_balance_per_currency() RETURNS trigger AS $$
+--
+-- Grouped by currency *and layer*, which is the same key every balance in this
+-- schema is reported against — `postings_account`, `checkpoints`, the
+-- `open_items` view, the trial balance a seal commits to. An entry whose
+-- pending side were offset by a settled one would net to zero per currency and
+-- leave both layers permanently out of balance, and nothing downstream could
+-- repair it: these tables are INSERT-only.
+CREATE OR REPLACE FUNCTION postings_balance_per_currency_and_layer() RETURNS trigger AS $$
 BEGIN
     IF EXISTS (
         SELECT 1
         FROM postings
         WHERE entry_id = NEW.entry_id
-        GROUP BY currency
+        GROUP BY currency, layer
         HAVING SUM(CASE WHEN direction = 'D' THEN amount_minor ELSE -amount_minor END) <> 0
     ) THEN
-        RAISE EXCEPTION 'entry % is unbalanced in at least one currency', NEW.entry_id;
+        RAISE EXCEPTION 'entry % is unbalanced in at least one currency and layer',
+            NEW.entry_id;
     END IF;
     RETURN NULL;
 END;
 $$ LANGUAGE plpgsql;
 
+-- Dropped by its old name too, so a database created before the rule was keyed
+-- on the layer does not keep enforcing the weaker one alongside it.
+DROP FUNCTION IF EXISTS postings_balance_per_currency() CASCADE;
+
 DROP TRIGGER IF EXISTS postings_balanced ON postings;
 CREATE CONSTRAINT TRIGGER postings_balanced
     AFTER INSERT ON postings
     DEFERRABLE INITIALLY DEFERRED
-    FOR EACH ROW EXECUTE FUNCTION postings_balance_per_currency();
+    FOR EACH ROW EXECUTE FUNCTION postings_balance_per_currency_and_layer();
 
 -- An entry needs at least two postings to be double-entry.
 CREATE OR REPLACE FUNCTION postings_at_least_two() RETURNS trigger AS $$
@@ -343,6 +356,20 @@ CREATE TABLE IF NOT EXISTS seals (
     accounts_root       BYTEA       NOT NULL,
 
     prev_seal           BYTEA,
+
+    -- Proof that the predecessor's log is a *prefix* of this seal's log, in the
+    -- crate's canonical encoding. It is what makes the chain say the history was
+    -- only appended to rather than merely that the seals are in order; without
+    -- it, a log rebuilt between two closes satisfies every other constraint
+    -- here.
+    --
+    -- NULL only for the genesis seal and for one following a predecessor whose
+    -- tree was empty. `SealChain` refuses any other NULL.
+    --
+    -- Covered by seal_hash, so it cannot be swapped for a proof relating a
+    -- different pair of trees.
+    prev_consistency    BYTEA,
+
     seal_hash           BYTEA       NOT NULL,
 
     -- Position in the chain. Explicit, because the chain has a definite order

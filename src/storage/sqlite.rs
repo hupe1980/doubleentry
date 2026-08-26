@@ -14,6 +14,23 @@
 //! either fails under contention or, worse, commits against a stale read and
 //! duplicates an index.
 //!
+//!
+//! # How the tree is stored
+//!
+//! In `log_nodes`, apart from the entries: every Merkle node whose subtree is
+//! complete, keyed by its position in the order nodes become complete. A
+//! completed subtree can never change in an append-only log, so the table is
+//! INSERT-only with a monotonic key, exactly like `entries`.
+//!
+//! Two things follow. A proof reads at most `1 + ceil(log2 n)` rows rather than
+//! replaying the whole log, and archiving a prefix of `entries` to a
+//! [cold tier](crate::storage::iceberg) leaves the tree — and therefore every
+//! proof — intact.
+//!
+//! There is no stored root beside it. A head at any size is the same `O(log n)`
+//! lookup, so a root column would be a second copy of a derived value, and two
+//! fields that must agree are two fields that can disagree.
+//!
 //! # What SQLite cannot enforce
 //!
 //! No deferrable constraint triggers, so the balance invariant is not checked a
@@ -38,7 +55,7 @@ use time::Date;
 use crate::account::{
     Account, AccountId, AccountKind, AccountPath, AccountRecord, AccountRegistry, BalanceLimit,
 };
-use crate::balance::{Balance, BalanceKey, TrialBalance};
+use crate::balance::{Balance, BalanceKey, BalanceQuery, DateBasis, TrialBalance};
 use crate::checkpoint::Checkpoint;
 use crate::clearing::{Clearing, ClearingError, ClearingId, OpenItem, PostingPosition, PostingRef};
 use crate::dimensions::{Dimensions, Label};
@@ -48,9 +65,9 @@ use crate::entry::{
 };
 use crate::hash::Hash;
 use crate::journal::{LogIndex, Recorded};
+use crate::merkle::nodes;
 use crate::merkle::{
-    ConsistencyProof, InclusionProof, MalformedAccumulator, MerkleAccumulator, MerkleLog,
-    ProofError, TreeHead, empty_root,
+    ConsistencyProof, InclusionProof, MalformedAccumulator, MerkleAccumulator, ProofError, TreeHead,
 };
 use crate::money::{Amount, Currency, MoneyError};
 use crate::period::{LedgerId, Period, PeriodCalendar, PeriodId, PeriodState};
@@ -85,17 +102,41 @@ pub enum SqliteError {
     /// A proof could not be built.
     #[error(transparent)]
     Proof(#[from] ProofError),
-    /// The stored log is not dense from zero, so no proof can be built from it.
+    /// A Merkle node the tree requires is not in the store.
+    ///
+    /// Nodes are written once, never updated and never deleted, so a missing one
+    /// is not a state the engine can reach: it means the rows read back are not
+    /// the rows written. Named rather than skipped, because folding around a
+    /// hole would produce a proof that verifies against a root nobody else
+    /// computes.
     #[error(
-        "the log is missing entries: expected log index {expected}, found {found}; \
-         proofs are built from the stored leaves and a hole renumbers every one after it"
+        "merkle node {index} is missing; nodes are append-only, so this is a \
+         partial restore or a table something else has written to"
     )]
-    LogNotDense {
-        /// The index the sequence required.
-        expected: u64,
-        /// The index actually present.
-        found: u64,
+    MissingNode {
+        /// The storage position that could not be read.
+        index: u64,
     },
+    /// The nodes read back are not the ones a proof plan asked for.
+    #[error(transparent)]
+    Nodes(#[from] crate::merkle::nodes::MalformedNodes),
+    /// The node store holds a count no whole number of records produces.
+    ///
+    /// A record writes all of its nodes or none of them, inside the transaction
+    /// that writes the entry, so this is not a state an append can leave behind.
+    /// It means a partial restore, or something other than the engine writing to
+    /// the table.
+    #[error(
+        "the node store holds {nodes} nodes, which no number of records \
+         produces; this is a partial restore rather than a log"
+    )]
+    PartialLog {
+        /// How many nodes are held.
+        nodes: u64,
+    },
+    /// A seal did not chain onto the one before it.
+    #[error(transparent)]
+    Seal(#[from] crate::seal::SealChainError),
     /// A sealed balance could not be proven.
     #[error(transparent)]
     SealedBalance(#[from] crate::seal::SealedBalanceError),
@@ -138,7 +179,7 @@ pub enum SqliteError {
         /// The offending identifier.
         id: ClearingId,
     },
-    /// The persisted Merkle accumulator does not describe the stored log.
+    /// The subtree cover read back does not describe a log of the claimed size.
     #[error(transparent)]
     Accumulator(#[from] MalformedAccumulator),
     /// The entry identifier is already used by a different entry.
@@ -153,6 +194,20 @@ pub enum SqliteError {
     /// The pool opens connections without foreign-key enforcement.
     #[error(transparent)]
     ForeignKeysDisabled(#[from] ForeignKeysDisabled),
+    /// Registering this path would put postings on an aggregation node.
+    ///
+    /// Only leaves are postable, and the named ancestor has already been posted
+    /// to. See [`JournalError::AncestorHasPostings`](crate::JournalError::AncestorHasPostings).
+    #[error(
+        "cannot register {path}: its ancestor {ancestor} has already been posted \
+         to, and only leaves are postable"
+    )]
+    AncestorHasPostings {
+        /// The path being registered.
+        path: String,
+        /// The registered ancestor that already carries postings.
+        ancestor: String,
+    },
     /// A handle was re-registered against a different account path.
     ///
     /// The path at a handle is what every posting row and every sealed balance
@@ -163,22 +218,21 @@ pub enum SqliteError {
         /// The offending handle.
         id: AccountId,
     },
-    /// An entry would leave an account on a side its balance limit forbids.
+    /// An entry would leave an account past its balance limit.
     #[error(
-        "account {account} in {currency} ({layer}) would net to {net_minor} \
-         minor units, which its {limit} limit forbids"
+        "account {account} in {currency} would be {} minor units past its \
+         {limit} limit",
+        .headroom_minor.saturating_neg()
     )]
     LimitBreached {
         /// The account whose limit would be breached.
         account: AccountId,
         /// The currency the limit was breached in.
         currency: Currency,
-        /// The layer the limit was breached in.
-        layer: Layer,
         /// The limit in force.
         limit: BalanceLimit,
-        /// The signed net the entry would leave, debit positive.
-        net_minor: i64,
+        /// Room left under the limit, in minor units — negative here.
+        headroom_minor: i128,
     },
     /// The database already holds a different ledger.
     #[error("this database holds ledger {found}, not {expected}")]
@@ -310,89 +364,171 @@ impl<const P: u8> SqliteStore<P> {
         Ok(PeriodCalendar::from_periods(self.periods().await?)?)
     }
 
-    /// Reads every leaf, checking the log is dense from zero.
+    /// How many records the node store describes.
     ///
-    /// **Checked, not trusted**, for the same reason
-    /// [`MerkleAccumulator::try_from_parts`] checks the subtree cover: a tree
-    /// built from whatever rows come back is a plausible-looking wrong tree.
+    /// Derived from `log_nodes` rather than counted from `entries`, because the
+    /// nodes **are** the log: an entry archived to a cold tier and pruned from
+    /// hot storage leaves the tree exactly as it was, and a size counted from
+    /// surviving rows would shrink underneath every proof and every seal.
     ///
-    /// The leaves *are* the log here, so a hole renumbers every leaf after it.
-    /// The head is unaffected — it is read from the last row's stored root — so
-    /// the two would disagree silently: `prove_inclusion` for an index past the
-    /// shortened set reports `IndexOutOfRange` for an index that is genuinely in
-    /// range, and one inside it returns a proof for a *different* entry, caught
-    /// only if the caller verifies before handing it on.
-    ///
-    /// Rows do not go missing on their own. They go missing when hot storage is
-    /// pruned after a [cold-tier](crate::storage::iceberg) compaction, when a
-    /// restore is partial, or when `DELETE` was granted on a table the schema
-    /// says to withhold it from. All three are worth naming rather than
-    /// discovering through a proof that will not verify.
-    async fn log(&self) -> Result<MerkleLog, SqliteError> {
-        let rows = sqlx::query(
-            "SELECT log_index, content_hash FROM entries \
-             WHERE log_index IS NOT NULL ORDER BY log_index",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-        let mut leaves = Vec::with_capacity(rows.len());
-        for (position, row) in rows.iter().enumerate() {
-            let stored: i64 = row.try_get("log_index")?;
-            let expected = i64::try_from(position).unwrap_or(i64::MAX);
-            if stored != expected {
-                return Err(SqliteError::LogNotDense {
-                    expected: u64::try_from(expected).unwrap_or(0),
-                    found: u64::try_from(stored).unwrap_or(0),
-                });
-            }
-            leaves.push(hash_from_bytes(
-                &row.try_get::<Vec<u8>, _>("content_hash")?,
-            )?);
-        }
-        Ok(MerkleLog::from_leaves(leaves))
+    /// One indexed row read: the highest position held, inverted through
+    /// [`nodes::count`]. A record writes all of its nodes or none of them, so a
+    /// count that lands between two sizes is a partially applied append — which
+    /// a transaction rules out, and which is named rather than rounded off.
+    async fn log_size<'e, E>(executor: E) -> Result<u64, SqliteError>
+    where
+        E: sqlx::Executor<'e, Database = Sqlite>,
+    {
+        let row = sqlx::query("SELECT MAX(node_index) AS top FROM log_nodes")
+            .fetch_one(executor)
+            .await?;
+        let top: Option<i64> = row.try_get("top")?;
+        let Some(top) = top else { return Ok(0) };
+        let held = u64::try_from(top).unwrap_or(0).saturating_add(1);
+        nodes::size_from_count(held).ok_or(SqliteError::PartialLog { nodes: held })
     }
 
+    /// Reads the nodes a plan named, **in plan order**.
+    ///
+    /// One query however many nodes are wanted, which is at most
+    /// `1 + ceil(log2 n)` — 64 rows for a log of every entry that will ever
+    /// exist. The result is reordered to the plan rather than returned in
+    /// primary-key order: a plan's output is consumed positionally, so a
+    /// silently reordered read would assemble a well-formed proof of the wrong
+    /// shape.
+    ///
+    /// A position the store cannot produce is named rather than skipped. Nodes
+    /// are never updated and never deleted, so a missing one means the rows read
+    /// back are not the rows written.
+    async fn read_nodes<'e, E>(executor: E, want: &[u64]) -> Result<Vec<Hash>, SqliteError>
+    where
+        E: sqlx::Executor<'e, Database = Sqlite>,
+    {
+        if want.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut sql = Sql::default();
+        let placeholders: Vec<String> = want
+            .iter()
+            .map(|index| sql.int(i64::try_from(*index).unwrap_or(i64::MAX)))
+            .collect();
+        let text = format!(
+            "SELECT node_index, node FROM log_nodes WHERE node_index IN ({})",
+            placeholders.join(",")
+        );
+        let rows = sql.apply(sqlx::query(&text)).fetch_all(executor).await?;
+
+        let mut found: BTreeMap<u64, Hash> = BTreeMap::new();
+        for row in &rows {
+            let at: i64 = row.try_get("node_index")?;
+            let node: Vec<u8> = row.try_get("node")?;
+            found.insert(u64::try_from(at).unwrap_or(0), hash_from_bytes(&node)?);
+        }
+        want.iter()
+            .map(|index| {
+                found
+                    .get(index)
+                    .copied()
+                    .ok_or(SqliteError::MissingNode { index: *index })
+            })
+            .collect()
+    }
+
+    /// The tree head at `size`, from `O(log n)` node reads.
+    ///
+    /// Deliberately **not** in a transaction, and safe without one. The cover of
+    /// a log of `size` records is made entirely of completed subtrees, and a
+    /// completed subtree never changes in an append-only log — so a concurrent
+    /// append cannot disturb this read. The worst it can do is make the answer
+    /// one entry stale, which is what any read of a growing log is.
+    async fn head_from_nodes<'e, E>(executor: E, size: u64) -> Result<TreeHead, SqliteError>
+    where
+        E: sqlx::Executor<'e, Database = Sqlite>,
+    {
+        let plan = nodes::RootPlan::new(size);
+        let read = Self::read_nodes(executor, plan.nodes()).await?;
+        Ok(TreeHead {
+            size,
+            root: plan.assemble(&read)?,
+        })
+    }
+
+    /// Restores the subtree cover an append needs, from the stored nodes.
+    ///
+    /// The cover is one node per set bit in the size, and every one of them is a
+    /// completed subtree — so it is a lookup rather than a rebuild, and there is
+    /// no separate accumulator table that could stop agreeing with the tree.
     async fn accumulator(
         tx: &mut Transaction<'_, Sqlite>,
     ) -> Result<MerkleAccumulator, SqliteError> {
-        let rows = sqlx::query("SELECT height, node FROM log_subtrees ORDER BY position")
-            .fetch_all(&mut **tx)
-            .await?;
-        let mut subtrees = Vec::with_capacity(rows.len());
-        for row in &rows {
-            let height: i64 = row.try_get("height")?;
-            let node: Vec<u8> = row.try_get("node")?;
-            subtrees.push((u8::try_from(height).unwrap_or(0), hash_from_bytes(&node)?));
-        }
-        let size: i64 =
-            sqlx::query("SELECT COUNT(*) AS n FROM entries WHERE log_index IS NOT NULL")
-                .fetch_one(&mut **tx)
-                .await?
-                .try_get("n")?;
-        // Checked, not trusted: a row lost, duplicated or returned out of order
-        // would otherwise produce a plausible-looking wrong root.
-        Ok(MerkleAccumulator::try_from_parts(
-            subtrees,
-            u64::try_from(size).unwrap_or(0),
-        )?)
+        let size = Self::log_size(&mut **tx).await?;
+        let plan = nodes::RootPlan::new(size);
+        let read = Self::read_nodes(&mut **tx, plan.nodes()).await?;
+        let subtrees = plan
+            .nodes()
+            .iter()
+            .zip(read)
+            .map(|(at, hash)| (nodes::split_index(*at).0, hash))
+            .collect();
+        // Checked, not trusted: the heights have to be the decomposition the
+        // size requires, or the rows read back are not the rows written.
+        Ok(MerkleAccumulator::try_from_parts(subtrees, size)?)
     }
 
-    async fn store_accumulator(
+    /// Appends the nodes a record's arrival completed.
+    ///
+    /// Positions are consecutive from [`nodes::count`] of the previous size, so
+    /// this table is INSERT-only with a monotonic key — never an update, never a
+    /// delete.
+    async fn store_nodes(
         tx: &mut Transaction<'_, Sqlite>,
-        accumulator: &MerkleAccumulator,
+        first_index: u64,
+        written: &[Hash],
     ) -> Result<(), SqliteError> {
-        sqlx::query("DELETE FROM log_subtrees")
-            .execute(&mut **tx)
-            .await?;
-        for (position, (height, node)) in accumulator.subtrees().iter().enumerate() {
-            sqlx::query("INSERT INTO log_subtrees (height, node, position) VALUES (?1, ?2, ?3)")
-                .bind(i64::from(*height))
+        for (offset, node) in written.iter().enumerate() {
+            let at = first_index.saturating_add(offset as u64);
+            sqlx::query("INSERT INTO log_nodes (node_index, node) VALUES (?1, ?2)")
+                .bind(i64::try_from(at).unwrap_or(i64::MAX))
                 .bind(node.as_bytes().as_slice())
-                .bind(i64::try_from(position).unwrap_or(i64::MAX))
                 .execute(&mut **tx)
                 .await?;
         }
         Ok(())
+    }
+
+    /// The registered ancestor of `path` that already carries postings, if any.
+    ///
+    /// One query over the ancestor paths, which is at most
+    /// [`MAX_DEPTH`](crate::account::MAX_DEPTH) values and only ever run when
+    /// an account is registered.
+    async fn posted_to_ancestor(
+        pool: &SqlitePool,
+        path: &AccountPath,
+    ) -> Result<Option<String>, SqliteError> {
+        let ancestors = path.ancestors();
+        if ancestors.is_empty() {
+            return Ok(None);
+        }
+        let placeholders = (1..=ancestors.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT a.path AS path FROM accounts a \
+             WHERE a.path IN ({placeholders}) \
+               AND EXISTS (SELECT 1 FROM postings p WHERE p.account_index = a.account_index) \
+             ORDER BY a.account_index LIMIT 1"
+        );
+        let mut query = sqlx::query(&sql);
+        for ancestor in &ancestors {
+            query = query.bind(ancestor.to_string());
+        }
+        query
+            .fetch_optional(pool)
+            .await?
+            .map(|row| row.try_get::<String, _>("path"))
+            .transpose()
+            .map_err(SqliteError::from)
     }
 
     async fn check_reversal(
@@ -469,17 +605,19 @@ impl<const P: u8> SqliteStore<P> {
             Self::check_reversal(tx, entry, original).await?;
         }
 
+        // Projected on a copy: the entry may still be refused below, and the
+        // accumulator must then be exactly what it was.
         let mut projected = accumulator.clone();
-        projected.push(content_hash);
-        let projected_root = projected.root();
+        let first_node = nodes::count(projected.size());
+        let (_, written) = projected.push_recording(content_hash);
 
         let inserted = sqlx::query(
             "INSERT INTO entries ( \
                 log_index, entry_id, idempotency_key, content_hash, booking_date, value_date, \
                 description, provenance_actor, provenance_source, provenance_correlation, \
-                document_id, document_content_hash, reverses, original_booking_date, tree_root, \
+                document_id, document_content_hash, reverses, original_booking_date, \
                 kind \
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16) \
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15) \
              ON CONFLICT (idempotency_key) DO NOTHING \
              RETURNING log_index",
         )
@@ -502,7 +640,6 @@ impl<const P: u8> SqliteStore<P> {
         )
         .bind(entry.reverses().map(uuid_bytes))
         .bind(entry.original_booking_date())
-        .bind(projected_root.as_bytes().as_slice())
         .bind(entry.kind().map(|k| k.as_str()))
         .fetch_optional(&mut **tx)
         .await?;
@@ -517,7 +654,11 @@ impl<const P: u8> SqliteStore<P> {
 
             let stored_hash = hash_from_bytes(&existing.try_get::<Vec<u8>, _>("content_hash")?)?;
             let stored_id = uuid_from_bytes(&existing.try_get::<Vec<u8>, _>("entry_id")?)?;
-            let stored_index: i64 = existing.try_get("log_index")?;
+            // Nullable in the schema, and read as such. This backend assigns
+            // positions inline so it is always set — but a column that *can* be
+            // NULL read as if it cannot turns a stale row into a decode error
+            // rather than into the honest answer.
+            let stored_index: Option<i64> = existing.try_get("log_index")?;
 
             if stored_hash != content_hash {
                 return Err(SqliteError::IdempotencyConflict {
@@ -526,13 +667,19 @@ impl<const P: u8> SqliteStore<P> {
             }
             return Ok(Recorded {
                 id: stored_id,
-                index: Some(LogIndex::new(u64::try_from(stored_index).unwrap_or(0))),
+                index: stored_index.map(|i| LogIndex::new(u64::try_from(i).unwrap_or(0))),
                 content_hash,
                 is_new: false,
             });
         };
 
         let assigned: i64 = row.try_get("log_index")?;
+
+        // The tree, in the same transaction as the entry that extended it. A
+        // crash between the two would leave a log whose size and whose nodes
+        // disagree, which is the one inconsistency nothing downstream could
+        // repair.
+        Self::store_nodes(tx, first_node, &written).await?;
         for (position, posting) in entry.postings().iter().enumerate() {
             let position = i64::try_from(position).unwrap_or(i64::MAX);
             sqlx::query(
@@ -577,12 +724,17 @@ impl<const P: u8> SqliteStore<P> {
         })
     }
 
-    /// Refuses the entry if it leaves a constrained account on a forbidden side.
+    /// Refuses the entry if it leaves a constrained account past its limit.
     ///
     /// Run *after* the postings are inserted and inside the same transaction, so
     /// the aggregate sees exactly the balance the entry would leave behind and a
     /// breach rolls the whole batch back with it. Checking beforehand would race
     /// with any concurrent append and would have to reimplement the fold.
+    ///
+    /// Both layers are read, and
+    /// [`BalanceLimit::headroom_minor`](crate::BalanceLimit::headroom_minor)
+    /// decides — the same function the in-memory journal calls, so the two
+    /// cannot drift on a rule with this much subtlety in it.
     ///
     /// Deliberately not filtered on `log_index IS NOT NULL`: an unsequenced
     /// entry is durable, and money it has already committed counts against the
@@ -591,25 +743,29 @@ impl<const P: u8> SqliteStore<P> {
         tx: &mut Transaction<'_, Sqlite>,
         entry: &Entry<Balanced, P>,
     ) -> Result<(), SqliteError> {
-        let mut checked: BTreeSet<(u32, Currency, Layer)> = BTreeSet::new();
+        let mut checked: BTreeSet<(u32, Currency)> = BTreeSet::new();
         for posting in entry.postings() {
-            if !checked.insert((posting.account.index(), posting.currency, posting.layer)) {
+            if !checked.insert((posting.account.index(), posting.currency)) {
                 continue;
             }
             let row = sqlx::query(
                 "SELECT a.balance_limit AS lim, \
-                    COALESCE(SUM(CASE WHEN p.direction = 'D' \
-                                      THEN p.amount_minor ELSE -p.amount_minor END), 0) AS net \
+                    COALESCE(SUM(CASE WHEN p.layer = 'settled' AND p.direction = 'D' \
+                                      THEN p.amount_minor ELSE 0 END), 0) AS sd, \
+                    COALESCE(SUM(CASE WHEN p.layer = 'settled' AND p.direction = 'C' \
+                                      THEN p.amount_minor ELSE 0 END), 0) AS sc, \
+                    COALESCE(SUM(CASE WHEN p.layer = 'pending' AND p.direction = 'D' \
+                                      THEN p.amount_minor ELSE 0 END), 0) AS pd, \
+                    COALESCE(SUM(CASE WHEN p.layer = 'pending' AND p.direction = 'C' \
+                                      THEN p.amount_minor ELSE 0 END), 0) AS pc \
                  FROM accounts a \
                  LEFT JOIN postings p \
-                   ON p.account_index = a.account_index \
-                  AND p.currency = ?2 AND p.layer = ?3 \
+                   ON p.account_index = a.account_index AND p.currency = ?2 \
                  WHERE a.account_index = ?1 AND a.balance_limit <> 'unlimited' \
                  GROUP BY a.balance_limit",
             )
             .bind(i64::from(posting.account.index()))
             .bind(posting.currency.code())
-            .bind(layer_str(posting.layer))
             .fetch_optional(&mut **tx)
             .await?;
 
@@ -617,23 +773,75 @@ impl<const P: u8> SqliteStore<P> {
             let code: String = row.try_get("lim")?;
             let limit = limit_from_code(&code)
                 .ok_or_else(|| SqliteError::malformed(format!("balance limit {code:?}")))?;
-            let net: i64 = row.try_get("net")?;
-            let permitted = match limit {
-                BalanceLimit::Unlimited => true,
-                BalanceLimit::NoCreditBalance => net >= 0,
-                BalanceLimit::NoDebitBalance => net <= 0,
+            let settled = Balance::<P> {
+                debits: Amount::from_minor(row.try_get::<i64, _>("sd")?),
+                credits: Amount::from_minor(row.try_get::<i64, _>("sc")?),
             };
-            if !permitted {
+            let pending = Balance::<P> {
+                debits: Amount::from_minor(row.try_get::<i64, _>("pd")?),
+                credits: Amount::from_minor(row.try_get::<i64, _>("pc")?),
+            };
+            if let Some(headroom) = limit.headroom_minor(&settled, &pending)
+                && headroom < 0
+            {
                 return Err(SqliteError::LimitBreached {
                     account: posting.account,
                     currency: posting.currency,
-                    layer: posting.layer,
                     limit,
-                    net_minor: net,
+                    headroom_minor: headroom,
                 });
             }
         }
         Ok(())
+    }
+
+    /// Gross totals over the postings `query` selects on `key`, optionally
+    /// stopping at a posting position.
+    ///
+    /// The two halves of a statement page's opening balance, and nothing else
+    /// uses it. `None` for the query selects nothing at all, which is what an
+    /// unscoped statement carries in.
+    async fn fold_postings(
+        &self,
+        key: BalanceKey,
+        query: Option<BalanceQuery<'_>>,
+        through: Option<PostingPosition>,
+    ) -> Result<Balance<P>, SqliteError> {
+        let Some(query) = query else {
+            return Ok(Balance::ZERO);
+        };
+        let mut sql = Sql::default();
+        let joins = dimension_joins(&mut sql, &query);
+        let account = sql.int(i64::from(key.account.index()));
+        let currency = sql.text(key.currency.code());
+        let layer = sql.text(layer_str(key.layer));
+        let bound = match through {
+            Some(position) => {
+                let index = sql.int(i64::try_from(position.index.get()).unwrap_or(i64::MAX));
+                let posting = sql.int(i64::from(position.posting));
+                format!(
+                    " AND (e.log_index < {index} \
+                       OR (e.log_index = {index} AND p.posting_index <= {posting}))"
+                )
+            }
+            None => String::new(),
+        };
+        let predicate = entry_predicate(&mut sql, &query);
+        let text = format!(
+            "SELECT \
+                COALESCE(SUM(CASE WHEN p.direction = 'D' THEN p.amount_minor ELSE 0 END), 0) \
+                    AS debits, \
+                COALESCE(SUM(CASE WHEN p.direction = 'C' THEN p.amount_minor ELSE 0 END), 0) \
+                    AS credits \
+             FROM postings p JOIN entries e ON e.entry_id = p.entry_id{joins} \
+             WHERE p.account_index = {account} AND p.currency = {currency} \
+               AND p.layer = {layer}{bound}{predicate}"
+        );
+        let row = sql.apply(sqlx::query(&text)).fetch_one(&self.pool).await?;
+        Ok(Balance::<P> {
+            debits: Amount::from_minor(row.try_get::<i64, _>("debits")?),
+            credits: Amount::from_minor(row.try_get::<i64, _>("credits")?),
+        })
     }
 
     /// Loads postings for several entries at once, grouped by log index.
@@ -789,6 +997,132 @@ fn dimensions_from(rows: &[sqlx::sqlite::SqliteRow]) -> Result<DimensionIndex, S
         .map_err(|e| SqliteError::malformed(e.to_string()))?;
     }
     Ok(out)
+}
+
+/// One bind value for a generated query, in placeholder order.
+enum Bind {
+    Int(i64),
+    Text(String),
+    Date(Date),
+}
+
+/// A query built up alongside the bind values its placeholders refer to.
+///
+/// Placeholders are handed out as the SQL is written, so the values can only be
+/// in the order the database will read them. Building the text and the binds
+/// separately is how a filter clause ends up matched against a date.
+#[derive(Default)]
+struct Sql {
+    binds: Vec<Bind>,
+}
+
+impl Sql {
+    /// Records a bind and returns the **numbered** placeholder that refers to it.
+    ///
+    /// Numbered rather than a bare `?`, because a bare one is positional: every
+    /// *occurrence* is a separate parameter, so a clause that names the same
+    /// bound value twice — as a `(index > x OR (index = x AND …))` cursor bound
+    /// must — silently shifts every parameter after it.
+    fn bind(&mut self, value: Bind) -> String {
+        self.binds.push(value);
+        format!("?{}", self.binds.len())
+    }
+
+    fn int(&mut self, v: i64) -> String {
+        self.bind(Bind::Int(v))
+    }
+
+    fn text(&mut self, v: &str) -> String {
+        self.bind(Bind::Text(v.to_owned()))
+    }
+
+    fn date(&mut self, v: Date) -> String {
+        self.bind(Bind::Date(v))
+    }
+
+    /// Applies every recorded bind, in order.
+    fn apply<'q>(
+        self,
+        query: sqlx::query::Query<'q, Sqlite, sqlx::sqlite::SqliteArguments<'q>>,
+    ) -> sqlx::query::Query<'q, Sqlite, sqlx::sqlite::SqliteArguments<'q>> {
+        let mut query = query;
+        for bind in self.binds {
+            query = match bind {
+                Bind::Int(v) => query.bind(v),
+                Bind::Text(v) => query.bind(v),
+                Bind::Date(v) => query.bind(v),
+            };
+        }
+        query
+    }
+}
+
+/// `JOIN` clauses for the dimension equalities a query requires.
+///
+/// An equality is an inner join rather than a correlated `EXISTS` so the planner
+/// can drive from `posting_dimensions (axis, value)` — the index that exists for
+/// exactly this, and that nothing used before dimensional reporting did. The
+/// join cannot duplicate a posting: `(entry_id, posting_index, axis)` is the
+/// primary key, so it matches at most one row.
+///
+/// Absences stay in the predicate, because there is no row to join to.
+fn dimension_joins(sql: &mut Sql, query: &BalanceQuery<'_>) -> String {
+    let mut out = String::new();
+    let Some(filter) = query.dimensions() else {
+        return out;
+    };
+    for (i, (axis, value)) in filter.clauses().enumerate() {
+        let Some(value) = value else { continue };
+        let axis = sql.text(axis.as_str());
+        let value = sql.text(value.as_str());
+        out.push_str(&format!(
+            " JOIN posting_dimensions d{i} ON d{i}.entry_id = p.entry_id \
+              AND d{i}.posting_index = p.posting_index \
+              AND d{i}.axis = {axis} AND d{i}.value = {value}"
+        ));
+    }
+    out
+}
+
+/// The `AND …` predicate a query adds to a `WHERE` clause.
+///
+/// Always starts by excluding unsequenced entries: an entry with no log position
+/// is durable but not in the log, so it is not part of any balance the log can
+/// be proven against.
+fn entry_predicate(sql: &mut Sql, query: &BalanceQuery<'_>) -> String {
+    let mut out = String::from(" AND e.log_index IS NOT NULL");
+    if let Some(size) = query.prefix() {
+        let bound = sql.int(prefix_bound(Some(size)));
+        out.push_str(&format!(" AND e.log_index < {bound}"));
+    }
+    // Whichever date the query says it means. The column is chosen from a
+    // two-variant enum, never interpolated from caller text.
+    let column = match query.basis() {
+        DateBasis::Booking => "e.booking_date",
+        DateBasis::Value => "e.value_date",
+    };
+    if let Some(start) = query.start() {
+        let bound = sql.date(start);
+        out.push_str(&format!(" AND {column} >= {bound}"));
+    }
+    if let Some(end) = query.end() {
+        let bound = sql.date(end);
+        out.push_str(&format!(" AND {column} <= {bound}"));
+    }
+    if let Some(filter) = query.dimensions() {
+        for (axis, value) in filter.clauses() {
+            if value.is_some() {
+                continue;
+            }
+            let axis = sql.text(axis.as_str());
+            out.push_str(&format!(
+                " AND NOT EXISTS (SELECT 1 FROM posting_dimensions dx \
+                  WHERE dx.entry_id = p.entry_id AND dx.posting_index = p.posting_index \
+                    AND dx.axis = {axis})"
+            ));
+        }
+    }
+    out
 }
 
 fn build_trial_balance<const P: u8>(
@@ -990,6 +1324,22 @@ impl<const P: u8> LedgerStore<P> for SqliteStore<P> {
 
     async fn register_account(&self, record: &AccountRecord) -> Result<(), Self::Error> {
         {
+            // The leaf rule, checked where the postings are. A registry holds
+            // none, so it cannot see that this path would turn an account that
+            // has already been posted to into an aggregation node — and the
+            // journal enforces the same rule for the same reason.
+            //
+            // Only a path the store has not seen can break it: a record it
+            // already holds cannot change the shape of the tree.
+            if let Some(ancestor) =
+                Self::posted_to_ancestor(&self.pool, &record.account.path).await?
+            {
+                return Err(SqliteError::AncestorHasPostings {
+                    path: record.account.path.to_string(),
+                    ancestor,
+                });
+            }
+
             // Upsert, not insert-or-ignore. The path at a handle is immutable
             // — changing it would repoint every posting row that names it, and
             // the WHERE clause refuses that outright — but the classification,
@@ -1052,7 +1402,6 @@ impl<const P: u8> LedgerStore<P> for SqliteStore<P> {
         for entry in batch.entries() {
             out.push(Self::append_one(&mut tx, entry, &mut next_index, &mut accumulator).await?);
         }
-        Self::store_accumulator(&mut tx, &accumulator).await?;
 
         tx.commit().await?;
         Ok(out)
@@ -1072,6 +1421,27 @@ impl<const P: u8> LedgerStore<P> for SqliteStore<P> {
         Ok(Some(build_stored_entry::<P>(
             &row,
             grouped.remove(&key).unwrap_or_default(),
+        )?))
+    }
+
+    async fn get_by_key(
+        &self,
+        key: &IdempotencyKey,
+    ) -> Result<Option<StoredEntry<P>>, Self::Error> {
+        // The same unique index that makes the append idempotent.
+        let sql = format!("SELECT {ENTRY_COLUMNS} FROM entries WHERE idempotency_key = ?1");
+        let Some(row) = sqlx::query(&sql)
+            .bind(key.as_bytes())
+            .fetch_optional(&self.pool)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let id: Vec<u8> = row.try_get("entry_id")?;
+        let mut grouped = self.load_postings_for(std::slice::from_ref(&id)).await?;
+        Ok(Some(build_stored_entry::<P>(
+            &row,
+            grouped.remove(&id).unwrap_or_default(),
         )?))
     }
 
@@ -1115,74 +1485,64 @@ impl<const P: u8> LedgerStore<P> for SqliteStore<P> {
     }
 
     async fn head(&self) -> Result<TreeHead, Self::Error> {
-        let Some(row) = sqlx::query(
-            "SELECT log_index, tree_root FROM entries \
-             WHERE log_index IS NOT NULL ORDER BY log_index DESC LIMIT 1",
-        )
-        .fetch_optional(&self.pool)
-        .await?
-        else {
-            return Ok(TreeHead {
-                size: 0,
-                root: empty_root(),
-            });
-        };
-        let log_index: i64 = row.try_get("log_index")?;
-        Ok(TreeHead {
-            size: u64::try_from(log_index).unwrap_or(0).saturating_add(1),
-            root: hash_from_bytes(&row.try_get::<Vec<u8>, _>("tree_root")?)?,
-        })
+        let size = Self::log_size(&self.pool).await?;
+        Self::head_from_nodes(&self.pool, size).await
     }
 
+    /// `O(log n)` node reads — the perfect-subtree cover at that size.
+    ///
+    /// There is no stored root to look up, and deliberately so: a root column
+    /// beside the nodes would be a second copy of a derived value, and two
+    /// fields that must agree are two fields that can disagree. Folding the
+    /// cover is one query and cannot drift.
     async fn head_at(&self, size: u64) -> Result<TreeHead, Self::Error> {
-        if size == 0 {
-            return Ok(TreeHead {
-                size: 0,
-                root: empty_root(),
-            });
+        let held = Self::log_size(&self.pool).await?;
+        if size > held {
+            // The log's real length, not a placeholder: this error is read by
+            // whoever was told their archived head could not be reproduced, and
+            // a wrong size sends them looking at their own records rather than
+            // at the prefix this store is missing.
+            return Err(ProofError::SizeOutOfRange {
+                from: size,
+                size: held,
+            }
+            .into());
         }
-        // Each entry stores the root as of its own sequencing, so a historical
-        // head is a row lookup rather than a replay of the log.
-        let index = i64::try_from(size.saturating_sub(1)).unwrap_or(i64::MAX);
-        let row = sqlx::query("SELECT tree_root FROM entries WHERE log_index = ?1")
-            .bind(index)
-            .fetch_optional(&self.pool)
-            .await?
-            .ok_or_else(|| {
-                SqliteError::from(ProofError::SizeOutOfRange {
-                    from: size,
-                    size: 0,
-                })
-            })?;
-        Ok(TreeHead {
-            size,
-            root: hash_from_bytes(&row.try_get::<Vec<u8>, _>("tree_root")?)?,
-        })
+        Self::head_from_nodes(&self.pool, size).await
     }
 
+    /// Counts the log, not the surviving entry rows.
+    ///
+    /// The nodes are the log. An entry archived to a cold tier and pruned from
+    /// hot storage leaves the tree exactly as it was, so a length counted from
+    /// `entries` would shrink underneath every head, proof and seal that had
+    /// already been published.
     async fn len(&self) -> Result<u64, Self::Error> {
-        let n: i64 = sqlx::query("SELECT COUNT(*) AS n FROM entries WHERE log_index IS NOT NULL")
-            .fetch_one(&self.pool)
-            .await?
-            .try_get("n")?;
-        Ok(u64::try_from(n).unwrap_or(0))
+        Self::log_size(&self.pool).await
     }
 
-    async fn balance(&self, key: BalanceKey, size: Option<u64>) -> Result<Balance<P>, Self::Error> {
-        let row = sqlx::query(
+    async fn balance(
+        &self,
+        key: BalanceKey,
+        query: BalanceQuery<'_>,
+    ) -> Result<Balance<P>, Self::Error> {
+        // Placeholders are handed out as the text is written, so the binds can
+        // only be in the order the database reads them.
+        let mut sql = Sql::default();
+        let joins = dimension_joins(&mut sql, &query);
+        let account = sql.int(i64::from(key.account.index()));
+        let currency = sql.text(key.currency.code());
+        let layer = sql.text(layer_str(key.layer));
+        let predicate = entry_predicate(&mut sql, &query);
+        let text = format!(
             "SELECT \
-               COALESCE(SUM(CASE WHEN direction = 'D' THEN amount_minor END), 0) AS debits, \
-               COALESCE(SUM(CASE WHEN direction = 'C' THEN amount_minor END), 0) AS credits \
-             FROM postings p JOIN entries e ON e.entry_id = p.entry_id \
-             WHERE p.account_index = ?1 AND p.currency = ?2 AND p.layer = ?3 \
-               AND e.log_index IS NOT NULL AND e.log_index < ?4",
-        )
-        .bind(i64::from(key.account.index()))
-        .bind(key.currency.code())
-        .bind(layer_str(key.layer))
-        .bind(prefix_bound(size))
-        .fetch_one(&self.pool)
-        .await?;
+               COALESCE(SUM(CASE WHEN p.direction = 'D' THEN p.amount_minor END), 0) AS debits, \
+               COALESCE(SUM(CASE WHEN p.direction = 'C' THEN p.amount_minor END), 0) AS credits \
+             FROM postings p JOIN entries e ON e.entry_id = p.entry_id{joins} \
+             WHERE p.account_index = {account} AND p.currency = {currency} \
+               AND p.layer = {layer}{predicate}"
+        );
+        let row = sql.apply(sqlx::query(&text)).fetch_one(&self.pool).await?;
 
         Ok(Balance {
             debits: Amount::from_minor(row.try_get::<i64, _>("debits")?),
@@ -1190,36 +1550,71 @@ impl<const P: u8> LedgerStore<P> for SqliteStore<P> {
         })
     }
 
-    async fn trial_balance(&self, size: Option<u64>) -> Result<TrialBalance<P>, Self::Error> {
-        let rows = sqlx::query(
+    async fn trial_balance(&self, query: BalanceQuery<'_>) -> Result<TrialBalance<P>, Self::Error> {
+        let mut sql = Sql::default();
+        let joins = dimension_joins(&mut sql, &query);
+        let predicate = entry_predicate(&mut sql, &query);
+        let text = format!(
             "SELECT p.account_index, p.currency, p.layer, \
                COALESCE(SUM(CASE WHEN p.direction = 'D' THEN p.amount_minor END), 0) AS debits, \
                COALESCE(SUM(CASE WHEN p.direction = 'C' THEN p.amount_minor END), 0) AS credits \
-             FROM postings p JOIN entries e ON e.entry_id = p.entry_id \
-             WHERE e.log_index IS NOT NULL AND e.log_index < ?1 \
+             FROM postings p JOIN entries e ON e.entry_id = p.entry_id{joins} \
+             WHERE 1 = 1{predicate} \
              GROUP BY p.account_index, p.currency, p.layer \
-             ORDER BY p.account_index, p.currency, p.layer",
-        )
-        .bind(prefix_bound(size))
-        .fetch_all(&self.pool)
-        .await?;
+             ORDER BY p.account_index, p.currency, p.layer"
+        );
+        let rows = sql.apply(sqlx::query(&text)).fetch_all(&self.pool).await?;
         build_trial_balance::<P>(&rows)
     }
 
-    async fn prove_inclusion(&self, index: LogIndex) -> Result<InclusionProof, Self::Error> {
-        Ok(self.log().await?.inclusion_proof(index.get())?)
+    async fn dimension_values(&self, axis: &str) -> Result<Vec<Label>, Self::Error> {
+        // Index-driven on `posting_dimensions (axis, value)`.
+        let rows = sqlx::query(
+            "SELECT DISTINCT value FROM posting_dimensions WHERE axis = ?1 ORDER BY value",
+        )
+        .bind(axis)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                let value: String = row.try_get("value")?;
+                Label::new(value.clone())
+                    .map_err(|_| SqliteError::malformed(format!("dimension value {value:?}")))
+            })
+            .collect()
     }
 
+    async fn prove_inclusion(&self, index: LogIndex) -> Result<InclusionProof, Self::Error> {
+        let size = Self::log_size(&self.pool).await?;
+        self.prove_inclusion_at(index, size).await
+    }
+
+    /// `O(log n)` node reads, not a replay of the log.
+    ///
+    /// The plan names at most `1 + ceil(log2 n)` positions, one query fetches
+    /// them, and the fold is pure. A hundred-million-entry ledger answers this
+    /// from 28 rows.
     async fn prove_inclusion_at(
         &self,
         index: LogIndex,
         size: u64,
     ) -> Result<InclusionProof, Self::Error> {
-        Ok(self.log().await?.inclusion_proof_at(index.get(), size)?)
+        let held = Self::log_size(&self.pool).await?;
+        if size > held {
+            return Err(ProofError::SizeOutOfRange {
+                from: size,
+                size: held,
+            }
+            .into());
+        }
+        let plan = nodes::InclusionPlan::new(index.get(), size)?;
+        let read = Self::read_nodes(&self.pool, plan.nodes()).await?;
+        Ok(plan.assemble(&read)?)
     }
 
     async fn prove_consistency(&self, old_size: u64) -> Result<ConsistencyProof, Self::Error> {
-        Ok(self.log().await?.consistency_proof(old_size)?)
+        let size = Self::log_size(&self.pool).await?;
+        self.prove_consistency_between(old_size, size).await
     }
 
     async fn prove_consistency_between(
@@ -1227,10 +1622,17 @@ impl<const P: u8> LedgerStore<P> for SqliteStore<P> {
         old_size: u64,
         new_size: u64,
     ) -> Result<ConsistencyProof, Self::Error> {
-        Ok(self
-            .log()
-            .await?
-            .consistency_proof_between(old_size, new_size)?)
+        let held = Self::log_size(&self.pool).await?;
+        if new_size > held {
+            return Err(ProofError::SizeOutOfRange {
+                from: new_size,
+                size: held,
+            }
+            .into());
+        }
+        let plan = nodes::ConsistencyPlan::new(old_size, new_size)?;
+        let read = Self::read_nodes(&self.pool, plan.nodes()).await?;
+        Ok(plan.assemble(&read)?)
     }
 
     async fn define_period(&self, period: &Period) -> Result<(), Self::Error> {
@@ -1286,22 +1688,6 @@ impl<const P: u8> LedgerStore<P> for SqliteStore<P> {
     /// tree head it carries covers only sequenced entries, so a closing balance
     /// that folded in unsequenced ones would commit to money the tree head does
     /// not account for.
-    async fn trial_balance_through_date(&self, end: Date) -> Result<TrialBalance<P>, SqliteError> {
-        let rows = sqlx::query(
-            "SELECT p.account_index, p.currency, p.layer, \
-               COALESCE(SUM(CASE WHEN p.direction = 'D' THEN p.amount_minor END), 0) AS debits, \
-               COALESCE(SUM(CASE WHEN p.direction = 'C' THEN p.amount_minor END), 0) AS credits \
-             FROM postings p JOIN entries e ON e.entry_id = p.entry_id \
-             WHERE e.log_index IS NOT NULL AND e.booking_date <= ?1 \
-             GROUP BY p.account_index, p.currency, p.layer \
-             ORDER BY p.account_index, p.currency, p.layer",
-        )
-        .bind(end)
-        .fetch_all(&self.pool)
-        .await?;
-        build_trial_balance::<P>(&rows)
-    }
-
     async fn seal_period(&self, period: &PeriodId) -> Result<Seal, Self::Error> {
         // The same rule the in-memory journal applies, from the same place: the
         // period is defined, closing, and next in date order. Sealing out of
@@ -1325,7 +1711,9 @@ impl<const P: u8> LedgerStore<P> for SqliteStore<P> {
         let last: Option<i64> = span.try_get("last")?;
         let count: i64 = span.try_get("n")?;
 
-        let closing = self.trial_balance_through_date(definition.end).await?;
+        let closing = self
+            .trial_balance(BalanceQuery::through(definition.end))
+            .await?;
         // Rebuilt through the chain rather than counted: seals read back from a
         // table are rows, not evidence, and the new one has to chain onto a
         // predecessor that itself still holds.
@@ -1333,7 +1721,22 @@ impl<const P: u8> LedgerStore<P> for SqliteStore<P> {
             .map_err(|e| SqliteError::malformed(e.to_string()))?;
         let position = i64::try_from(chain.len()).unwrap_or(0);
 
-        let seal = Seal::build(
+        // The seal's tree head, and — when it chains onto one — the consistency
+        // proof from its predecessor's tree, both read from the stored nodes in
+        // `O(log n)`. Derived from one source, so the proof and the head it
+        // relates cannot have come from different trees.
+        let size = Self::log_size(&self.pool).await?;
+        let tree_head = Self::head_from_nodes(&self.pool, size).await?;
+        let prev_consistency = match chain.last() {
+            Some(previous) if previous.tree_head.size > 0 => {
+                let plan = nodes::ConsistencyPlan::new(previous.tree_head.size, size)?;
+                let read = Self::read_nodes(&self.pool, plan.nodes()).await?;
+                Some(plan.assemble(&read)?)
+            }
+            _ => None,
+        };
+
+        let seal = Seal::from_parts(
             self.ledger.clone(),
             period.clone(),
             PeriodCoverage {
@@ -1341,7 +1744,8 @@ impl<const P: u8> LedgerStore<P> for SqliteStore<P> {
                 last_index: last.map(|v| u64::try_from(v).unwrap_or(0)),
                 entry_count: u64::try_from(count).unwrap_or(0),
             },
-            self.head().await?,
+            tree_head,
+            prev_consistency,
             &closing,
             // Built from the stored bindings, not from a caller-supplied
             // registry: the seal must commit to the handles this database
@@ -1349,16 +1753,16 @@ impl<const P: u8> LedgerStore<P> for SqliteStore<P> {
             AccountRegistry::from_records(LedgerStore::<P>::accounts(self).await?)
                 .map_err(|e: crate::account::AccountError| SqliteError::malformed(e.to_string()))?
                 .commitment(),
-            chain.head(),
-        );
+            chain.last(),
+        )?;
 
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query(
             "INSERT INTO seals ( \
                 period_id, first_index, last_index, entry_count, tree_size, tree_root, \
                 trial_balance_size, trial_balance_root, accounts_size, accounts_root, \
-                prev_seal, seal_hash, chain_position \
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                prev_seal, prev_consistency, seal_hash, chain_position \
+             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
         )
         .bind(seal.period.as_str())
         .bind(seal.first_index.map(|v| i64::try_from(v).unwrap_or(0)))
@@ -1371,6 +1775,14 @@ impl<const P: u8> LedgerStore<P> for SqliteStore<P> {
         .bind(i64::try_from(seal.accounts.size).unwrap_or(0))
         .bind(seal.accounts.root.as_bytes().as_slice())
         .bind(seal.prev_seal.map(|h| h.as_bytes().to_vec()))
+        // The crate's own canonical encoding, not a general-purpose format:
+        // the seal hash covers these bytes, so their framing has to be fixed
+        // for as long as the seal is evidence.
+        .bind(
+            seal.prev_consistency
+                .as_ref()
+                .map(crate::Canonical::to_canonical_bytes),
+        )
         .bind(seal.seal_hash.as_bytes().as_slice())
         .bind(position)
         .execute(&mut *tx)
@@ -1387,7 +1799,7 @@ impl<const P: u8> LedgerStore<P> for SqliteStore<P> {
         let rows = sqlx::query(
             "SELECT period_id, first_index, last_index, entry_count, tree_size, tree_root, \
              trial_balance_size, trial_balance_root, accounts_size, accounts_root, \
-             prev_seal, seal_hash \
+             prev_seal, prev_consistency, seal_hash \
              FROM seals ORDER BY chain_position",
         )
         .fetch_all(&self.pool)
@@ -1403,6 +1815,12 @@ impl<const P: u8> LedgerStore<P> for SqliteStore<P> {
             let tb_size: i64 = row.try_get("trial_balance_size")?;
             let accounts_size: i64 = row.try_get("accounts_size")?;
             let prev: Option<Vec<u8>> = row.try_get("prev_seal")?;
+            let consistency: Option<Vec<u8>> = row.try_get("prev_consistency")?;
+            let prev_consistency = consistency
+                .as_deref()
+                .map(crate::ConsistencyProof::from_canonical_bytes)
+                .transpose()
+                .map_err(|e: crate::MalformedProof| SqliteError::malformed(e.to_string()))?;
             out.push(Seal {
                 ledger: self.ledger.clone(),
                 period: PeriodId::new(period).map_err(|e| SqliteError::malformed(e.to_string()))?,
@@ -1422,6 +1840,7 @@ impl<const P: u8> LedgerStore<P> for SqliteStore<P> {
                     root: hash_from_bytes(&row.try_get::<Vec<u8>, _>("accounts_root")?)?,
                 },
                 prev_seal: prev.as_deref().map(hash_from_bytes).transpose()?,
+                prev_consistency,
                 seal_hash: hash_from_bytes(&row.try_get::<Vec<u8>, _>("seal_hash")?)?,
             });
         }
@@ -1622,36 +2041,34 @@ impl<const P: u8> LedgerStore<P> for SqliteStore<P> {
         accounts: &[AccountId],
         currency: Currency,
         layer: Layer,
-        size: Option<u64>,
+        query: BalanceQuery<'_>,
     ) -> Result<BTreeMap<AccountId, Balance<P>>, Self::Error> {
         let mut out = BTreeMap::new();
         if accounts.is_empty() {
             return Ok(out);
         }
+        let mut sql = Sql::default();
+        let joins = dimension_joins(&mut sql, &query);
+        let currency_bind = sql.text(currency.code());
+        let layer_bind = sql.text(layer_str(layer));
         // SQLite has no array binding, so the placeholder list is generated.
         // The values are account indices the caller already holds.
-        let placeholders = (0..accounts.len())
-            .map(|i| format!("?{}", i.saturating_add(4)))
+        let placeholders = accounts
+            .iter()
+            .map(|account| sql.int(i64::from(account.index())))
             .collect::<Vec<_>>()
             .join(",");
-        let sql = format!(
+        let predicate = entry_predicate(&mut sql, &query);
+        let text = format!(
             "SELECT p.account_index, \
                COALESCE(SUM(CASE WHEN p.direction = 'D' THEN p.amount_minor END), 0) AS debits, \
                COALESCE(SUM(CASE WHEN p.direction = 'C' THEN p.amount_minor END), 0) AS credits \
-             FROM postings p JOIN entries e ON e.entry_id = p.entry_id \
-             WHERE p.currency = ?1 AND p.layer = ?2 \
-               AND e.log_index IS NOT NULL AND e.log_index < ?3 \
-               AND p.account_index IN ({placeholders}) \
+             FROM postings p JOIN entries e ON e.entry_id = p.entry_id{joins} \
+             WHERE p.currency = {currency_bind} AND p.layer = {layer_bind} \
+               AND p.account_index IN ({placeholders}){predicate} \
              GROUP BY p.account_index"
         );
-        let mut query = sqlx::query(&sql)
-            .bind(currency.code())
-            .bind(layer_str(layer))
-            .bind(prefix_bound(size));
-        for account in accounts {
-            query = query.bind(i64::from(account.index()));
-        }
-        for row in &query.fetch_all(&self.pool).await? {
+        for row in &sql.apply(sqlx::query(&text)).fetch_all(&self.pool).await? {
             let account: i64 = row.try_get("account_index")?;
             out.insert(
                 AccountId::from_index(u32::try_from(account).unwrap_or(0)),
@@ -1667,6 +2084,7 @@ impl<const P: u8> LedgerStore<P> for SqliteStore<P> {
     async fn statement(
         &self,
         key: BalanceKey,
+        query: BalanceQuery<'_>,
         cursor: PostingCursor,
     ) -> Result<StatementPage<P>, Self::Error> {
         // A statement is a list of *postings*, and one entry may put several on
@@ -1681,63 +2099,52 @@ impl<const P: u8> LedgerStore<P> for SqliteStore<P> {
         });
         let limit = cursor.effective_limit();
 
-        // Everything strictly before the page, summed in the database. Gross
-        // totals, not a net: a running balance carries both sides.
-        //
-        // The bound is the same pair the page filter uses, negated — so a page
-        // that starts mid-entry opens with exactly the postings already shown.
-        let opening = if cursor.after.is_some() {
-            let row = sqlx::query(
-                "SELECT \
-                    COALESCE(SUM(CASE WHEN p.direction = 'D' THEN p.amount_minor ELSE 0 END), 0) \
-                        AS debits, \
-                    COALESCE(SUM(CASE WHEN p.direction = 'C' THEN p.amount_minor ELSE 0 END), 0) \
-                        AS credits \
-                 FROM postings p JOIN entries e ON e.entry_id = p.entry_id \
-                 WHERE p.account_index = ?1 AND p.currency = ?2 AND p.layer = ?3 \
-                   AND e.log_index IS NOT NULL \
-                   AND (e.log_index < ?4 \
-                        OR (e.log_index = ?4 AND p.posting_index <= ?5))",
-            )
-            .bind(i64::from(key.account.index()))
-            .bind(key.currency.code())
-            .bind(layer_str(key.layer))
-            .bind(after_index)
-            .bind(after_posting)
-            .fetch_one(&self.pool)
-            .await?;
-            Balance {
-                debits: Amount::<P>::from_minor(row.try_get::<i64, _>("debits")?),
-                credits: Amount::<P>::from_minor(row.try_get::<i64, _>("credits")?),
-            }
-        } else {
-            Balance::ZERO
-        };
-
-        // One row past the page, so "is there more" is answered by the query
-        // rather than guessed from a full page — which would hand back a cursor
-        // that yields nothing.
+        // The page first: one row past it, so "is there more" is answered by
+        // the query rather than guessed from a full page — which would hand back
+        // a cursor that yields nothing.
         let probe = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
-        let mut rows = sqlx::query(
-            "SELECT e.log_index, e.entry_id, e.booking_date, e.kind, p.posting_index, \
+        let mut sql = Sql::default();
+        let joins = dimension_joins(&mut sql, &query);
+        let account = sql.int(i64::from(key.account.index()));
+        let currency = sql.text(key.currency.code());
+        let layer = sql.text(layer_str(key.layer));
+        let after_index_bind = sql.int(after_index);
+        let after_posting_bind = sql.int(after_posting);
+        let predicate = entry_predicate(&mut sql, &query);
+        let probe_bind = sql.int(probe);
+        let text = format!(
+            "SELECT e.log_index, e.entry_id, e.booking_date, e.value_date, e.kind, \
+                    p.posting_index, \
                     p.direction, p.amount_minor \
-             FROM postings p JOIN entries e ON e.entry_id = p.entry_id \
-             WHERE p.account_index = ?1 AND p.currency = ?2 AND p.layer = ?3 \
-               AND e.log_index IS NOT NULL \
-               AND (e.log_index > ?4 \
-                    OR (e.log_index = ?4 AND p.posting_index > ?5)) \
-             ORDER BY e.log_index, p.posting_index LIMIT ?6",
-        )
-        .bind(i64::from(key.account.index()))
-        .bind(key.currency.code())
-        .bind(layer_str(key.layer))
-        .bind(after_index)
-        .bind(after_posting)
-        .bind(probe)
-        .fetch_all(&self.pool)
-        .await?;
+             FROM postings p JOIN entries e ON e.entry_id = p.entry_id{joins} \
+             WHERE p.account_index = {account} AND p.currency = {currency} \
+               AND p.layer = {layer} \
+               AND (e.log_index > {after_index_bind} \
+                    OR (e.log_index = {after_index_bind} \
+                        AND p.posting_index > {after_posting_bind})){predicate} \
+             ORDER BY e.log_index, p.posting_index LIMIT {probe_bind}"
+        );
+        let mut rows = sql.apply(sqlx::query(&text)).fetch_all(&self.pool).await?;
         let has_more = rows.len() > limit;
         rows.truncate(limit);
+
+        // Then what the page opens at, which is two disjoint folds:
+        //
+        //   1. everything the query narrows to that was booked *before* its
+        //      window — `BalanceQuery::opening`, defined by date so a backdated
+        //      entry lands in the opening rather than mid-statement; and
+        //   2. the statement's own lines up to and including the cursor, which
+        //      earlier pages have already shown.
+        //
+        // Bounded by the cursor rather than by the first row: an exhausted
+        // cursor must still open at the figure the window closed at, which is
+        // what "no activity this period" should read as.
+        let carried = self.fold_postings(key, query.opening(), None).await?;
+        let shown = match cursor.after {
+            Some(after) => self.fold_postings(key, Some(query), Some(after)).await?,
+            None => Balance::ZERO,
+        };
+        let opening = carried.checked_add(&shown)?;
 
         let mut running = opening;
         let mut lines = Vec::with_capacity(rows.len());
@@ -1760,6 +2167,7 @@ impl<const P: u8> LedgerStore<P> for SqliteStore<P> {
                 index: LogIndex::new(u64::try_from(log_index).unwrap_or(0)),
                 posting: PostingRef::new(entry_id, u16::try_from(posting_index).unwrap_or(0)),
                 booking_date: row.try_get("booking_date")?,
+                value_date: row.try_get("value_date")?,
                 direction,
                 amount,
                 running,
@@ -1771,9 +2179,14 @@ impl<const P: u8> LedgerStore<P> for SqliteStore<P> {
             after: Some(l.position()),
             limit: cursor.limit,
         });
-        Ok(StatementPage { lines, next })
+        Ok(StatementPage {
+            opening,
+            lines,
+            next,
+        })
     }
 
+    /// Conditional on the tree size not going backwards — see the trait.
     async fn save_checkpoint(&self, checkpoint: &Checkpoint<P>) -> Result<(), Self::Error> {
         sqlx::query(
             "INSERT INTO checkpoints ( \
@@ -1784,7 +2197,8 @@ impl<const P: u8> LedgerStore<P> for SqliteStore<P> {
                 debits_minor  = excluded.debits_minor, \
                 credits_minor = excluded.credits_minor, \
                 tree_size     = excluded.tree_size, \
-                tree_root     = excluded.tree_root",
+                tree_root     = excluded.tree_root \
+             WHERE excluded.tree_size >= checkpoints.tree_size",
         )
         .bind(i64::from(checkpoint.key.account.index()))
         .bind(checkpoint.key.currency.code())

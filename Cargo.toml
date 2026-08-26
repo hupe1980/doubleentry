@@ -1,6 +1,6 @@
 [package]
 name        = "doubleentry"
-version     = "0.6.0"
+version     = "0.7.0"
 edition     = "2024"
 rust-version = "1.94"
 authors     = ["hupe1980"]
@@ -55,6 +55,17 @@ postgres = ["dep:sqlx", "sqlx/postgres"]
 ## `SqliteStore::migrate`.
 sqlite = ["dep:sqlx", "sqlx/sqlite"]
 
+## Ed25519 cosigning of tree heads, in the C2SP signed-note format.
+##
+## The `witness` module's state machine — which decides whether a head may be
+## vouched for, and refuses a second history at the same size — needs no
+## cryptography and is always available. This feature adds the keys, so a
+## decision can be turned into a signature a third party can check.
+##
+## No HTTP: `AddCheckpoint` is the C2SP `tlog-witness` request and response as
+## bytes, for whatever client you already have.
+witness = ["dep:ed25519-dalek", "dep:sha2"]
+
 ## An Apache Iceberg cold tier: compacts sealed periods into Parquet.
 ##
 ## Pulls in Arrow, Parquet and object storage, so it is off by default.
@@ -76,6 +87,17 @@ serde    = { version = "1", features = ["derive"], optional = true }
 sqlx     = { version = "0.8", default-features = false, features = [
     "runtime-tokio-rustls", "time", "uuid",
 ], optional = true }
+
+# Cosigning. `rand_core` is deliberately off: this crate reads no randomness and
+# no clock, so a key is built from caller-supplied bytes and a cosignature's
+# timestamp is a caller-supplied argument. Nothing here can be non-deterministic.
+ed25519-dalek = { version = "2", default-features = false, features = [
+    "std", "zeroize",
+], optional = true }
+# The note key hash is specified as SHA-256, and interoperating is the whole
+# point of using a specified format — BLAKE3 is already here and cannot be
+# substituted.
+sha2 = { version = "0.10", default-features = false, optional = true }
 
 # Cold tier. Arrow and Parquet must match what `iceberg` itself resolves.
 iceberg      = { version = "0.10", optional = true }

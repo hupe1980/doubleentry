@@ -1,7 +1,7 @@
 +++
 title = "Persistence"
 description = "The LedgerStore contract, the executable conformance suite that defines it, and the SQLite and PostgreSQL backends."
-weight = 14
+weight = 15
 +++
 
 ## The contract
@@ -33,23 +33,71 @@ A backend must guarantee all of the following:
 7. **Balance limits are enforced in the write path.** A checked-then-written
    limit races: two appends that each fit the balance they read can together
    breach it. See [Accounts](@/docs/accounts.md#balance-limits).
-8. **Seals chain.** `seals()` returns them in chain order, and what comes back
-   reproduces a chain that verifies — against the store's *own* ledger, so the
-   first seal is checked as strictly as the last.
-9. **Seals bind their account handles.** A seal's `accounts` head is the
-   commitment over the bindings the store itself holds.
-10. **Periods seal in date order.** A closing balance is cumulative through the
+8. **A posted-to leaf cannot gain a child.** Only leaves are postable, so
+   `register_account` must refuse a path beneath an account that already carries
+   postings. Otherwise the parent becomes an aggregation node and every later
+   entry on it is refused — including the reversal that would correct it —
+   leaving a balance that can never be moved. See
+   [Accounts](@/docs/accounts.md#the-two-rules-it-does-enforce).
+9. **Seals chain, and the chain describes the store's own log.** `seals()`
+   returns them in chain order, and what comes back reproduces a chain that
+   verifies — against the store's *own* ledger, so the first seal is checked as
+   strictly as the last. Stronger than it sounds: each seal carries a consistency
+   proof from its predecessor's tree, and the suite additionally rebuilds the log
+   from `page()` and checks every seal's tree head against it. A chain that
+   verifies over a history the store does not hold is not a chain this store may
+   return. See
+   [the chain](@/docs/periods-and-seals.md#why-the-fifth-rule-is-the-load-bearing-one).
+10. **Seals bind their account handles, and the chain is checked against them.**
+    A seal's `accounts` head is the commitment over the bindings the store itself
+    holds, taken at the size the seal recorded — so renumbering the accounts
+    table is caught, rather than merely being detectable by whoever thinks to
+    look. The suite runs `SealChain::verify_against_accounts` over the stored
+    chain and a registry rebuilt from the stored bindings, which is the check
+    that turns the `accounts` head from evidence into evidence somebody reads.
+11. **Periods seal in date order.** A closing balance is cumulative through the
    period's last day, so sealing one while an earlier period is still open lets
    an ordinary later booking restate it. Enforce it with
    `PeriodCalendar::check_sealable` rather than by hand — see
    [the sealed watermark](@/docs/periods-and-seals.md#the-sealed-watermark).
-11. **A sealed balance stays provable and nameable.** `prove_sealed_balance`
+12. **A sealed balance stays provable and nameable.** `prove_sealed_balance`
    must keep answering after the registry has grown, an account has closed and a
    limit has changed — all routine — and it must refuse rather than return a
    proof when the rebuilt closing balance does not match the seal.
-12. **Archived heads stay checkable.** `head_at`, `prove_inclusion_at` and
-   `prove_consistency_between` answer for a head published in the past, not
-   only the current one.
+13. **Archived heads stay checkable, in `O(log n)`.** `head_at`,
+    `prove_inclusion_at` and `prove_consistency_between` answer for a head
+    published in the past — and answer it from a logarithmic number of reads
+    rather than a replay. The cost is part of the contract, not an optimisation:
+    a backend that rebuilds the tree per proof passes every correctness check and
+    falls over at scale. Store the interior nodes and serve a
+    `merkle::nodes` plan — see [Proofs](@/docs/proofs.md#cost).
+14. **Entries are findable by their idempotency key.** The key is derived from a
+    source transaction, so "did we already book message X?" is the question that
+    follows — and the alternative to `get_by_key` is rebuilding the entry and
+    re-submitting it, which answers by writing.
+15. **Balances slice by dimension and by date, on either date.** A
+    `BalanceQuery` narrows any balance read by reporting axis, date range, or log
+    prefix, and the narrowings compose. The date range applies to the **booking**
+    date by default and to the **value** date when the query says so — see
+    [Two dates](@/docs/statements.md#two-dates-and-which-one-a-report-means). A
+    backend that stores dimensions or a value date but cannot filter by them has
+    a write-only feature.
+16. **A statement scopes to a period and opens at the right figure.**
+    `StatementPage::opening` carries in everything dated **before** the query's
+    window plus everything the earlier pages showed, so a March statement opens
+    at February's closing rather than at zero and `opening` plus the page's
+    movements is the last line's `running`. The first half is defined by date,
+    not by log position: entries arrive in recording order, so bounding it by
+    position folds a later-dated entry into the middle of the statement and
+    leaves a backdated one out of the opening. The suite books its fixture out of
+    date order on purpose.
+17. **Checkpoints never go backwards.** `save_checkpoint` leaves a *later*
+    stored checkpoint in place. A checkpoint is a cache for a fold, so
+    overwriting it with an earlier one records nothing and loses work — the next
+    reader re-folds from further back — and it would make the stored value depend
+    on which of two writers arrived last. Monotone, the write is idempotent and
+    order-independent, which is what lets a caller checkpoint from more than one
+    place without coordinating.
 
 ## Why a conformance suite ships with the library {#conformance}
 
@@ -62,6 +110,15 @@ Publishing the trait alone would leave every implementor to guess what
 "idempotent" or "atomic" means here. The suite makes the contract executable: a
 backend either passes it or is not a backend.
 
+One rule it cannot check is the first. "Append-only" is a claim about everything
+a backend does *not* do, over all future time, and a suite only observes what it
+can provoke. What it checks instead is every consequence it can reach — a record
+read twice comes back identical, the log stays dense and complete across appends,
+a refused write leaves nothing behind. Where the property has to be *enforced*
+rather than tested, enforce it below the application: PostgreSQL can revoke
+`UPDATE` and `DELETE`, and that is the difference between a convention and a
+property.
+
 ```rust
 use doubleentry::storage::{MemoryStore, conformance};
 
@@ -70,8 +127,8 @@ let report = conformance::block_on(conformance::check_all(&store));
 report.assert_passed();
 ```
 
-Twenty checks, each building its own accounts and entries, so a backend needs to
-provide nothing but an empty store.
+Twenty-five checks, each building its own accounts and entries, so a backend
+needs to provide nothing but an empty store.
 
 ## Backends
 
@@ -86,19 +143,19 @@ mode — and a test asserts they **agree**: same log indices, same content hashe
 same tree root, same trial balance for the same operations. An abstraction that
 only one implementation satisfies is not an abstraction.
 
-Writing the second backend paid for itself immediately. The PostgreSQL store had
-been ordering the seal chain by `sealed_at, period_id`, which is neither chain
-order nor reliable: two seals in the same clock tick order arbitrarily, and the
-fallback is lexical. SQLite has no sub-second timestamp ordering at all, which
-forced the question and produced the right answer for both — an explicit
-`chain_position`.
+Two implementations is what keeps the contract honest. The seal chain carries an
+explicit `chain_position` rather than ordering by `sealed_at, period_id`, because
+a timestamp is neither chain order nor reliable — two seals in the same tick
+order arbitrarily, and the fallback is lexical. A single backend can hide that
+behind whatever its engine happens to do.
 
 ### Choosing between them
 
 SQLite suits embedded and single-process deployments and needs no server.
 
 PostgreSQL additionally enforces the balance invariant *in the database* via a
-deferred constraint trigger, enforces period non-overlap with an `EXCLUDE`
+deferred constraint trigger — per currency **and layer**, the same key every
+balance in the schema is reported against — enforces period non-overlap with an `EXCLUDE`
 constraint, and supports revoking `UPDATE` and `DELETE` — so where the ledger
 must be defended against processes other than this one, it is the stronger
 choice. Immutability enforced only in application code is a convention;

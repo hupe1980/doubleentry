@@ -61,9 +61,44 @@ impl std::fmt::Display for Direction {
 
 /// Whether a posting has settled or is still reserved.
 ///
-/// A pending posting reserves an amount without moving the settled balance. It
-/// is later resolved by a further entry that either settles or releases it —
-/// both of which are ordinary appends, so nothing is ever mutated.
+/// A pending posting reserves an amount without moving the settled balance. The
+/// two layers are totalled apart everywhere — balances, statements, seals,
+/// clearings — and an entry has to balance within each of them, so a reservation
+/// can never be offset by a settled movement.
+///
+/// # Resolving a reservation
+///
+/// There is no `post` and no `void` operation: the log is append-only and both
+/// are ordinary entries.
+///
+/// - **Settling** is one entry carrying the reservation's *inverse* in
+///   [`Pending`](Layer::Pending) and the real movement in
+///   [`Settled`](Layer::Settled). Each layer balances on its own, so one entry
+///   both clears the hold and moves the money.
+/// - **Releasing** is the inverse alone —
+///   [`Entry::reverse`](crate::Entry::reverse) builds it.
+/// - **Settling part** is the same entry with a smaller settled leg and a
+///   partial pending inverse; the remainder stays reserved.
+///
+/// Two consequences worth stating:
+///
+/// **What stops a hold being released twice** is a
+/// [`BalanceLimit`](crate::BalanceLimit), and only that. The engine cannot tell
+/// a release from a fresh hold the other way — they are the same posting. It can
+/// tell that a cash box may not go credit, so
+/// [`NoCreditBalance`](crate::BalanceLimit::NoCreditBalance) refuses the second
+/// release: the limit folds both layers, and a doubled release drives the fold
+/// below zero. On an unlimited account it is accepted, like any other credit to
+/// cash you do not have. Limit the accounts you hold reservations on.
+///
+/// **Which release discharged which hold** is [`Clearing`](crate::Clearing),
+/// which is scoped to a layer. Each reservation is an open item, a release is
+/// applied against it, over-application is refused, and
+/// [`Journal::open_items`](crate::Journal::open_items) lists what is outstanding.
+///
+/// A reservation does not expire on its own: expiry needs a clock, and a hold
+/// that vanished without an entry would be a balance change nothing in the log
+/// accounts for. Book the release from your scheduler instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Layer {

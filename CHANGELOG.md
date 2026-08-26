@@ -12,9 +12,789 @@ Entries marked ⚠️ change a hash, an encoding or the schema. Read those befor
 upgrading a ledger that already holds data — each one now says what an existing
 ledger has to do, which earlier revisions of this file wrongly said was nothing.
 
-## [Unreleased]
+## [0.7.0] — 2026-08-26
 
-Renamed to `[0.6.0]` when tagged, as `[Unreleased]` was for `0.5.0`.
+### Accounts roll up: the report the tree exists for
+
+`AccountPath` is a hierarchy and only leaves are postable, which is what makes a
+*node's* balance a single defensible number: everything beneath it. There was no
+way to ask for it.
+
+```text
+Assets                            1190.00
+  Assets:Bank                     1000.00
+    Assets:Bank:Main              1000.00
+  Assets:Cash                      190.00
+Income                           -1190.00
+  Income:Sales                   -1190.00
+```
+
+- New `rollup` module — `Rollup`, `RollupNode` — plus `Journal::rollup`. Nodes
+  come back in path order, which for segment-wise paths is depth-first pre-order,
+  so indenting by `depth()` is the report.
+- **Grouping nodes are inferred** from the paths that exist, so a chart that
+  registers only leaves still produces a tree. That is grouping by path prefix,
+  not an invented account: a registered node carries its handle and `AccountKind`,
+  and `is_registered()` says which.
+- Each node carries `own` (posted directly here) and `subtree` (here and below).
+  Neither reconstructs the other, and both are gross-preserving.
+- One `(currency, layer)` per report. A parent cannot hold the sum of its
+  children in two currencies.
+- `to_depth(n)` summarises without recomputing: a subtree total already carries
+  everything beneath it.
+- Deliberately not a `TrialBalance`, whose rows sum to zero — these include both
+  a parent and its children. The *roots* do sum to the trial balance.
+
+No backend method: the fold is pure over a trial balance and a registry, both of
+which a `LedgerStore` already serves, so a report from a database and one from
+memory are the same report.
+
+### ⚠️ Balance reads fold by booking date or value date
+
+`value_date` was stored on every entry, hashed into it, written to both schemas
+and bounded by `LedgerPolicy::with_max_value_date_drift`. Nothing could read it
+back.
+
+An invoice booked on 28 March with value 2 April belongs to **March's books and
+April's cash**, and checking a bank statement against a booking-dated fold is the
+classic reconciliation mistake.
+
+```rust
+let march = BalanceQuery::between(date!(2026 - 03 - 01), date!(2026 - 03 - 31));
+journal.balance(&cash, march)?;                  // the books
+journal.balance(&cash, march.by_value_date())?;  // the cash
+```
+
+- New `DateBasis`, and `BalanceQuery::by_value_date` / `by_booking_date` /
+  `basis`. Booking date remains the default.
+- New `EntryDates` and `Entry::dates`. `BalanceQuery::includes_entry` takes an
+  `EntryDates` rather than a bare `Date`, so the query picks the date it means
+  instead of the caller picking — and two adjacent `Date` arguments cannot be
+  transposed.
+- `AssertAt::OnDate` gains a `basis` field; `BalanceAssertion::on_value_date`
+  joins `on_date`.
+- `StatementLine` gains `value_date`: a value-dated statement still has to say
+  which period each line was booked in.
+
+The basis is a **reporting** choice. Period membership, the sealed watermark and
+what a seal commits to stay booking-dated — a settlement instruction must not be
+able to reopen sealed books.
+
+**Migration.** ⚠️ Both reference schemas add `entries_value_date`; an index on
+one date and not the other makes half the queries a sequential scan. `AssertAt`
+and `StatementLine` gained fields, so struct literals need them.
+
+### The seal chain is checked against the account registry
+
+A trial-balance leaf names its account by **handle**, so re-registering the same
+paths in a different order repoints every sealed balance while every hash in the
+chain still matches. `Seal::accounts` records the commitment that exposes it;
+nothing compared the two on any routine path.
+
+- New `SealChain::verify_against_accounts`, the registry half of
+  `verify_against_log`. It compares each seal's `accounts` head against the
+  registry's commitment *at the size the seal recorded* — the registry has grown
+  since, so a comparison against the current one would fail for every seal but
+  the last.
+- New `AccountRegistry::commitment_at`. A registry only ever grows, so its
+  history is exactly its own prefixes.
+- New `SealChainError::AccountsRebound` and `SealChainError::BeyondTheRegistry`.
+- `Journal::verify_seals` runs both halves, so `Journal::audit` covers it, and
+  the conformance suite holds every backend to it.
+
+### Recording costs the entry, not the chart of accounts
+
+`Journal::record` cloned the whole maintained trial balance per entry so it could
+apply the postings to a copy and discard it if a balance limit refused. That made
+a booking cost `O(accounts × currencies × layers)`.
+
+Balances are now applied in place with an exact undo — every key saved before it
+is first touched, restored in reverse, and *absence* restored as absence, since a
+trial balance with no row for a key says the account never moved.
+
+Measured on a debug build: at five thousand accounts an append was 6.5× the cost
+it was at fifty, and the curve does not flatten. The two are now within noise.
+`tests/scale.rs` guards both axes a ledger grows on — a two-account fixture is
+blind to the second.
+
+
+### ⚠️ Proofs are `O(log n)` reads, and the log stores the tree
+
+Every proof a SQL backend produced rebuilt the entire Merkle tree first. Both
+backends read every content hash in the ledger, held them all at once, and folded
+the whole thing — to answer a question whose answer is under a kilobyte.
+
+At a hundred million entries that is roughly three gigabytes of memory per
+`prove_inclusion` call. Not a slowdown: an outage. The crate's own documentation
+called proofs "audit-time operations, not write-path ones", which was true about
+*time* and quietly wrong about memory.
+
+The in-memory path was no better in shape and worse in one specific place:
+`TrialBalanceCommitment::prove_all` called an `O(n)` proof once per row, so
+proving a whole trial balance was **quadratic** in the size of the chart of
+accounts.
+
+The fix is the one Certificate Transparency, Trillian and Go's `sumdb/tlog` all
+use: store the interior nodes. A node whose subtree is complete can never change
+in an append-only log, so it is written once and read back forever; only the
+ragged right edge is folded at read time.
+
+| Operation | Before | After |
+|---|---|---|
+| Inclusion / consistency proof | `O(n)` time **and memory** | `O(log n)` |
+| Historical root or head | `O(n)` (memory) / one row (SQL) | `O(log n)` |
+| `TrialBalanceCommitment::prove_all` | `O(n²)` | `O(n log n)` |
+| Append | amortised `O(1)` | unchanged |
+| Storage | 32 bytes per entry | `2n − popcount(n)` hashes — just under two per entry |
+
+New `merkle::nodes` module: the numbering, and `RootPlan` / `InclusionPlan` /
+`ConsistencyPlan`. Reading is split into *plan, fetch, assemble* because storage
+is asynchronous and this crate is not — a plan names the positions, the caller
+fetches them however it likes, and a pure fold produces the proof. **The
+in-memory log and both SQL backends run the same two functions**, so a proof from
+a database and a proof from memory are the same proof.
+
+The numbering is Go `sumdb/tlog`'s `StoredHashIndex` exactly, so the on-disk
+layout is one other transparency-log tooling already understands.
+
+RFC 6962's `MTH`, `PATH` and `SUBPROOF` are kept, transcribed literally, as a
+**test-only reference**, and the fast path is compared against them exhaustively
+over every size and position up to 130 leaves. An optimisation with no
+independent statement of what it is optimising is one nobody can audit.
+
+`MerkleLog` now holds nodes rather than payloads:
+
+- `leaves()` is **removed** — the payloads are not kept. `nodes()` returns the
+  stored tree.
+- `verify_incremental_state()` is **replaced by** `verify_structure()`, which
+  checks that every interior node is the hash of the two beneath it. Strictly
+  stronger, and it needs no payloads: a single altered node fails wherever it
+  sits, rather than only being visible as a changed root.
+- `MerkleAccumulator` gains `push_recording`, which returns the nodes an append
+  completed. It is no longer a *storage* format — a backend that keeps its tree
+  reads the subtree cover back in `O(log n)` — but it is still how the write side
+  gets those nodes without reading anything.
+
+**Migration.** ⚠️ Both reference schemas change. `log_subtrees` is replaced by
+`log_nodes (node_index, node)`, and `entries.tree_root` is **dropped**: a
+historical head is now the same `O(log n)` lookup, so the column was a second
+copy of a derived value, and two fields that must agree are two fields that can
+disagree. The project is pre-1.0 and this is a hard cut — recreate the database.
+
+### Pruning an archived prefix no longer costs provability
+
+A consequence of the above, large enough to state on its own.
+
+The cold tier's protocol ends "only then may the operational store drop the
+rows", and doing so used to break the hot store's proofs completely: the tree was
+derived from the stored leaves, so a hole renumbered every leaf after it.
+`prove_inclusion` returned a proof for a *different* entry while the head went on
+reporting the truth. The backends had to detect the hole and refuse
+(`LogNotDense`), which was the best available answer and not a good one.
+
+The tree now lives in `log_nodes`, apart from `entries`. Archiving a prefix
+leaves it untouched: the log keeps its length and its root, and inclusion and
+consistency proofs keep working *across the archived range*. The proof comes from
+the hot store and the leaf it is checked against comes from the archive — which
+is the arrangement an archive is for.
+
+What pruning still costs is the entry bodies: `get` stops finding them, a
+statement stops listing them. Those answers live in the archive.
+
+`LogNotDense` is **removed** from both backend error types; the condition it
+named is no longer reachable. Two new variants replace it where genuine
+corruption is possible: `MissingNode` (a node position the store cannot produce —
+nodes are never updated or deleted, so this means a partial restore) and
+`PartialLog` (a node count no whole number of records produces).
+
+`Seal::build` now has a durable counterpart, `Seal::from_parts`, for a backend
+that reads its head and consistency proof out of storage rather than deriving
+them from a log it holds. It **checks** the parts rather than trusting them — the
+proof has to verify against the predecessor's head and this one before anything
+is hashed — and both constructors share one rule with `SealChain::verify`, so a
+seal that could never chain is never written. Both now return
+`Result<_, SealChainError>`.
+
+### ⚠️ A seal chain now proves the log was only appended to
+
+`SealChain::verify` checked that seals hash to their own contents, name their
+predecessor, grow monotonically, name one ledger, and seal each period once. All
+of that is about the *seals*, and none of it looks at the entries underneath.
+
+Two seals claiming tree sizes 100 and 200 with **entirely unrelated roots**
+satisfied every one of those rules. `prev_seal` matches, both hashes are
+self-consistent, sizes grow, the registry grows. A log rebuilt from scratch
+between two closes verified byte for byte — which is precisely the alteration a
+seal exists to expose. The crate had `ConsistencyProof` sitting in the next module
+and never applied it to the chain.
+
+`Seal` now carries `prev_consistency`: a proof that the predecessor's log is a
+**prefix** of this one's, inside the seal preimage so it cannot be swapped for one
+relating a different pair of trees. `SealChain::verify` checks it, turning *"these
+commitments are in order"* into *"this history was only ever appended to"* — and
+it does so **offline**, for a recipient holding the seals and no database.
+
+`None` is admissible in exactly two places, both pinned rather than tolerated: the
+genesis seal, and one following a predecessor whose tree was empty (no proof from
+the empty tree exists, so its root is checked against the empty root instead).
+Anything else is `SealChainError::MissingConsistency`. The field cannot be dropped
+to make a rewritten history verify.
+
+Also new: `SealChain::verify_against_log`, which additionally recomputes each
+seal's tree head from a log and compares. `verify` alone is satisfied by any
+internally consistent chain, *including one over a history nobody holds*;
+`Journal::verify_seals` now runs the stronger form, and the conformance suite
+rebuilds the log from `page()` and holds every backend to it.
+
+`Seal::build` takes `&MerkleLog` and `Option<&Seal>` instead of a `TreeHead` and
+an `Option<Hash>`, and returns `Result`. Both changes exist so the proof and the
+head it relates cannot come from different trees.
+
+**Migration.** ⚠️ The seal preimage gained a field, so **every `seal_hash`
+changes**. Both reference schemas gain a `prev_consistency` BLOB/BYTEA column on
+`seals`. An existing ledger cannot be migrated by adding the column: seals written
+before this carry no proof, so the chain will refuse them at the first link. The
+project is pre-1.0 and this is a hard cut — re-seal from a fresh chain, or stay on
+0.6. Cost is `O(log n)` hashes per seal; a billion-entry log adds under a kilobyte
+to each.
+
+### ⚠️ A consistency proof from the empty tree is refused, not returned
+
+`consistency_proof(0)` used to return a proof, and that proof verified. Correctly,
+too — every log extends the empty tree — and that was the trap. The statement it
+makes is *true of every history that has ever existed*, so it constrains neither
+the new root nor anything else. An auditor who archived a head **before the first
+entry** got `true` back from a check that examined nothing, indistinguishable from
+a genuine verification unless they knew to ask.
+
+The previous release documented the trap on `ConsistencyProof::is_vacuous` and
+left the behaviour. Documenting a footgun the crate could refuse is not this
+crate's standard: `Entry` refuses to deserialise as `Balanced`, `Seal` re-checks
+its hash on the way in, `InclusionProof::verify` takes a head rather than a root.
+
+So it is refused at both ends. `MerkleLog::consistency_proof(0)` and
+`consistency_proof_between(0, _)` return `ProofError::EmptyOldTree`, and
+`ConsistencyProof::verify` returns `false` for `old_size == 0` — both, because the
+fields are public and a proof arrives over a wire. A `true` from `verify` now
+always means something was checked.
+
+This is what the specifications do.
+[RFC 9162 §2.1.4.2](https://www.rfc-editor.org/rfc/rfc9162#section-2.1.4.2)
+defines consistency only for `0 < m ≤ n`, and Go's `tlog.ProveTree` refuses
+`m < 1`.
+
+`ConsistencyProof::is_vacuous` is **removed**. With construction and verification
+both refusing, it had nothing left to warn about.
+
+`ConsistencyProof` also gains a canonical encoding — `Canonical` plus
+`from_canonical_bytes` — because a seal now carries one and a backend has to store
+and read it back. The decode is strict: trailing bytes, a truncated path, or a
+declared count the buffer cannot satisfy are all refused.
+
+**Migration.** Archive tree heads with at least one entry in them. Code calling
+`consistency_proof(0)` was getting an answer that meant nothing and now gets an
+error saying so.
+
+### Witness cosigning: closing the split view
+
+Every guarantee this crate makes is *relative to a tree head*. Inclusion is
+against a head, consistency is between two heads, a seal commits to a head. So an
+operator who can serve two heads can serve two histories — head `H₁` to the tax
+authority, `H₂` to the bank — with a complete, internally consistent log behind
+each. Every proof either party checks verifies, because nothing is wrong *inside*
+either view. No proof can detect this; each party only ever sees one side.
+
+The [proofs guide](https://hupe1980.github.io/doubleentry/docs/proofs/) has always
+ended on the admission — *"a head has to come from somewhere the verifier already
+trusts"* — and offered nothing to get there. `doubleentry::witness` is that
+somewhere.
+
+A witness holds one row per log (origin, size, root) and applies one rule above
+all others: **it will not vouch for a second history at a size it has already
+vouched for.** Offered a head at a known size with a different root, it returns
+`WitnessError::Fork` and never signs. Growth must be *proven*, not asserted —
+a later head without a verifying `ConsistencyProof` is refused.
+
+```rust
+let mut witness = Witness::new(MemoryWitnessStore::new());
+witness.trust(origin.clone(), archived_head)?;          // out of band, deliberately
+
+assert!(matches!(
+    witness.offer(&origin, forked_head, None),
+    Err(WitnessError::Fork { .. })
+));
+```
+
+Two decisions worth stating, because both were live:
+
+**No trust-on-first-use.** `Witness::trust` refuses a log it already tracks. A
+witness that adopted whatever head it was shown first could be introduced to the
+fork as easily as to the log, by the same operator, and would cosign the fork with
+complete sincerity. Re-pointing an existing witness is exactly how a fork would be
+laundered, so calling the setup function twice will not do it.
+
+**No HTTP.** [C2SP `tlog-witness`](https://c2sp.org/tlog-witness) puts this behind
+`POST /add-checkpoint`; `AddCheckpoint` gives you that request and response as
+bytes and stops there. Shipping an async runtime and a TLS stack to save fifteen
+lines would put both in the dependency tree of every user who never touches a
+witness. `WitnessError` documents its status code per variant.
+
+The state machine needs no cryptography and is always available. The new
+`witness` **feature** adds Ed25519 keys — `ed25519-dalek` and `sha2` — so a
+decision becomes a signature a third party can check. `Cosigner::cosign` runs the
+state machine first and signs only if it returns: a refused head produces an error
+and no bytes at all.
+
+The wire format is [C2SP `signed-note`](https://c2sp.org/signed-note) around a
+[`tlog-checkpoint`](https://c2sp.org/tlog-checkpoint) body with
+[`tlog-cosignature`](https://c2sp.org/tlog-cosignature) signatures — what
+Certificate Transparency, the Go checksum database, Sigsum and sigstore speak.
+Not decoration: a witness is only worth having if it is *somebody else's*, and a
+bespoke format could only ever be cosigned by software this crate ships. Key
+hashes use SHA-256 rather than the BLAKE3 used everywhere else here, because
+interoperating is the whole point and a substitution would silently disagree with
+every existing implementation.
+
+That claim is checked rather than asserted. `tests/witness.rs` pins the exact
+bytes of a note, and those bytes were cross-checked against Go's
+`crypto/ed25519` and the key-hash construction in `golang.org/x/mod/sumdb/note`:
+the derived public key matches, both key hashes match, and `ed25519.Verify`
+accepts the cosignature this crate produced. Extension lines are read and
+rendered back verbatim — never written, since the specification calls them NOT
+RECOMMENDED — because dropping them would render a body nobody signed and
+refusing them would mean refusing to cosign for any log that uses one.
+
+The engine still reads no clock. A cosignature covers a timestamp, so the
+timestamp is an **argument**; `ed25519-dalek` is pulled in with `rand_core` off so
+that holds by construction rather than by discipline.
+
+**Migration.** Purely additive. Nothing to do.
+
+### `Journal::audit()` — one call for "is everything alright"
+
+`verify_log`, `verify_balances`, `verify_balanced` and `verify_seals` are all
+public and all worth calling. Knowing to call *all four* was left to the reader,
+and getting it wrong is silent: a caller who checks the log and not the seals has
+verified something real and concluded something broader.
+
+```rust
+let report = journal.audit();
+assert!(report.passed(), "{report}");
+```
+
+All four run — the first failure is not necessarily the most informative — and a
+failing report names which check and why. `AuditReport` and `AuditCheck` are
+deliberately the same shape as the conformance suite's `Report` and
+`CheckResult`: both answer "did this hold up", and a reader who has met one
+should not have to learn the other.
+
+### `save_checkpoint` no longer goes backwards
+
+`LedgerStore::load_checkpoint` was documented as returning "the most recent
+checkpoint", and all three backends did an unconditional upsert. Saving an
+*earlier* checkpoint silently replaced a later one, and two concurrent writers
+left whichever arrived last.
+
+A checkpoint is a cache for a fold over the journal, so that is not a write, it is
+a loss: the next reader re-folds from further back. The upsert is now conditional
+on the tree size not going backwards, in `MemoryStore`, SQLite and PostgreSQL
+alike, which makes it idempotent and order-independent — two writers racing leave
+the same row whichever wins. That is what lets a caller checkpoint from more than
+one place without coordinating.
+
+Rule 17 of the `LedgerStore` contract, and the conformance suite now checks it.
+
+**Migration.** No schema change. Behaviour only.
+
+### `head_at` names the real log size when it refuses
+
+Both SQL backends reported `ProofError::SizeOutOfRange { size: 0 }` for a head
+they could not produce, whatever the log actually held. The error is read by
+whoever was told their archived head could not be reproduced, and `size: 0`
+against a populated log sends them looking at their own records rather than at the
+prefix the store is missing. It now reports the real length, at the cost of one
+round trip on a path that has already failed.
+
+### ⚠️ Entries must balance per currency **and layer**
+
+`Entry::seal` totalled debits and credits per currency alone. Every balance the
+engine reports — `TrialBalance`, `balance`, a statement, the trial-balance root a
+seal commits to — is keyed on `(account, currency, layer)`, and
+`verify_balanced` checks each currency and layer independently. Validation did
+not.
+
+So this sealed, recorded, and persisted cleanly:
+
+```rust
+Entry::new(id, key, on)
+    .post(Posting::debit(cash, Eur::parse("50.00")?, EUR).in_layer(Layer::Pending))
+    .post(Posting::credit(revenue, Eur::parse("50.00")?, EUR))   // settled
+```
+
+It nets to zero in EUR and leaves **both** layers permanently out of balance.
+`journal.verify_balanced()` returns `false` from then on, for good: the log is
+append-only, every posting in the entry looks ordinary, and nothing downstream
+points at it. One legal-looking booking falsified the engine's own consistency
+check.
+
+`ValidationError::Unbalanced` and `ValidationError::Overflow` now carry a
+`layer`, and an entry that only balances across layers is refused naming both.
+PostgreSQL's deferred trigger groups by `(currency, layer)` to match; the old
+`postings_balance_per_currency()` function is dropped by name during migration so
+a database created earlier cannot keep enforcing the weaker rule alongside it.
+
+**Migration.** No hash, encoding or column changes, so existing rows are
+unaffected and re-reading them is not required. Run `migrate` to replace the
+trigger. Then check for entries already recorded that only balance across
+layers — `journal.verify_balanced()`, or in SQL:
+
+```sql
+SELECT entry_id FROM postings GROUP BY entry_id, currency, layer
+HAVING SUM(CASE WHEN direction = 'D' THEN amount_minor ELSE -amount_minor END) <> 0;
+```
+
+Any row it returns has to be offset by a compensating entry; nothing can remove
+it. Code that split a hold and its settlement across two entries to work around
+the old rule can now book them as one atomic entry, which is what the layer was
+for.
+
+### ⚠️ A leaf that has been posted to can no longer acquire a child
+
+"Only leaves are postable" was checked when an entry was validated and nowhere
+else, so it held in one direction only. Registering `Assets:Cash:Petty` after
+`Assets:Cash` had been posted to turned the parent into an aggregation node —
+and then *every* later entry on it was refused, **including the reversal that
+would have corrected it**. The balance already sitting there could never be
+moved again. The account was bricked, silently, by an ordinary master-data
+change.
+
+`AccountRegistry` cannot make that check: it holds no postings. So registration
+moved to where the postings are.
+
+- `Journal::accounts_mut()` is **gone**. In its place:
+  `register_account`, `register_path`, `restore_account`, `close_account`,
+  `reopen_account`, `set_account_limit` — all returning `JournalError`.
+  `journal.accounts_mut().register_path(p, d)?` becomes
+  `journal.register_path(p, d)?`; the rest rename likewise. `accounts()` is
+  unchanged.
+- New `JournalError::AncestorHasPostings`, and the same variant on
+  `SqliteError` and `PostgresError`, raised by `LedgerStore::register_account`.
+- New conformance check, `check_a_posted_leaf_cannot_gain_a_child`, so every
+  backend is held to it. `check_all` now runs **21** checks.
+
+`AccountRegistry` keeps its own `register`/`close`/`set_limit` for building a
+registry outside a journal — for a `SealContext`, or for a backend rehydrating
+one. Those cannot see postings and do not pretend to.
+
+**Migration.** Rename the call sites. No schema or hash change. A ledger that
+already contains a posted-to node keeps working exactly as before — the rule
+governs registrations from now on, like every other master-data rule here.
+
+### ⚠️ A balance limit now folds both layers, so a reservation counts against it
+
+The limit was checked per `(account, currency, layer)`, against a pending balance
+that starts at zero. That is neither of the two things it could sensibly mean,
+and it failed in both directions at once.
+
+A cash box limited to `NoCreditBalance` could not reserve an outflow **at all** —
+the pending layer had nothing in it, so the first pending credit crossed zero and
+was refused. The limit did not constrain reservations; it forbade them, which is
+the one thing the pending layer exists for. And in the other direction the two
+layers never met: whatever a limited account held in one had no bearing on the
+other, so a hold and a settled draw could each fit while together exceeding the
+funds.
+
+Both are now one question about the same money.
+`BalanceLimit::headroom_minor(settled, pending)` returns the room left in minor
+units — negative when breached — folding the layers **asymmetrically**: a pending
+net working against the limit consumes room, one working for it grants none. An
+outflow already promised is gone; an inflow merely reserved has not arrived.
+Discharging a reservation nets its pending side to zero and the room returns.
+
+- `BalanceLimit::permits` takes `(&settled, &pending)` rather than one balance.
+- `JournalError::LimitBreached`, `SqliteError::LimitBreached` and
+  `PostgresError::LimitBreached` drop `layer` and `net_minor` for a single
+  `headroom_minor: i128` — negative, magnitude equal to the shortfall. A breach
+  is no longer attributable to a layer, because the check is not per layer.
+- Both SQL backends read the settled and pending totals in one pass and call
+  `headroom_minor`, so a rule with this much subtlety in it has exactly one
+  implementation.
+- The conformance check for limits now covers a reservation against an empty
+  account, a reservation within the funds, and a settled draw that ignores an
+  outstanding hold.
+
+**Migration.** Rename the error fields at any call site that matched on them.
+Nothing stored changes. Behaviour changes in two ways and both are the point:
+reservations against limited accounts that were previously refused now succeed
+when the funds are there, and settled draws that previously ignored an
+outstanding hold are now refused. If your application was maintaining its own
+"available balance" to work around the old rule, it can stop.
+
+### ⚠️ Dimensions can be reported on
+
+Dimensions were **write-only**. You could attach them to a posting, they were
+hashed into the entry, stored in `posting_dimensions`, and rehydrated on read —
+and there was no API anywhere in the crate that could filter, group or total by
+one. The index `(axis, value)` the reference schema ships for exactly this was
+never queried by anything.
+
+The docs said otherwise in three places: "the axes reporting slices by", "lets a
+trial balance group by any axis without restructuring the tree", and a note that
+`WHERE axis = 'activity' AND value = 'Network'` "is an index scan here". The
+first two described an API that did not exist; the third described an index
+nothing used.
+
+- **`DimensionFilter`** — a conjunction of clauses, in `dimensions`:
+  `matching(axis, value)` requires an equality, `missing(axis)` requires the axis
+  to be absent.
+
+  `missing` is not an afterthought. Slice by the values an axis takes and the
+  totals do not add up to the trial balance, because unattributed postings land
+  in none of the slices — silently, which is the worst way for a report to be
+  wrong. `LedgerPolicy::requiring` stops that happening going forward; `missing`
+  is how you find what slipped through before you turned it on.
+
+- **`Journal::dimension_values`** and **`LedgerStore::dimension_values`** — the
+  values an axis actually takes. The values are the caller's and nothing else
+  knows which are in use, so a report cannot slice by an axis without this.
+
+- **Both SQL backends turn an equality clause into an inner join** on
+  `posting_dimensions`, so the planner drives from `(axis, value)` rather than
+  testing every posting. It cannot duplicate a posting, because
+  `(entry_id, posting_index, axis)` is the primary key. An absence clause has no
+  row to join to and stays a `NOT EXISTS`.
+
+- **New conformance check**, `check_balances_slice_by_dimension`, covering an
+  equality, an absence, and that the two partition the account.
+
+### ⚠️ One `BalanceQuery` replaces the prefix and date read methods
+
+Adding dimensional filtering to `trial_balance(size)` and
+`trial_balance_through_date(end)` would have produced a method per combination,
+on the journal and on the trait and in three backends. They are the same fold
+with different predicates, so they are now one:
+
+```rust
+journal.trial_balance(BalanceQuery::all())?;
+journal.trial_balance(BalanceQuery::over_prefix(1_204))?;
+journal.trial_balance(BalanceQuery::through(date!(2026 - 03 - 31)))?;
+journal.trial_balance(BalanceQuery::between(a, b).matching(&filter))?;
+```
+
+- `Journal::trial_balance`, `Journal::balance`, `LedgerStore::trial_balance`,
+  `LedgerStore::balance` and `LedgerStore::balances` take a `BalanceQuery`
+  instead of `Option<u64>`.
+- `Journal::trial_balance_through_date`, `Journal::balance_on_date` and
+  `LedgerStore::trial_balance_through_date` are **gone** — they are
+  `BalanceQuery::through(…)`. The trait loses a method and gains two.
+- `BalanceQuery::between` is new and fills a real hole: there was no way to ask
+  for a period's **activity** at all, only for the cumulative position at a date.
+  That is the difference between an income statement and a balance sheet, and
+  the workaround was to fold twice and subtract.
+- `AssertAt::query()` bridges the serialisable assertion form to the query every
+  read takes. `AssertAt` itself is unchanged — an assertion travels, and a
+  borrowed filter cannot.
+
+`BalanceQuery::all()` is a fast path: the journal serves its maintained totals
+rather than re-folding, exactly as `None` did.
+
+**Migration.** Mechanical. `None` → `BalanceQuery::all()`, `Some(n)` →
+`BalanceQuery::over_prefix(n)`, `trial_balance_through_date(d)` →
+`trial_balance(BalanceQuery::through(d))`, `balance_on_date(&k, d)` →
+`balance(&k, BalanceQuery::through(d))`. No schema or hash change.
+
+### ⚠️ Statements scope to a period, and report what they open at
+
+`statement` listed an account's whole history and nothing else. A statement for
+one period — the most ordinary ledger read there is — meant paging every posting
+ever made on the account and filtering in the caller.
+
+- `Journal::statement` and `LedgerStore::statement` take a `BalanceQuery`, so
+  "this account, March, this reporting axis" is one query.
+- **`StatementPage::opening`** is new: the balance the page was entered with.
+  Both SQL backends already computed it to page correctly and threw it away, so
+  a caller wanting an opening balance issued a second query for a number the
+  first one already had.
+
+  It is two disjoint folds — everything the query narrows to that was booked
+  **before** its window, plus the lines the earlier pages already showed. So
+  `opening` plus the page's movements is the last line's `running`.
+
+  The first fold is by **date**, not by log position, and that is the subtle
+  part. Entries are appended in recording order, so bounding the carry set by
+  position folds a later-dated entry into the middle of the statement and leaves
+  a backdated one out of the opening — both from ordinary bookings, and the
+  identity above then fails for any ledger that has ever taken one.
+  `BalanceQuery::opening()` is what it is folded over, and
+  `Journal::statement_opening` takes the cursor the page resumes from.
+
+- New conformance checks: `check_statements_scope_to_a_period`, whose fixture is
+  booked out of date order on purpose and which pages a statement one line at a
+  time, and `check_queries_fold_by_value_date`. The first found a real bug in the
+  SQLite backend on its first run — see below.
+
+**Migration.** `store.statement(key, cursor)` →
+`store.statement(key, BalanceQuery::all(), cursor)`, and `StatementPage` gained
+a field, so a struct literal needs `opening`.
+
+### Fixed
+
+- **The SQLite query builder mis-bound every parameter after a reused
+  placeholder.** SQLite reads a bare `?` positionally: every *occurrence* is a
+  separate parameter, not a second reference to the same one. The generated
+  statement query names its cursor bound twice — `(index > x OR (index = x AND
+  …))` — so from that point on every value was bound one position early, and the
+  database reported a datatype mismatch rather than a wrong answer.
+
+  Placeholders are now numbered (`?1`, `?2`, …). PostgreSQL was unaffected: `$n`
+  is a reference, not a position. Caught by the new conformance check, which is
+  the argument for the suite in one line.
+
+### Added
+
+- **`LedgerStore::get_by_key` and `Journal::get_by_key`.** The lookup the
+  idempotency key exists for. The guidance is to derive a key from the source
+  transaction — a message id, an external document reference, a `(run, line)`
+  pair from a batch import — and the question that follows is "did we already
+  book message X?". There was no way to ask it: the only route was to rebuild the
+  whole entry and re-submit it, which answers by writing. Backed by the same
+  unique index that makes the append idempotent, so it is a lookup rather than a
+  scan. `Journal::index_of_key` returns just the position.
+
+- **`Amount::checked_mul_ratio`, `checked_mul_int`, `rescale`, and `Rounding`.**
+  The gap this fills was the crate's largest: there was no way to multiply an
+  amount by a rate. `net × 19 / 100` for VAT, `principal × days / 365` for
+  interest, `eur × rate / 10⁶` for a conversion — every one of them forced a
+  caller down to `to_minor()` and raw `i64` arithmetic, in the one place the type
+  exists to protect. The intermediate product overflows an `i64` long before
+  either operand is unreasonable, so the workaround was not merely inelegant.
+
+  `checked_mul_ratio` is exact in `i128` and only the result has to fit.
+  `Rounding` has seven modes named after `java.math.RoundingMode` and Python's
+  `decimal`, so a rule written against a specification in either transcribes
+  rather than translates. The mode is a required argument: there is no answer
+  that is right everywhere, and choosing one silently is how a ledger drifts.
+
+  `rescale::<Q>` restates an amount at another precision — exact when widening,
+  rounded when narrowing. Paired with `checked_mul_ratio` it is what makes a
+  conversion at a published rate expressible: parse the rate at the precision it
+  was published in, apply it, restate the result in the scale the receiving books
+  are kept in. The engine still does not convert currencies; it makes the
+  arithmetic in the middle exact and total.
+
+  `MoneyError::DivideByZero` is new.
+
+### Changed
+
+- **`SealChain` indexes its periods by position, so `get` is a lookup.** It was
+  a linear scan over every seal. A ledger on daily periods reaches thousands
+  within a decade, and `get` is on the path `prove_sealed_balance` takes.
+  `check_link` now takes a predicate rather than a set, so appending consults the
+  index it maintains while verification rebuilds one — verification that trusted
+  the cache would only be checking that the cache agreed with itself.
+
+- ⚠️ **`log_subtrees.position` is dropped from both schemas.** The heights in a
+  Merkle cover are one per set bit in the log size: distinct, strictly
+  descending, and already the primary key. `ORDER BY height DESC` is the order
+  the accumulator folds in, so the column was a second thing that had to agree
+  with the first — exactly what the `checkpoints` comment in the same file argues
+  against. A `height BETWEEN 0 AND 63` check replaces it.
+
+  **Migration.** `ALTER TABLE log_subtrees DROP COLUMN position;` — or drop and
+  let the next append rebuild it, since the table is derived state.
+
+- ⚠️ **A period entirely at or below the sealed watermark can no longer be
+  defined.** Its dates are already frozen, so nothing could ever be booked into
+  it and `check_sealable` would refuse it forever — leaving a period whose own
+  state said `open` while `state_on` said `sealed` for every date it covered.
+  New `PeriodError::DefinedBelowWatermark`.
+
+  A period arriving already **sealed** is still admitted, in any order: that is
+  the replay path a durable backend takes, and a sealed period below the
+  watermark is exactly what a sealed history looks like. The refusal is for the
+  unreachable case — `check_sealable` will not seal a period while an earlier one
+  is open, so an unsealed period below the watermark can only have been defined
+  after the fact.
+
+- ⚠️ **`PeriodCalendar::ensure` refuses to reopen a sealed period.** `transition`
+  refuses `Sealed -> Open` outright; `ensure` is the replay path and inserted
+  whatever state it was handed, so a stale row arrived at the same place by the
+  back door. The watermark meant nothing could actually be booked, but the
+  period's own state was wrong. Now `PeriodError::InvalidTransition`.
+
+- **The SQLite backend reads `log_index` as nullable on the replay path.** It is
+  nullable in the schema and this backend always assigns it inline, so the read
+  never failed — but a column that *can* be NULL read as if it cannot turns a
+  stale row into a decode error rather than the honest answer.
+
+- **`TrialBalanceCommitment::prove` binary-searches the committed rows** instead
+  of scanning them. Rows come out of a `TrialBalance` in key order, so proving a
+  hundred accounts out of a hundred thousand costs `O(k log n)`.
+
+- **The merkle property tests no longer reject two thirds of what they
+  generate.** Sizes and indices were drawn from independent ranges and filtered
+  with `prop_assume!`, so the tests explored a fraction of the cases their count
+  suggested — and proptest abandons a run once its global reject budget is spent,
+  so raising the count made the suite stop running instead. They are generated
+  together now, and the suite is clean at 4 000 cases.
+
+- **The simulation gained a straddling-value-date operation** and two invariants
+  re-checked after every step: that a rollup redistributes the trial balance
+  without changing it, and that a statement opens where the window before it
+  closed, on both date bases.
+
+### Documentation
+
+- **The stated reason for the leaf rule was wrong.** Six places said posting to
+  both a node and its descendants "makes every rollup double-count, and no
+  reporting layer can repair it". It does not: `descendants_of` includes the node
+  itself, so a subtree rollup that sums the node's own postings alongside its
+  children's is the correct total. The real defect is ambiguity — an account that
+  is both a bucket and a container has two defensible balances, its own postings
+  and its subtree's, and every report has to pick one silently — and, now stated
+  where it belongs, that such an account cannot correct itself.
+
+- **The `LedgerStore` contract said the conformance suite "checks each one".** It
+  cannot check the first. "Append-only" is a claim about everything a backend
+  does *not* do, over all future time, and a suite only observes what it can
+  provoke. Both the trait docs and the persistence guide now say so, name the
+  consequences the suite *does* reach, and point at the `GRANT` that turns the
+  convention into a property.
+
+- **The contract list in the trait docs had drifted from the guide** — nine items
+  against twelve. Both are now the same seventeen, including the balance-limit
+  rule, the sealed-balance rule, the archived-head rule, the new leaf rule, the
+  key lookup, dimensional slicing, the scoped statement and the checkpoint rule.
+
+- **The pending/settled guide** gains the whole two-phase story: why each layer
+  balances on its own, the hold-and-discharge shape that makes expressible as one
+  atomic entry, and how a reservation interacts with a balance limit.
+
+- **`money.md`** gains a section on rates, rounding modes and crossing scales,
+  and `accounts.md` a worked account of what a reservation does to headroom —
+  including both wrong designs and how each fails.
+
+- **`dimensions.md`** gains the reporting half it always described and never
+  had, `statements.md` is rewritten around `BalanceQuery`, and the README gains
+  a reporting section. A new **`reporting.md`** covers the account rollup. The
+  conformance suite is now **25** checks, stated consistently in all three places
+  that count it.
+
+- **`accounts.md` states what master data costs you.** An account's
+  classification, open window and limit are outside every commitment for reasons
+  the page explained at length — and it never said the consequence: the ledger
+  records their *current* state, not their history. Nothing says when an account
+  closed or who closed it, and none of it is tamper-evident.
+
+- **`open-items.md` states what it does not do.** An open-item list takes no
+  `BalanceQuery`, because a residual is not a filtered posting: "what was open
+  as at 31 March" needs the clearings replayed to that date. The events are on
+  file and carry their dates; the ageing buckets are the caller's.
+
+- The changelog's own `[Unreleased]` heading was never renamed when `v0.6.0` was
+  tagged, and the compare links for `0.5.0` and `0.6.0` were missing. Both fixed.
+
+## [0.6.0] — 2026-08-17
 
 Everything here answers integration feedback from `accountingd` against `0.5.0`.
 Two of the three observations were valid; the third rested on a hazard that does
@@ -609,6 +1389,10 @@ the seal chain, open-item clearing, closing entries, the `LedgerStore` contract
 with its conformance suite, and the in-memory, SQLite, PostgreSQL and Iceberg
 backends.
 
+[Unreleased]: https://github.com/hupe1980/doubleentry/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/hupe1980/doubleentry/compare/v0.6.0...v0.7.0
+[0.6.0]: https://github.com/hupe1980/doubleentry/compare/v0.5.0...v0.6.0
+[0.5.0]: https://github.com/hupe1980/doubleentry/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/hupe1980/doubleentry/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/hupe1980/doubleentry/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/hupe1980/doubleentry/compare/v0.1.0...v0.2.0

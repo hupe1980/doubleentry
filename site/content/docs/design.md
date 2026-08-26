@@ -1,7 +1,7 @@
 +++
 title = "Design boundaries and testing"
 description = "What the crate deliberately is not, the two structural rules it does enforce, and how its invariants are verified."
-weight = 17
+weight = 18
 +++
 
 ## What it is not
@@ -20,25 +20,68 @@ Specifically, it does **not**:
 - **Name your reporting axes.** See [Dimensions](@/docs/dimensions.md).
 - **Decide your retention.** Pruning archived history has legal weight.
 - **Read a clock.** Identity and dates are supplied by you, which is what makes
-  replay reproduce byte-identical output.
+  replay reproduce byte-identical output. A witness cosignature covers a
+  timestamp, so that timestamp is an *argument* — see
+  [Witnessing](@/docs/witness.md#determinism).
+- **Speak HTTP.** The witness protocol is C2SP's and `AddCheckpoint` gives you
+  the request bytes; the client stays yours. An async runtime and a TLS stack are
+  a large thing to inflict on every user who never touches a witness.
+- **Keep a history of master data.** An account's classification, open window and
+  balance limit are mutable by design, and the ledger records their *current*
+  state rather than the changes that produced it. Nothing says when an account
+  closed or who closed it. See
+  [Accounts](@/docs/accounts.md#what-that-costs) for why hashing them into a
+  commitment would be worse.
+
+## Checking the books
+
+Four independent self-checks, and knowing to run all four is itself a thing to
+get wrong — so `Journal::audit()` runs them and names what held:
+
+```rust
+let report = journal.audit();
+assert!(report.passed(), "{report}");
+```
+
+- the Merkle log commits to these entries;
+- the maintained balances match them;
+- debits equal credits per currency **and** layer;
+- the seal chain holds *and describes these books* — this log **and** this chart
+  of accounts, since a seal's balances are keyed on handles and renumbering them
+  leaves every hash in the chain matching.
+
+Each can fail while the others hold, so all of them run: the first failure is not
+necessarily the most informative. A caller who checked the log and not the seals
+has verified something real and concluded something broader, which is the mistake
+this exists to remove.
+
+`O(n)`, an audit-time operation. Behind a `LedgerStore` the equivalent is the
+[conformance suite](@/docs/persistence.md#conformance) plus
+`SealChain::verify_against_log` and `verify_against_accounts` — the log and the
+chart of accounts, because a seal is evidence about both.
 
 ## What it does enforce
 
 Two structural rules, because no downstream layer can repair either:
 
-- **Only leaves are postable.** Posting to both a node and its descendants makes
-  every rollup double-count, and no reporting layer can undo it afterwards.
+- **Only leaves are postable.** An account that is both a bucket and a container
+  has two defensible balances — its own postings, and its subtree's — and no
+  report can un-mix them. Checked when an entry is validated *and* when an
+  account is registered, so a leaf that has been posted to cannot later acquire
+  a child.
 - **Postings fall inside the account's open window.**
 
 And one rule you opt into per account, for the same reason — an overdrawn cash
 account is not something a report can repair either:
 
 - **A [balance limit](@/docs/accounts.md#balance-limits)**, when set, is checked
-  against the balance an entry would leave behind, per currency and per layer.
+  against the balance an entry would leave behind, per currency, folding the
+  settled and pending layers into one answer — an outstanding reservation
+  consumes room, an expected inflow grants none.
 
 Everything else that is enforced follows from double-entry itself: entries
-balance per currency, amounts are positive magnitudes with an explicit side, and
-sealed periods do not accept postings.
+balance per currency **and layer**, amounts are positive magnitudes with an
+explicit side, and sealed periods do not accept postings.
 
 ## Determinism as a property, not a habit
 
@@ -71,7 +114,12 @@ proofs verify for every log size and every prefix; tampering with any committed
 leaf changes the root; seals detect any edit to their own fields; checkpoints
 always re-derive; clearing never over-applies and never moves money; closing
 always balances and always flattens; canonical encoding is a pure function of the
-value; and a journal of balanced entries always folds to a balanced trial balance.
+value; a journal of balanced entries always folds to a balanced trial balance; a
+[rollup](@/docs/reporting.md) redistributes a trial balance without changing it;
+and a statement's opening balance plus its movements is its closing balance, on
+either [date basis](@/docs/statements.md#two-dates-and-which-one-a-report-means)
+and over entries whose booking dates, value dates and recording order share
+nothing.
 
 **Simulation.** Long, randomly generated sequences of appends, replays,
 reversals, clearings, resets, seals, and imposing and lifting balance limits,
@@ -89,11 +137,14 @@ invalidates every hash ever written while leaving the rest of the suite green.
 deserialiser. A panic on hostile input is a denial of service in something meant
 to be a system of record.
 
-**Cost.** A guard on the shape of the curve, not on wall-clock: appending four
-times as many entries must not take sixteen times as long. Quadratic behaviour in
-a ledger fails no test — it just makes the books slower the longer they are kept.
+**Cost.** A guard on the shape of the curve, not on wall-clock, along **both**
+axes a ledger grows on: appending four times as many entries must not take
+sixteen times as long, and a hundred times as many *accounts* must not make an
+append more expensive at all — a booking touches two accounts whether the chart
+holds ten or ten thousand. A per-entry clone of the maintained balances passes
+every correctness test and is invisible on a two-account fixture.
 
-**Conformance.** The storage contract, executable — twenty checks, run against
+**Conformance.** The storage contract, executable — twenty-five checks, run against
 the in-memory, SQLite and PostgreSQL backends, and against PostgreSQL twice, once
 per sequencing mode. See [Persistence](@/docs/persistence.md#conformance).
 
@@ -112,20 +163,14 @@ cargo clippy --all-targets --all-features
 
 ## On changing the encoding
 
-The crate is published, and ledgers exist that were written by earlier versions.
-A deliberate format revision therefore means three things:
+Ledgers exist that were written by earlier versions, so a deliberate format
+revision means three things:
 
 1. Regenerating the golden vectors — `just golden-emit` prints them.
-2. **Bumping the encoding version in the domain tag** for whatever moved, so a
-   root computed under the old rule and one computed under the new rule are not
-   both labelled `v1`.
-3. Writing down in the changelog what an existing ledger has to do — which is
-   rarely "nothing".
+2. **Bumping the encoding version in the domain tag** for whatever moved, so two
+   roots computed under different rules are not both labelled `v1`.
+3. Recording in the changelog what an existing ledger has to do — which is rarely
+   "nothing".
 
-Two revisions shipped without step 2 and are recorded rather than repaired: the
-entry encoding moved in `0.3.0` under `doubleentry/entry/v1`, and the
-account-binding leaf moved in `0.5.0` under `doubleentry/accountbinding/v1`.
-Neither can cause a misreading — the preimages differ in length, so verification
-fails rather than accepting the wrong thing — and re-tagging them now would break
-every ledger written since, to relabel a hash nobody can confuse. The rule binds
-from `0.6.0` on.
+The [changelog](https://github.com/hupe1980/doubleentry/blob/main/CHANGELOG.md)
+marks every such release with ⚠️ and says what it costs.

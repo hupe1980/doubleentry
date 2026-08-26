@@ -162,6 +162,68 @@ impl CanonicalWriter {
     }
 }
 
+/// Reads back what [`CanonicalWriter`] wrote.
+///
+/// Only as much of the format as the crate actually decodes. Most canonical
+/// encodings here are write-only — they exist to be hashed, and the value they
+/// came from is the thing that is kept — so a full symmetric decoder would be
+/// code with no caller and no test that could tell it had rotted.
+///
+/// The one value that genuinely round-trips is a
+/// [`ConsistencyProof`](crate::ConsistencyProof), which a
+/// [`Seal`](crate::Seal) carries and a backend therefore has to store and read
+/// back.
+///
+/// Every read is fallible and every read is bounds-checked. A short buffer
+/// yields `None` rather than a truncated value, and [`Self::is_exhausted`] is
+/// what a caller uses to refuse trailing bytes — without which two different
+/// buffers could decode to the same value, undoing exactly the unambiguity the
+/// writer exists to provide.
+#[derive(Debug, Clone)]
+pub struct CanonicalReader<'a> {
+    buf: &'a [u8],
+    at: usize,
+}
+
+impl<'a> CanonicalReader<'a> {
+    /// Starts reading at the beginning of `buf`.
+    #[must_use]
+    pub fn new(buf: &'a [u8]) -> Self {
+        Self { buf, at: 0 }
+    }
+
+    /// How many bytes are left unread.
+    #[must_use]
+    pub fn remaining(&self) -> usize {
+        self.buf.len().saturating_sub(self.at)
+    }
+
+    /// True when every byte has been consumed.
+    ///
+    /// Check this before accepting a decoded value: trailing bytes mean the
+    /// buffer is not exactly one encoding of it.
+    #[must_use]
+    pub fn is_exhausted(&self) -> bool {
+        self.remaining() == 0
+    }
+
+    /// Reads a fixed-width byte array.
+    #[must_use]
+    pub fn array<const N: usize>(&mut self) -> Option<[u8; N]> {
+        let end = self.at.checked_add(N)?;
+        let slice = self.buf.get(self.at..end)?;
+        let out: [u8; N] = slice.try_into().ok()?;
+        self.at = end;
+        Some(out)
+    }
+
+    /// Reads a little-endian `u64`.
+    #[must_use]
+    pub fn u64(&mut self) -> Option<u64> {
+        self.array::<8>().map(u64::from_le_bytes)
+    }
+}
+
 /// A value with a canonical byte encoding.
 pub trait Canonical {
     /// Appends this value's canonical encoding to `w`.

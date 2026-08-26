@@ -29,7 +29,7 @@ use crate::dimensions::{DimensionError, Label};
 use crate::hash::{Hash, tag, tagged};
 use crate::money::{Amount, Currency, MoneyError};
 use crate::period::{PeriodCalendar, PeriodState};
-use crate::posting::Posting;
+use crate::posting::{Layer, Posting};
 use crate::serde_support::validating_string_serde;
 
 /// Maximum characters in an entry description.
@@ -378,7 +378,7 @@ pub enum EntryFieldError {
 /// Which currencies a ledger accepts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CurrencyPolicy {
-    /// Any currency, balanced independently per currency.
+    /// Any currency. Each still balances independently, as does each layer.
     #[default]
     Multi,
     /// Exactly one currency.
@@ -503,17 +503,27 @@ pub enum ValidationError {
         /// The booking date.
         on: Date,
     },
-    /// Debits and credits did not match for a currency.
+    /// Debits and credits did not match within one currency and layer.
+    ///
+    /// The layer is part of the key, not decoration. A reservation and a
+    /// settled movement are different claims on the same account and are
+    /// totalled apart everywhere — balances, statements, limits, seals — so an
+    /// entry whose pending side were offset by a settled one would leave *both*
+    /// layers permanently out of balance while every posting in it looked
+    /// ordinary. Nothing downstream could repair it, because the log is
+    /// append-only.
     ///
     /// Amounts are reported in minor units at `scale`, so the variant stays
     /// independent of the entry's compile-time precision.
     #[error(
-        "{currency} is unbalanced at scale {scale}: debits {debits_minor}, \
-         credits {credits_minor} (difference {difference_minor})"
+        "{currency} ({layer}) is unbalanced at scale {scale}: debits \
+         {debits_minor}, credits {credits_minor} (difference {difference_minor})"
     )]
     Unbalanced {
         /// The currency that failed to balance.
         currency: Currency,
+        /// The layer that failed to balance.
+        layer: Layer,
         /// Gross debits, in minor units.
         debits_minor: i64,
         /// Gross credits, in minor units.
@@ -556,10 +566,12 @@ pub enum ValidationError {
         max_days: i64,
     },
     /// Accumulating the postings overflowed.
-    #[error("summing {currency} overflowed")]
+    #[error("summing {currency} ({layer}) overflowed")]
     Overflow {
         /// The currency being accumulated.
         currency: Currency,
+        /// The layer being accumulated.
+        layer: Layer,
     },
 }
 
@@ -780,8 +792,10 @@ impl<const P: u8> Entry<Draft, P> {
             });
         }
 
-        // Per-currency gross totals; ordered so error reporting is deterministic.
-        let mut totals: BTreeMap<Currency, Balance<P>> = BTreeMap::new();
+        // Gross totals per currency *and layer*; ordered so error reporting is
+        // deterministic. The layer is part of the key because every balance the
+        // engine reports is — see `ValidationError::Unbalanced`.
+        let mut totals: BTreeMap<(Currency, Layer), Balance<P>> = BTreeMap::new();
 
         for (index, posting) in self.postings.iter().enumerate() {
             if posting.amount.is_zero() {
@@ -830,20 +844,22 @@ impl<const P: u8> Entry<Draft, P> {
                 }
             }
 
-            let balance = totals.entry(posting.currency).or_default();
+            let balance = totals.entry((posting.currency, posting.layer)).or_default();
             if balance.add(posting.direction, posting.amount).is_err() {
                 errors.push(ValidationError::Overflow {
                     currency: posting.currency,
+                    layer: posting.layer,
                 });
             }
         }
 
-        for (currency, balance) in &totals {
+        for (&(currency, layer), balance) in &totals {
             if !balance.is_balanced() {
                 let debits_minor = balance.debits.to_minor();
                 let credits_minor = balance.credits.to_minor();
                 errors.push(ValidationError::Unbalanced {
-                    currency: *currency,
+                    currency,
+                    layer,
                     debits_minor,
                     credits_minor,
                     difference_minor: debits_minor.saturating_sub(credits_minor),
@@ -931,6 +947,16 @@ impl<S: sealed::State, const P: u8> Entry<S, P> {
     #[must_use]
     pub fn value_date(&self) -> Date {
         self.value_date
+    }
+
+    /// Both dates together, for a [`BalanceQuery`](crate::BalanceQuery) to pick
+    /// between.
+    #[must_use]
+    pub fn dates(&self) -> crate::balance::EntryDates {
+        crate::balance::EntryDates {
+            booking: self.booking_date,
+            value: self.value_date,
+        }
     }
 
     /// The description.
@@ -1162,7 +1188,6 @@ mod tests {
     use crate::account::{Account, AccountPath};
     use crate::dimensions::Dimensions;
     use crate::period::{Period, PeriodId};
-    use crate::posting::Layer;
     use time::macros::date;
 
     type Eur = Amount<2>;
@@ -1416,6 +1441,68 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn a_layer_that_does_not_balance_is_named() {
+        // The failure this rule exists for: the pending side is offset by a
+        // settled one, so the entry "balances" in EUR overall while leaving
+        // *both* layers permanently out of balance. Every posting in it looks
+        // ordinary and the log is append-only, so nothing downstream could
+        // repair it.
+        let f = Fixture::new();
+        let err = f
+            .draft()
+            .post(
+                Posting::debit(f.cash, Eur::from_minor(1000), Currency::EUR)
+                    .in_layer(Layer::Pending),
+            )
+            .post(Posting::credit(
+                f.revenue,
+                Eur::from_minor(1000),
+                Currency::EUR,
+            ))
+            .seal(&f.ctx())
+            .expect_err("the layers do not balance independently");
+
+        assert!(err.any(|e| matches!(
+            e,
+            ValidationError::Unbalanced {
+                currency: Currency::EUR,
+                layer: Layer::Pending,
+                ..
+            }
+        )));
+        assert!(err.any(|e| matches!(
+            e,
+            ValidationError::Unbalanced {
+                currency: Currency::EUR,
+                layer: Layer::Settled,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn a_reservation_and_its_settlement_balance_in_one_entry() {
+        // The shape the rule makes expressible: releasing a hold and booking
+        // the movement it was holding for, atomically, with each layer
+        // balancing on its own.
+        let f = Fixture::new();
+        let entry = f
+            .draft()
+            .post(
+                Posting::credit(f.cash, Eur::from_minor(1000), Currency::EUR)
+                    .in_layer(Layer::Pending),
+            )
+            .post(
+                Posting::debit(f.revenue, Eur::from_minor(1000), Currency::EUR)
+                    .in_layer(Layer::Pending),
+            )
+            .debit(f.cash, Eur::from_minor(1000), Currency::EUR)
+            .credit(f.revenue, Eur::from_minor(1000), Currency::EUR)
+            .seal(&f.ctx());
+        assert!(entry.is_ok(), "each layer balances on its own");
     }
 
     #[test]

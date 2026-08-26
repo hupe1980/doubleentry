@@ -30,8 +30,9 @@ use time::macros::date;
 use crate::account::{
     Account, AccountKind, AccountPath, AccountRecord, AccountRegistry, BalanceLimit,
 };
-use crate::balance::BalanceKey;
+use crate::balance::{BalanceKey, BalanceQuery};
 use crate::clearing::{Clearing, PostingRef};
+use crate::dimensions::{DimensionFilter, Dimensions, Label};
 use crate::entry::{Draft, Entry, EntryId, IdempotencyKey, LedgerPolicy, SealContext};
 use crate::merkle::MerkleLog;
 use crate::money::{Amount, Currency};
@@ -440,6 +441,7 @@ pub async fn check_all<const P: u8, S: LedgerStore<P>>(store: &S) -> Report {
     checks.push(check_append_assigns_dense_indices(store).await);
     checks.push(check_reads_are_stable(store).await);
     checks.push(check_idempotent_replay(store).await);
+    checks.push(check_lookup_by_idempotency_key(store).await);
     checks.push(check_idempotency_conflict(store).await);
     checks.push(check_batch_is_atomic(store).await);
     checks.push(check_pagination_covers_the_log(store).await);
@@ -450,6 +452,10 @@ pub async fn check_all<const P: u8, S: LedgerStore<P>>(store: &S) -> Report {
     checks.push(check_open_items_track_residuals(store).await);
     checks.push(check_account_bindings_survive_a_restart(store).await);
     checks.push(check_balance_limits_are_enforced(store).await);
+    checks.push(check_a_posted_leaf_cannot_gain_a_child(store).await);
+    checks.push(check_balances_slice_by_dimension(store).await);
+    checks.push(check_statements_scope_to_a_period(store).await);
+    checks.push(check_queries_fold_by_value_date(store).await);
     checks.push(check_kind_survives_a_round_trip(store).await);
     checks.push(check_dimensions_survive_a_round_trip(store).await);
     checks.push(check_balances_agree_across_readers(store).await);
@@ -522,11 +528,11 @@ pub async fn check_balances_agree_across_readers<const P: u8, S: LedgerStore<P>>
     let f = Fixture::new();
     let key = f.key();
 
-    let single = match store.balance(key, None).await {
+    let single = match store.balance(key, BalanceQuery::all()).await {
         Ok(b) => b,
         Err(e) => return CheckResult::fail(NAME, format!("balance failed: {e}")),
     };
-    match store.trial_balance(None).await {
+    match store.trial_balance(BalanceQuery::all()).await {
         Ok(tb) if tb.get_or_zero(&key) == single => {}
         Ok(tb) => {
             return CheckResult::fail(
@@ -540,7 +546,12 @@ pub async fn check_balances_agree_across_readers<const P: u8, S: LedgerStore<P>>
         Err(e) => return CheckResult::fail(NAME, format!("trial_balance failed: {e}")),
     }
     match store
-        .balances(&[f.left, f.right], Currency::EUR, Layer::Settled, None)
+        .balances(
+            &[f.left, f.right],
+            Currency::EUR,
+            Layer::Settled,
+            BalanceQuery::all(),
+        )
         .await
     {
         Ok(many) if many.get(&f.left).copied() == Some(single) => {}
@@ -563,7 +574,7 @@ pub async fn check_balances_agree_across_readers<const P: u8, S: LedgerStore<P>>
             &[AccountId::from_index(u32::MAX)],
             Currency::EUR,
             Layer::Settled,
-            None,
+            BalanceQuery::all(),
         )
         .await
     {
@@ -618,7 +629,11 @@ pub async fn check_statement_pages_do_not_repeat_or_skip<const P: u8, S: LedgerS
     }
 
     let whole = match store
-        .statement(key, PostingCursor::start().with_limit(MAX_PAGE_SIZE))
+        .statement(
+            key,
+            BalanceQuery::all(),
+            PostingCursor::start().with_limit(MAX_PAGE_SIZE),
+        )
         .await
     {
         Ok(page) => page.lines,
@@ -636,7 +651,7 @@ pub async fn check_statement_pages_do_not_repeat_or_skip<const P: u8, S: LedgerS
         if guard > whole.len().saturating_add(8) {
             return CheckResult::fail(NAME, "pagination did not terminate");
         }
-        match store.statement(key, c).await {
+        match store.statement(key, BalanceQuery::all(), c).await {
             Ok(page) => {
                 if page.lines.is_empty() && page.next.is_some() {
                     return CheckResult::fail(NAME, "an empty page handed back another cursor");
@@ -693,7 +708,10 @@ pub async fn check_checkpoints_round_trip<const P: u8, S: LedgerStore<P>>(
     let f = Fixture::new();
     let key = f.key();
 
-    let (head, balance) = match (store.head().await, store.balance(key, None).await) {
+    let (head, balance) = match (
+        store.head().await,
+        store.balance(key, BalanceQuery::all()).await,
+    ) {
         (Ok(head), Ok(balance)) => (head, balance),
         (Err(e), _) | (_, Err(e)) => return CheckResult::fail(NAME, format!("read failed: {e}")),
     };
@@ -712,6 +730,49 @@ pub async fn check_checkpoints_round_trip<const P: u8, S: LedgerStore<P>>(
         }
         Ok(None) => return CheckResult::fail(NAME, "a saved checkpoint was not found"),
         Err(e) => return CheckResult::fail(NAME, format!("load_checkpoint failed: {e}")),
+    }
+
+    // Saving an *earlier* checkpoint must not replace a later one. A checkpoint
+    // is a cache for a fold, so going backwards records nothing and loses work —
+    // and with two writers it would make the stored value depend on arrival
+    // order, which is how a caller that checkpoints from more than one place
+    // ends up re-folding the whole log.
+    if head.size > 0 {
+        let earlier_size = head.size.saturating_sub(1);
+        let earlier = match (
+            store.head_at(earlier_size).await,
+            store
+                .balance(key, BalanceQuery::over_prefix(earlier_size))
+                .await,
+        ) {
+            (Ok(h), Ok(b)) => crate::checkpoint::Checkpoint::new(key, b, h),
+            (Err(e), _) | (_, Err(e)) => {
+                return CheckResult::fail(NAME, format!("read failed: {e}"));
+            }
+        };
+        if let Err(e) = store.save_checkpoint(&earlier).await {
+            return CheckResult::fail(NAME, format!("save_checkpoint failed: {e}"));
+        }
+        match store.load_checkpoint(key).await {
+            Ok(Some(loaded)) if loaded == checkpoint => {}
+            Ok(other) => {
+                return CheckResult::fail(
+                    NAME,
+                    format!(
+                        "saving a checkpoint at {earlier_size} replaced the one at \
+                         {}: got {other:?}",
+                        head.size
+                    ),
+                );
+            }
+            Err(e) => return CheckResult::fail(NAME, format!("load_checkpoint failed: {e}")),
+        }
+
+        // And re-saving the stored one is a no-op rather than an error, so an
+        // idempotent caller is not punished for retrying.
+        if let Err(e) = store.save_checkpoint(&checkpoint).await {
+            return CheckResult::fail(NAME, format!("re-saving a checkpoint failed: {e}"));
+        }
     }
 
     // A key never checkpointed reads as absent rather than as a zero.
@@ -885,11 +946,43 @@ pub async fn check_period_lifecycle_and_seals<const P: u8, S: LedgerStore<P>>(
         Err(e) => return CheckResult::fail(NAME, format!("accounts failed: {e}")),
     }
 
+    // And the *chain* must say so against the registry the store holds, not only
+    // the seal just taken. This is what catches renumbering after the fact: the
+    // seals and the log are untouched, so every other check here passes while
+    // each sealed balance refers to a different account.
+    match store.seals().await {
+        Ok(seals) => {
+            let chain = match crate::seal::SealChain::from_seals(store.ledger().clone(), seals) {
+                Ok(chain) => chain,
+                Err(e) => {
+                    return CheckResult::fail(NAME, format!("the stored seals do not chain: {e}"));
+                }
+            };
+            match store.accounts().await {
+                Ok(records) => match AccountRegistry::from_records(records) {
+                    Ok(registry) => {
+                        if let Err(e) = chain.verify_against_accounts(&registry) {
+                            return CheckResult::fail(
+                                NAME,
+                                format!("the seal chain does not describe these accounts: {e}"),
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        return CheckResult::fail(NAME, format!("registry would not rebuild: {e}"));
+                    }
+                },
+                Err(e) => return CheckResult::fail(NAME, format!("accounts failed: {e}")),
+            }
+        }
+        Err(e) => return CheckResult::fail(NAME, format!("seals failed: {e}")),
+    }
+
     // A sealed balance must stay provable and nameable after the books move on.
-    // `Seal::accounts` is the registry commitment as of the seal; onboarding one
-    // more account used to make every already-sealed balance unnameable, and a
-    // routine `close` did the same. Both are ordinary operations, so a backend
-    // that cannot answer afterwards cannot answer in production.
+    // `Seal::accounts` is the registry commitment as of the seal, so a backend
+    // proving against the *current* registry cannot name a balance once one more
+    // account is onboarded — or once a routine `close` lands. Both are ordinary
+    // operations, so failing here means failing in production.
     let onboarded = Account::new(
         match AccountPath::parse("Conformance:Later") {
             Ok(p) => p,
@@ -916,12 +1009,12 @@ pub async fn check_period_lifecycle_and_seals<const P: u8, S: LedgerStore<P>>(
     // moved on. Which accounts those are is read off the store rather than
     // assumed, so this does not depend on the fixture's naming.
     let closing = match store
-        .trial_balance_through_date(date!(2026 - 03 - 31))
+        .trial_balance(BalanceQuery::through(date!(2026 - 03 - 31)))
         .await
     {
         Ok(tb) => tb,
         Err(e) => {
-            return CheckResult::fail(NAME, format!("trial_balance_through_date failed: {e}"));
+            return CheckResult::fail(NAME, format!("trial_balance through a date failed: {e}"));
         }
     };
     if closing.is_empty() {
@@ -983,14 +1076,38 @@ pub async fn check_period_lifecycle_and_seals<const P: u8, S: LedgerStore<P>>(
             if !stored.iter().any(|s| s.seal_hash == seal.seal_hash) {
                 return CheckResult::fail(NAME, "the seal was not read back");
             }
-            match crate::seal::SealChain::from_seals(store.ledger().clone(), stored) {
-                Ok(chain) => match chain.verify() {
-                    Ok(()) => CheckResult::pass(NAME),
-                    Err(e) => {
-                        CheckResult::fail(NAME, format!("the seal chain does not verify: {e}"))
+            let chain = match crate::seal::SealChain::from_seals(store.ledger().clone(), stored) {
+                Ok(chain) => chain,
+                Err(e) => {
+                    return CheckResult::fail(NAME, format!("seals do not chain in order: {e}"));
+                }
+            };
+            if let Err(e) = chain.verify() {
+                return CheckResult::fail(NAME, format!("the seal chain does not verify: {e}"));
+            }
+
+            // Stronger, and the one that ties evidence to books: every seal's
+            // tree head has to be the head *this store's log* had at that size.
+            // `verify` alone is satisfied by any internally consistent chain,
+            // including one over a history the store does not hold — which is
+            // exactly what a rebuilt log looks like.
+            let mut leaves = Vec::new();
+            let mut cursor = Some(Cursor::start());
+            while let Some(c) = cursor {
+                match store.page(c).await {
+                    Ok(page) => {
+                        leaves.extend(page.records.iter().map(|r| r.content_hash));
+                        cursor = page.next;
                     }
-                },
-                Err(e) => CheckResult::fail(NAME, format!("seals do not chain in order: {e}")),
+                    Err(e) => return CheckResult::fail(NAME, format!("page failed: {e}")),
+                }
+            }
+            match chain.verify_against_log(&MerkleLog::from_leaves(leaves)) {
+                Ok(()) => CheckResult::pass(NAME),
+                Err(e) => CheckResult::fail(
+                    NAME,
+                    format!("the seal chain does not describe this store's log: {e}"),
+                ),
             }
         }
         Err(e) => CheckResult::fail(NAME, format!("seals failed: {e}")),
@@ -1045,7 +1162,10 @@ pub async fn check_kind_survives_a_round_trip<const P: u8, S: LedgerStore<P>>(
         currency: Currency::EUR,
         layer: Layer::Settled,
     };
-    match store.statement(key, PostingCursor::start()).await {
+    match store
+        .statement(key, BalanceQuery::all(), PostingCursor::start())
+        .await
+    {
         Ok(page) => {
             let seen = page
                 .lines
@@ -1146,6 +1266,645 @@ pub async fn check_account_bindings_survive_a_restart<const P: u8, S: LedgerStor
     };
     if rebuilt.commitment() != registry.commitment() {
         return CheckResult::fail(NAME, "rebuilt registry does not match the original");
+    }
+
+    CheckResult::pass(NAME)
+}
+
+/// A leaf that has been posted to cannot acquire a child.
+///
+/// The rule "only leaves are postable" is checked when an entry is validated,
+/// which settles the question in one direction only: an account that is a leaf
+/// today can be turned into an aggregation node tomorrow by registering
+/// something beneath it. Every entry already recorded against it would then
+/// violate the rule it was accepted under, and the log is append-only, so
+/// nothing can be taken back.
+///
+/// A registry cannot catch this — it holds no postings. A store can, and must,
+/// or the invariant holds only until the next master-data change.
+pub async fn check_a_posted_leaf_cannot_gain_a_child<const P: u8, S: LedgerStore<P>>(
+    store: &S,
+) -> CheckResult {
+    const NAME: &str = "a posted-to leaf cannot gain a child";
+
+    let existing = match store.accounts().await {
+        Ok(records) => records,
+        Err(e) => return CheckResult::fail(NAME, format!("accounts failed: {e}")),
+    };
+    let mut registry = match AccountRegistry::from_records(existing) {
+        Ok(r) => r,
+        Err(e) => return CheckResult::fail(NAME, format!("stored bindings are unusable: {e}")),
+    };
+
+    // A fresh pair, so the check does not depend on what earlier checks booked.
+    let mut ids = Vec::new();
+    for path in ["Leafconf:Bucket", "Leafconf:Other"] {
+        let parsed = match AccountPath::parse(path) {
+            Ok(p) => p,
+            Err(e) => return CheckResult::fail(NAME, format!("bad fixture path: {e}")),
+        };
+        match registry.register(Account::new(parsed, date!(2000 - 01 - 01))) {
+            Ok(id) => ids.push(id),
+            Err(e) => return CheckResult::fail(NAME, format!("fixture registration failed: {e}")),
+        }
+    }
+    let (bucket, other) = match ids.as_slice() {
+        [bucket, other] => (*bucket, *other),
+        _ => return CheckResult::fail(NAME, "fixture registration returned the wrong shape"),
+    };
+    for record in registry.records() {
+        if let Err(e) = store.register_account(&record).await {
+            return CheckResult::fail(NAME, format!("register_account failed: {e}"));
+        }
+    }
+
+    let calendar = PeriodCalendar::new();
+    let policy = LedgerPolicy::default();
+    let ctx = SealContext {
+        accounts: &registry,
+        calendar: &calendar,
+        policy: &policy,
+    };
+    let Ok(entry) = Entry::<Draft, P>::new(
+        EntryId::generate(),
+        match IdempotencyKey::new(b"leaf-rule".to_vec()) {
+            Ok(k) => k,
+            Err(e) => return CheckResult::fail(NAME, format!("bad fixture key: {e}")),
+        },
+        date!(2026 - 03 - 15),
+    )
+    .debit(bucket, Amount::<P>::from_minor(500), Currency::EUR)
+    .credit(other, Amount::<P>::from_minor(500), Currency::EUR)
+    .seal(&ctx) else {
+        return CheckResult::fail(NAME, "fixture entry failed to seal");
+    };
+    if let Err(e) = store.append(&EntryBatch::single(entry)).await {
+        return CheckResult::fail(NAME, format!("append failed: {e}"));
+    }
+
+    // Now the bucket has postings. A child under it must be refused.
+    let child = match AccountPath::parse("Leafconf:Bucket:Petty") {
+        Ok(p) => p,
+        Err(e) => return CheckResult::fail(NAME, format!("bad fixture path: {e}")),
+    };
+    let Ok(child_id) = registry.register(Account::new(child, date!(2000 - 01 - 01))) else {
+        return CheckResult::fail(NAME, "fixture registration failed");
+    };
+    let Some(record) = registry.records().into_iter().find(|r| r.id == child_id) else {
+        return CheckResult::fail(NAME, "the child record went missing");
+    };
+    if store.register_account(&record).await.is_ok() {
+        return CheckResult::fail(
+            NAME,
+            "a child was registered under an account that has already been posted to",
+        );
+    }
+
+    // And the refusal wrote nothing.
+    match store.accounts().await {
+        Ok(stored) if stored.iter().any(|r| r.id == child_id) => {
+            CheckResult::fail(NAME, "a refused registration still wrote the binding")
+        }
+        Ok(_) => CheckResult::pass(NAME),
+        Err(e) => CheckResult::fail(NAME, format!("accounts failed: {e}")),
+    }
+}
+
+/// Balances can be sliced by a reporting axis, and by a date range.
+///
+/// Dimensions exist to be reported on. A backend that stores and rehydrates them
+/// but cannot filter by them has a write-only feature, and the index the
+/// reference schema ships for exactly this would never be used.
+///
+/// Three things are checked, and the third is the one a naive implementation
+/// gets wrong: an equality clause, an **absence** clause, and that the two
+/// together partition the account. Slice by the values an axis takes and the
+/// totals come up short, because postings carrying no value land in none of the
+/// slices — silently, which is the whole reason the absence clause exists.
+pub async fn check_balances_slice_by_dimension<const P: u8, S: LedgerStore<P>>(
+    store: &S,
+) -> CheckResult {
+    const NAME: &str = "balances slice by dimension and date";
+    if let Err(e) = drain_sequencing(store).await {
+        return CheckResult::fail("sequencing", e);
+    }
+    let f = Fixture::new();
+
+    // A fresh account, so the totals below are this check's own. Every other
+    // check books against the shared pair.
+    let existing = match store.accounts().await {
+        Ok(records) => records,
+        Err(e) => return CheckResult::fail(NAME, format!("accounts failed: {e}")),
+    };
+    let mut registry = match AccountRegistry::from_records(existing) {
+        Ok(r) => r,
+        Err(e) => return CheckResult::fail(NAME, format!("stored bindings are unusable: {e}")),
+    };
+    let path = match AccountPath::parse("Conformance:Sliced") {
+        Ok(p) => p,
+        Err(e) => return CheckResult::fail(NAME, format!("bad fixture path: {e}")),
+    };
+    let sliced = match registry.register(Account::new(path, date!(2000 - 01 - 01))) {
+        Ok(id) => id,
+        Err(e) => return CheckResult::fail(NAME, format!("fixture registration failed: {e}")),
+    };
+    for record in registry.records() {
+        if let Err(e) = store.register_account(&record).await {
+            return CheckResult::fail(NAME, format!("register_account failed: {e}"));
+        }
+    }
+    let ctx = SealContext {
+        accounts: &registry,
+        calendar: &f.calendar,
+        policy: &f.policy,
+    };
+
+    let Ok(axis) = Label::new("conformance-segment") else {
+        return CheckResult::fail(NAME, "bad fixture axis");
+    };
+    let slice = |value: &str| {
+        Label::new(value)
+            .ok()
+            .and_then(|v| Dimensions::none().with(axis.clone(), v).ok())
+    };
+
+    // Three postings on one account: two attributed, one not, on two dates.
+    let rows: [(&[u8], i64, Option<&str>, time::Date); 3] = [
+        (b"dim-retail", 100, Some("Retail"), date!(2026 - 03 - 10)),
+        (b"dim-trade", 200, Some("Trade"), date!(2026 - 03 - 20)),
+        (b"dim-none", 400, None, date!(2026 - 04 - 05)),
+    ];
+    for (key, minor, value, on) in rows {
+        let amount = Amount::<P>::from_minor(minor);
+        let (mut debit, mut credit) = (
+            crate::Posting::debit(sliced, amount, Currency::EUR),
+            crate::Posting::credit(f.right, amount, Currency::EUR),
+        );
+        if let Some(value) = value {
+            let Some(dims) = slice(value) else {
+                return CheckResult::fail(NAME, "bad fixture dimension");
+            };
+            debit = debit.with_dimensions(dims.clone());
+            credit = credit.with_dimensions(dims);
+        }
+        let Ok(idem) = IdempotencyKey::new(key.to_vec()) else {
+            return CheckResult::fail(NAME, "bad fixture key");
+        };
+        let Ok(entry) = Entry::<Draft, P>::new(EntryId::generate(), idem, on)
+            .post(debit)
+            .post(credit)
+            .seal(&ctx)
+        else {
+            return CheckResult::fail(NAME, "fixture entry failed to seal");
+        };
+        if let Err(e) = store.append(&EntryBatch::single(entry)).await {
+            return CheckResult::fail(NAME, format!("append failed: {e}"));
+        }
+    }
+    if let Err(e) = drain_sequencing(store).await {
+        return CheckResult::fail("sequencing", e);
+    }
+
+    let key = BalanceKey {
+        account: sliced,
+        currency: Currency::EUR,
+        layer: Layer::Settled,
+    };
+    let debits = |b: crate::Balance<P>| b.debits.to_minor();
+
+    // The values the axis takes — absences are not among them.
+    match store.dimension_values(axis.as_str()).await {
+        Ok(values) => {
+            let found: Vec<&str> = values.iter().map(Label::as_str).collect();
+            if found != vec!["Retail", "Trade"] {
+                return CheckResult::fail(
+                    NAME,
+                    format!("dimension_values returned {found:?}, not [Retail, Trade]"),
+                );
+            }
+        }
+        Err(e) => return CheckResult::fail(NAME, format!("dimension_values failed: {e}")),
+    }
+
+    let Ok(retail_value) = Label::new("Retail") else {
+        return CheckResult::fail(NAME, "bad fixture value");
+    };
+    let retail = DimensionFilter::any().matching(axis.clone(), retail_value);
+    let unattributed = DimensionFilter::any().missing(axis.clone());
+
+    // An equality clause.
+    match store
+        .balance(key, BalanceQuery::all().matching(&retail))
+        .await
+    {
+        Ok(b) if debits(b) == 100 => {}
+        Ok(b) => {
+            return CheckResult::fail(
+                NAME,
+                format!("the Retail slice came back as {}, not 100", debits(b)),
+            );
+        }
+        Err(e) => return CheckResult::fail(NAME, format!("balance failed: {e}")),
+    }
+
+    // An absence clause — and that the slices plus the absences are the whole.
+    let whole = match store.balance(key, BalanceQuery::all()).await {
+        Ok(b) => debits(b),
+        Err(e) => return CheckResult::fail(NAME, format!("balance failed: {e}")),
+    };
+    let rest = match store
+        .balance(key, BalanceQuery::all().matching(&unattributed))
+        .await
+    {
+        Ok(b) => debits(b),
+        Err(e) => return CheckResult::fail(NAME, format!("balance failed: {e}")),
+    };
+    let mut attributed = 0i64;
+    for value in ["Retail", "Trade"] {
+        let Ok(value) = Label::new(value) else {
+            return CheckResult::fail(NAME, "bad fixture value");
+        };
+        let filter = DimensionFilter::any().matching(axis.clone(), value);
+        match store
+            .balance(key, BalanceQuery::all().matching(&filter))
+            .await
+        {
+            Ok(b) => attributed = attributed.saturating_add(debits(b)),
+            Err(e) => return CheckResult::fail(NAME, format!("balance failed: {e}")),
+        }
+    }
+    if attributed.saturating_add(rest) != whole {
+        return CheckResult::fail(
+            NAME,
+            format!("slices ({attributed}) plus unattributed ({rest}) is not the whole ({whole})"),
+        );
+    }
+
+    // A date range is activity, not the cumulative position.
+    let march = BalanceQuery::between(date!(2026 - 03 - 01), date!(2026 - 03 - 31));
+    match store.balance(key, march).await {
+        Ok(b) if debits(b) == 300 => {}
+        Ok(b) => {
+            return CheckResult::fail(
+                NAME,
+                format!("March's activity came back as {}, not 300", debits(b)),
+            );
+        }
+        Err(e) => return CheckResult::fail(NAME, format!("balance failed: {e}")),
+    }
+
+    // And the two narrowings compose, in a trial balance as well as a balance.
+    match store.trial_balance(march.matching(&retail)).await {
+        Ok(tb) if tb.get_or_zero(&key).debits.to_minor() == 100 => {}
+        Ok(tb) => {
+            return CheckResult::fail(
+                NAME,
+                format!(
+                    "Retail in March came back as {}, not 100",
+                    tb.get_or_zero(&key).debits.to_minor()
+                ),
+            );
+        }
+        Err(e) => return CheckResult::fail(NAME, format!("trial_balance failed: {e}")),
+    }
+
+    CheckResult::pass(NAME)
+}
+
+/// A statement can be scoped to a period, and opens at the right figure.
+///
+/// The rule a backend gets wrong by being literal: an opening balance is folded
+/// over everything the query narrows to that was booked **before** its window.
+/// Apply the start date to both the lines and the opening and a March statement
+/// opens at zero, which is not an opening balance — it is the absence of one.
+///
+/// The rule a backend gets wrong by being clever: bounding the carry set by log
+/// position instead. Entries are appended in recording order, so this fixture
+/// books **out of date order** on purpose — April first, February second, March
+/// last. A position bound folds April into the opening and drops February.
+///
+/// Also checks the identity that makes a statement a statement: `opening` plus
+/// the page's movements is the last line's `running`, page by page.
+pub async fn check_statements_scope_to_a_period<const P: u8, S: LedgerStore<P>>(
+    store: &S,
+) -> CheckResult {
+    const NAME: &str = "statements scope to a period";
+    if let Err(e) = drain_sequencing(store).await {
+        return CheckResult::fail("sequencing", e);
+    }
+    let f = Fixture::new();
+
+    let existing = match store.accounts().await {
+        Ok(records) => records,
+        Err(e) => return CheckResult::fail(NAME, format!("accounts failed: {e}")),
+    };
+    let mut registry = match AccountRegistry::from_records(existing) {
+        Ok(r) => r,
+        Err(e) => return CheckResult::fail(NAME, format!("stored bindings are unusable: {e}")),
+    };
+    let path = match AccountPath::parse("Conformance:Scoped") {
+        Ok(p) => p,
+        Err(e) => return CheckResult::fail(NAME, format!("bad fixture path: {e}")),
+    };
+    let scoped = match registry.register(Account::new(path, date!(2000 - 01 - 01))) {
+        Ok(id) => id,
+        Err(e) => return CheckResult::fail(NAME, format!("fixture registration failed: {e}")),
+    };
+    for record in registry.records() {
+        if let Err(e) = store.register_account(&record).await {
+            return CheckResult::fail(NAME, format!("register_account failed: {e}"));
+        }
+    }
+    let ctx = SealContext {
+        accounts: &registry,
+        calendar: &f.calendar,
+        policy: &f.policy,
+    };
+
+    // 700 before the window, 300 inside it, 900 after — recorded in an order
+    // that shares nothing with their booking dates, so a backend that bounds the
+    // opening balance by log position rather than by date gets a different and
+    // wrong answer for every figure below.
+    let rows: [(&[u8], i64, time::Date); 3] = [
+        (b"scoped-after", 900, date!(2026 - 04 - 10)),
+        (b"scoped-before", 700, date!(2026 - 02 - 10)),
+        (b"scoped-inside", 300, date!(2026 - 03 - 10)),
+    ];
+    for (key, minor, on) in rows {
+        let amount = Amount::<P>::from_minor(minor);
+        let Ok(idem) = IdempotencyKey::new(key.to_vec()) else {
+            return CheckResult::fail(NAME, "bad fixture key");
+        };
+        let Ok(entry) = Entry::<Draft, P>::new(EntryId::generate(), idem, on)
+            .debit(scoped, amount, Currency::EUR)
+            .credit(f.right, amount, Currency::EUR)
+            .seal(&ctx)
+        else {
+            return CheckResult::fail(NAME, "fixture entry failed to seal");
+        };
+        if let Err(e) = store.append(&EntryBatch::single(entry)).await {
+            return CheckResult::fail(NAME, format!("append failed: {e}"));
+        }
+    }
+    if let Err(e) = drain_sequencing(store).await {
+        return CheckResult::fail("sequencing", e);
+    }
+
+    let key = BalanceKey {
+        account: scoped,
+        currency: Currency::EUR,
+        layer: Layer::Settled,
+    };
+    let march = BalanceQuery::between(date!(2026 - 03 - 01), date!(2026 - 03 - 31));
+    let page = match store.statement(key, march, PostingCursor::start()).await {
+        Ok(page) => page,
+        Err(e) => return CheckResult::fail(NAME, format!("statement failed: {e}")),
+    };
+
+    if page.lines.len() != 1 {
+        return CheckResult::fail(
+            NAME,
+            format!(
+                "March holds one movement, the statement listed {}",
+                page.lines.len()
+            ),
+        );
+    }
+    if page.opening.debits.to_minor() != 700 {
+        return CheckResult::fail(
+            NAME,
+            format!(
+                "March opened at {}, not the 700 carried in from February",
+                page.opening.debits.to_minor()
+            ),
+        );
+    }
+    let Some(last) = page.lines.last() else {
+        return CheckResult::fail(NAME, "the page lost its line");
+    };
+    if last.running.debits.to_minor() != 1000 {
+        return CheckResult::fail(
+            NAME,
+            format!(
+                "the running balance closed at {}, not opening plus the movement",
+                last.running.debits.to_minor()
+            ),
+        );
+    }
+    if last.booking_date != date!(2026 - 03 - 10) {
+        return CheckResult::fail(NAME, "the statement listed a movement outside the window");
+    }
+
+    // Unscoped, the same account lists everything and opens at nothing.
+    let all = match store
+        .statement(key, BalanceQuery::all(), PostingCursor::start())
+        .await
+    {
+        Ok(all) => all,
+        Err(e) => return CheckResult::fail(NAME, format!("statement failed: {e}")),
+    };
+    if all.lines.len() != 3 || all.opening != crate::Balance::ZERO {
+        return CheckResult::fail(
+            NAME,
+            format!(
+                "an unscoped statement listed {} lines opening at {:?}",
+                all.lines.len(),
+                all.opening
+            ),
+        );
+    }
+
+    // Paging must not move the figures. Reading the unscoped statement one line
+    // at a time has to reproduce exactly the running balances the whole one
+    // showed, which is only true if each page's opening carries the pages before
+    // it — see `StatementPage::opening`.
+    let mut cursor = PostingCursor::start().with_limit(1);
+    for expected in &all.lines {
+        let page = match store.statement(key, BalanceQuery::all(), cursor).await {
+            Ok(page) => page,
+            Err(e) => return CheckResult::fail(NAME, format!("paged statement failed: {e}")),
+        };
+        let Some(line) = page.lines.first() else {
+            return CheckResult::fail(NAME, "paging the statement lost a line");
+        };
+        if line.running != expected.running {
+            return CheckResult::fail(
+                NAME,
+                format!(
+                    "paged, the line at {} ran to {:?} rather than the {:?} the \
+                     whole statement showed",
+                    line.index, line.running, expected.running
+                ),
+            );
+        }
+        let Ok(closing) = page.opening.checked_add(&crate::Balance {
+            debits: if line.direction.is_debit() {
+                line.amount
+            } else {
+                crate::Amount::ZERO
+            },
+            credits: if line.direction.is_credit() {
+                line.amount
+            } else {
+                crate::Amount::ZERO
+            },
+        }) else {
+            return CheckResult::fail(NAME, "a page's opening plus its movement overflowed");
+        };
+        if closing != line.running {
+            return CheckResult::fail(
+                NAME,
+                format!(
+                    "a page opened at {:?}, moved by {}, and closed at {:?}",
+                    page.opening, line.amount, line.running
+                ),
+            );
+        }
+        match page.next {
+            Some(next) => cursor = next.with_limit(1),
+            None => break,
+        }
+    }
+
+    CheckResult::pass(NAME)
+}
+
+/// A date-bounded query can fold by **value date** instead of booking date.
+///
+/// The fixture is the ordinary straddling entry: booked at the end of a month,
+/// settling at the start of the next, so it belongs to the earlier month's books
+/// and the later month's cash. A backend that stores `value_date` but filters on
+/// `booking_date` reports the same figure for both.
+pub async fn check_queries_fold_by_value_date<const P: u8, S: LedgerStore<P>>(
+    store: &S,
+) -> CheckResult {
+    const NAME: &str = "queries fold by value date";
+    if let Err(e) = drain_sequencing(store).await {
+        return CheckResult::fail("sequencing", e);
+    }
+    let f = Fixture::new();
+
+    let existing = match store.accounts().await {
+        Ok(records) => records,
+        Err(e) => return CheckResult::fail(NAME, format!("accounts failed: {e}")),
+    };
+    let mut registry = match AccountRegistry::from_records(existing) {
+        Ok(r) => r,
+        Err(e) => return CheckResult::fail(NAME, format!("stored bindings are unusable: {e}")),
+    };
+    let path = match AccountPath::parse("Conformance:Valued") {
+        Ok(p) => p,
+        Err(e) => return CheckResult::fail(NAME, format!("bad fixture path: {e}")),
+    };
+    let valued = match registry.register(Account::new(path, date!(2000 - 01 - 01))) {
+        Ok(id) => id,
+        Err(e) => return CheckResult::fail(NAME, format!("fixture registration failed: {e}")),
+    };
+    for record in registry.records() {
+        if let Err(e) = store.register_account(&record).await {
+            return CheckResult::fail(NAME, format!("register_account failed: {e}"));
+        }
+    }
+    let ctx = SealContext {
+        accounts: &registry,
+        calendar: &f.calendar,
+        policy: &f.policy,
+    };
+
+    // 100 wholly inside March; 400 booked in March, settling in April.
+    let rows: [(&[u8], i64, time::Date, time::Date); 2] = [
+        (
+            b"valued-inside",
+            100,
+            date!(2026 - 03 - 10),
+            date!(2026 - 03 - 10),
+        ),
+        (
+            b"valued-straddle",
+            400,
+            date!(2026 - 03 - 28),
+            date!(2026 - 04 - 02),
+        ),
+    ];
+    for (key, minor, booked, valued_on) in rows {
+        let amount = Amount::<P>::from_minor(minor);
+        let Ok(idem) = IdempotencyKey::new(key.to_vec()) else {
+            return CheckResult::fail(NAME, "bad fixture key");
+        };
+        let Ok(entry) = Entry::<Draft, P>::new(EntryId::generate(), idem, booked)
+            .with_value_date(valued_on)
+            .debit(valued, amount, Currency::EUR)
+            .credit(f.right, amount, Currency::EUR)
+            .seal(&ctx)
+        else {
+            return CheckResult::fail(NAME, "fixture entry failed to seal");
+        };
+        if let Err(e) = store.append(&EntryBatch::single(entry)).await {
+            return CheckResult::fail(NAME, format!("append failed: {e}"));
+        }
+    }
+    if let Err(e) = drain_sequencing(store).await {
+        return CheckResult::fail("sequencing", e);
+    }
+
+    let key = BalanceKey {
+        account: valued,
+        currency: Currency::EUR,
+        layer: Layer::Settled,
+    };
+    let march = BalanceQuery::between(date!(2026 - 03 - 01), date!(2026 - 03 - 31));
+    let april = BalanceQuery::between(date!(2026 - 04 - 01), date!(2026 - 04 - 30));
+
+    for (label, query, expected) in [
+        ("March, booked", march, 500),
+        ("March, valued", march.by_value_date(), 100),
+        ("April, booked", april, 0),
+        ("April, valued", april.by_value_date(), 400),
+    ] {
+        match store.balance(key, query).await {
+            Ok(balance) if balance.debits.to_minor() == expected => {}
+            Ok(balance) => {
+                return CheckResult::fail(
+                    NAME,
+                    format!(
+                        "{label} came back as {}, not {expected}",
+                        balance.debits.to_minor()
+                    ),
+                );
+            }
+            Err(e) => return CheckResult::fail(NAME, format!("balance failed: {e}")),
+        }
+    }
+
+    // A statement takes the same basis, and its opening balance with it.
+    let page = match store
+        .statement(key, april.by_value_date(), PostingCursor::start())
+        .await
+    {
+        Ok(page) => page,
+        Err(e) => return CheckResult::fail(NAME, format!("statement failed: {e}")),
+    };
+    if page.lines.len() != 1 || page.opening.debits.to_minor() != 100 {
+        return CheckResult::fail(
+            NAME,
+            format!(
+                "a value-dated April statement listed {} lines opening at {}",
+                page.lines.len(),
+                page.opening.debits.to_minor()
+            ),
+        );
+    }
+    let Some(line) = page.lines.first() else {
+        return CheckResult::fail(NAME, "the page lost its line");
+    };
+    if line.booking_date != date!(2026 - 03 - 28) || line.value_date != date!(2026 - 04 - 02) {
+        return CheckResult::fail(
+            NAME,
+            format!(
+                "the line came back booked {} valued {}",
+                line.booking_date, line.value_date
+            ),
+        );
     }
 
     CheckResult::pass(NAME)
@@ -1277,6 +2036,67 @@ pub async fn check_balance_limits_are_enforced<const P: u8, S: LedgerStore<P>>(
         (Err(e), _) | (_, Err(e)) => return CheckResult::fail(NAME, format!("len failed: {e}")),
     }
 
+    // A reservation draws on the same funds as a settled movement. The account
+    // is back at zero, so there is nothing to hold — a backend that checked the
+    // pending layer against its own zero-based balance would accept this, and a
+    // limit that a reservation can step around is not a limit.
+    let reserve = |key: &[u8], minor: i64| {
+        let amount = Amount::<P>::from_minor(minor);
+        Entry::<Draft, P>::new(
+            EntryId::generate(),
+            IdempotencyKey::new(key.to_vec()).ok()?,
+            date!(2026 - 03 - 22),
+        )
+        .post(crate::Posting::credit(limited, amount, Currency::EUR).in_layer(Layer::Pending))
+        .post(crate::Posting::debit(f.right, amount, Currency::EUR).in_layer(Layer::Pending))
+        .seal(&ctx)
+        .ok()
+    };
+    let Some(unfunded_hold) = reserve(b"limit-hold-empty", 1) else {
+        return CheckResult::fail(NAME, "fixture entry failed to seal");
+    };
+    if store
+        .append(&EntryBatch::single(unfunded_hold))
+        .await
+        .is_ok()
+    {
+        return CheckResult::fail(
+            NAME,
+            "a reservation was accepted against an account with nothing in it",
+        );
+    }
+
+    // Fund it again, and a reservation within the funds is accepted — which the
+    // opposite mistake, checking each layer against its own zero, would refuse:
+    // an account that cannot reserve an outflow cannot use the pending layer at
+    // all.
+    let Some(refunding) = movement(b"limit-refunding", 500, true) else {
+        return CheckResult::fail(NAME, "fixture entry failed to seal");
+    };
+    if let Err(e) = store.append(&EntryBatch::single(refunding)).await {
+        return CheckResult::fail(NAME, format!("refunding was refused: {e}"));
+    }
+    let Some(hold) = reserve(b"limit-hold", 400) else {
+        return CheckResult::fail(NAME, "fixture entry failed to seal");
+    };
+    if let Err(e) = store.append(&EntryBatch::single(hold)).await {
+        return CheckResult::fail(
+            NAME,
+            format!("a reservation within the funds was refused: {e}"),
+        );
+    }
+
+    // And the outstanding hold consumes what a settled draw can still take.
+    let Some(too_much) = movement(b"limit-after-hold", 101, false) else {
+        return CheckResult::fail(NAME, "fixture entry failed to seal");
+    };
+    if store.append(&EntryBatch::single(too_much)).await.is_ok() {
+        return CheckResult::fail(
+            NAME,
+            "a settled draw ignored the reservation already outstanding",
+        );
+    }
+
     // Rebinding a handle to a different path is refused outright, because every
     // posting row that names it would silently repoint.
     let rebound = AccountRecord {
@@ -1388,7 +2208,7 @@ pub async fn check_clearing_rules<const P: u8, S: LedgerStore<P>>(store: &S) -> 
         currency: Currency::EUR,
         layer: Layer::Settled,
     };
-    let before = match store.trial_balance(None).await {
+    let before = match store.trial_balance(BalanceQuery::all()).await {
         Ok(tb) => tb,
         Err(e) => return CheckResult::fail(NAME, format!("trial_balance failed: {e}")),
     };
@@ -1447,7 +2267,7 @@ pub async fn check_clearing_rules<const P: u8, S: LedgerStore<P>>(store: &S) -> 
     }
 
     // Clearing is an assignment, never a movement.
-    match store.trial_balance(None).await {
+    match store.trial_balance(BalanceQuery::all()).await {
         Ok(after) if after == before => {}
         Ok(_) => return CheckResult::fail(NAME, "clearing changed a balance"),
         Err(e) => return CheckResult::fail(NAME, format!("trial_balance failed: {e}")),
@@ -1604,7 +2424,11 @@ pub async fn check_open_items_track_residuals<const P: u8, S: LedgerStore<P>>(
     // so that ordering is chronological only when the caller happens to use
     // this crate's own time-ordered generator, and silently is not otherwise.
     let statement = match store
-        .statement(key, PostingCursor::start().with_limit(MAX_PAGE_SIZE))
+        .statement(
+            key,
+            BalanceQuery::all(),
+            PostingCursor::start().with_limit(MAX_PAGE_SIZE),
+        )
         .await
     {
         Ok(page) => page.lines,
@@ -1855,6 +2679,58 @@ pub async fn check_idempotent_replay<const P: u8, S: LedgerStore<P>>(store: &S) 
     }
 }
 
+/// An entry can be found by the key it was recorded under.
+///
+/// The lookup the idempotency key exists for. A backend that stores the key only
+/// to enforce uniqueness makes the callers derive one from a source transaction
+/// and then gives them no way to ask about it.
+pub async fn check_lookup_by_idempotency_key<const P: u8, S: LedgerStore<P>>(
+    store: &S,
+) -> CheckResult {
+    const NAME: &str = "entries are findable by key";
+    let f = Fixture::new();
+    let Ok(key) = IdempotencyKey::new(b"findable".to_vec()) else {
+        return CheckResult::fail(NAME, "bad fixture key");
+    };
+
+    // Absent before it is written — and absent is `None`, not an error.
+    match store.get_by_key(&key).await {
+        Ok(None) => {}
+        Ok(Some(_)) => return CheckResult::fail(NAME, "an unwritten key was found"),
+        Err(e) => return CheckResult::fail(NAME, format!("get_by_key failed: {e}")),
+    }
+
+    let Some(entry) = f.entry::<P>(b"findable", 4242) else {
+        return CheckResult::fail(NAME, "fixture entry failed to seal");
+    };
+    let expected = entry.id();
+    let hash = entry.content_hash();
+    if let Err(e) = store.append(&EntryBatch::single(entry)).await {
+        return CheckResult::fail(NAME, format!("append failed: {e}"));
+    }
+
+    match store.get_by_key(&key).await {
+        Ok(Some(found)) => {
+            if found.entry.id() != expected {
+                return CheckResult::fail(NAME, "the key returned a different entry");
+            }
+            if found.content_hash != hash {
+                return CheckResult::fail(NAME, "the key returned a different content hash");
+            }
+            // And it agrees with the identifier-keyed lookup, including its
+            // position — two lookups of one row must not disagree.
+            match store.get(expected).await {
+                Ok(Some(by_id)) if by_id.index == found.index => CheckResult::pass(NAME),
+                Ok(Some(_)) => CheckResult::fail(NAME, "the two lookups disagree on the position"),
+                Ok(None) => CheckResult::fail(NAME, "the entry is findable by key but not by id"),
+                Err(e) => CheckResult::fail(NAME, format!("get failed: {e}")),
+            }
+        }
+        Ok(None) => CheckResult::fail(NAME, "a recorded key was not found"),
+        Err(e) => CheckResult::fail(NAME, format!("get_by_key failed: {e}")),
+    }
+}
+
 /// The same key with different content is refused, not overwritten.
 pub async fn check_idempotency_conflict<const P: u8, S: LedgerStore<P>>(store: &S) -> CheckResult {
     const NAME: &str = "conflicting key is refused";
@@ -2000,7 +2876,7 @@ pub async fn check_balances_match_the_log<const P: u8, S: LedgerStore<P>>(
         layer: Layer::Settled,
     };
 
-    let reported = match store.balance(key, None).await {
+    let reported = match store.balance(key, BalanceQuery::all()).await {
         Ok(b) => b,
         Err(e) => return CheckResult::fail(NAME, format!("balance failed: {e}")),
     };
@@ -2160,7 +3036,9 @@ mod tests {
     fn the_memory_store_conforms() {
         let report = block_on(check_all(&MemoryStore::<2>::new(test_ledger())));
         report.assert_passed();
-        assert_eq!(report.checks.len(), 20);
+        // Pinned so a check cannot be dropped from `check_all` unnoticed: a
+        // suite that silently shrinks still passes.
+        assert_eq!(report.checks.len(), 25);
     }
 
     #[test]

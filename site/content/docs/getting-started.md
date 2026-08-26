@@ -6,15 +6,18 @@ weight = 1
 
 ## Install
 
-```toml
-[dependencies]
-doubleentry = "0.4"
-time = { version = "0.3", features = ["macros"] }
+```console
+cargo add doubleentry
+cargo add time --features macros
 ```
 
 Nothing else is required. The core engine performs no I/O, spawns no tasks, and
 pulls in no async runtime. Storage backends are opt-in
-[features](@/docs/features.md).
+[features](@/docs/features.md), and `cargo add` takes them the same way:
+
+```console
+cargo add doubleentry --features sqlite,serde
+```
 
 ## The journal
 
@@ -45,8 +48,8 @@ accounts: it does not know what `Assets` means, does not require that name, and
 validates against no national or corporate scheme.
 
 ```rust
-let cash    = journal.accounts_mut().register_path("Assets:Cash",  date!(2026-01-01))?;
-let revenue = journal.accounts_mut().register_path("Income:Sales", date!(2026-01-01))?;
+let cash    = journal.register_path("Assets:Cash",  date!(2026-01-01))?;
+let revenue = journal.register_path("Income:Sales", date!(2026-01-01))?;
 ```
 
 Registration returns an `AccountId` — a dense handle, cheap to compare and to
@@ -54,7 +57,9 @@ index by. Two structural rules *are* enforced, because no downstream layer can
 repair them:
 
 - **Only leaves are postable.** An account with children is an aggregation path.
-  Posting to both a node and its descendants makes every rollup double-count.
+  One that is both a bucket and a container has two defensible balances, and no
+  report can un-mix them. Registering a child under an account that has already
+  been posted to is refused for the same reason.
 - **Postings fall inside the account's open window.** An account has an opening
   date and an optional closing date.
 
@@ -85,10 +90,10 @@ path. See [Idempotency](@/docs/idempotency.md).
 ## Reading it back
 
 ```rust
-use doubleentry::{BalanceKey, Layer};
+use doubleentry::{BalanceKey, BalanceQuery, Layer};
 
 let key = BalanceKey { account: cash, currency: Currency::EUR, layer: Layer::Settled };
-let balance = journal.balance(&key, None)?;
+let balance = journal.balance(&key, BalanceQuery::all())?;
 
 assert_eq!(balance.debits, Eur::parse("1190.00")?);
 ```
@@ -96,6 +101,14 @@ assert_eq!(balance.debits, Eur::parse("1190.00")?);
 Balances carry gross debit *and* credit totals rather than only the net — see
 [Debits and credits](@/docs/debits-and-credits.md) for why that distinction is
 not optional.
+
+Every balance read takes a `BalanceQuery`. `all()` is the whole ledger; it also
+narrows by date range, log prefix, or
+[reporting axis](@/docs/dimensions.md#slicing-a-report), and the narrowings
+compose. The date range applies to the booking date by default and to the value
+date when you say so — the books, or the cash. See
+[Historical reads](@/docs/statements.md#historical-reads) and
+[Two dates](@/docs/statements.md#two-dates-and-which-one-a-report-means).
 
 ## Proving it
 
@@ -115,5 +128,7 @@ detail on one of those three.
   actually claims, and what it does not.
 - [Proofs](@/docs/proofs.md) — inclusion and consistency, and why the log is a
   Merkle tree rather than a hash chain.
+- [Dimensions](@/docs/dimensions.md) — the reporting axes a posting is sliced
+  by, and how a report slices by them.
 - [Persistence](@/docs/persistence.md) — when the books have to survive the
   process.

@@ -22,8 +22,8 @@ use doubleentry::seal::{Seal, SealChain, SealChainError};
 use doubleentry::storage::sqlite::{SqliteError, SqliteStore};
 use doubleentry::storage::{Cursor, EntryBatch, LedgerStore, PostingCursor};
 use doubleentry::{
-    AccountId, Amount, BalanceKey, Balanced, Currency, Entry, EntryId, IdempotencyKey, Layer,
-    LogIndex, MerkleLog,
+    AccountId, Amount, BalanceKey, BalanceQuery, Balanced, Currency, Entry, EntryId,
+    IdempotencyKey, Layer, LogIndex, MerkleLog,
 };
 use sqlx::sqlite::SqlitePoolOptions;
 use time::macros::date;
@@ -152,14 +152,11 @@ async fn entries_round_trip_through_the_database() {
 }
 
 #[tokio::test]
-async fn a_pruned_log_is_named_rather_than_proven_around() {
+async fn pruning_an_archived_prefix_leaves_the_log_provable() {
     // The cold tier's protocol ends "only then may the operational store drop
-    // the rows". Doing so costs the hot store its proofs — the Merkle log is
-    // derived from the stored leaves, so a hole renumbers every leaf after it.
-    //
-    // The head does *not* notice: it is read from the last row's stored root.
-    // So the two would disagree silently, which is exactly the shape of failure
-    // this crate refuses to ship.
+    // the rows", and dropping them costs no proofs: the Merkle tree lives in
+    // `log_nodes`, not in `entries`. An auditor gets the proof from the hot
+    // store and the entry it is checked against from the archive.
     let h = Harness::start_named("sqlite-pruned").await;
     for n in 0..10i64 {
         h.store
@@ -171,23 +168,15 @@ async fn a_pruned_log_is_named_rather_than_proven_around() {
     }
 
     let head = h.store.head().await.expect("reads");
-    let entry_7 = h
-        .store
-        .page(Cursor::start())
-        .await
-        .expect("reads")
-        .records
-        .into_iter()
-        .find(|r| r.index == Some(LogIndex::new(7)))
-        .expect("entry 7 is in the log");
-    assert!(
-        h.store
-            .prove_inclusion(LogIndex::new(7))
-            .await
-            .expect("in range")
-            .verify(&entry_7.content_hash, &head),
-        "sanity: proofs work before anything is pruned"
-    );
+    let records = h.store.page(Cursor::start()).await.expect("reads").records;
+    let hash_at = |index: u64| {
+        records
+            .iter()
+            .find(|r| r.index == Some(LogIndex::new(index)))
+            .expect("in the log")
+            .content_hash
+    };
+    let (kept, archived) = (hash_at(7), hash_at(3));
 
     // Prune what a compaction would have archived.
     for sql in [
@@ -203,31 +192,63 @@ async fn a_pruned_log_is_named_rather_than_proven_around() {
             .expect("prunes");
     }
 
-    // The head still reports the truth, which is what makes the mismatch
-    // dangerous rather than obvious.
+    // The log is still ten entries long and still has the same root: its size
+    // comes from the nodes, not from a count of surviving rows.
+    assert_eq!(h.store.len().await.expect("reads"), 10);
     assert_eq!(h.store.head().await.expect("reads"), head);
 
-    // Every proof route now refuses, naming the hole. Before this check, an
-    // index past the shortened set reported `IndexOutOfRange` for an index that
-    // is genuinely in range, and one inside it returned a proof for a
-    // *different* entry — caught only if the caller verified before handing it
-    // to an auditor.
-    for outcome in [
-        h.store.prove_inclusion(LogIndex::new(7)).await.err(),
-        h.store.prove_inclusion(LogIndex::new(3)).await.err(),
-        h.store.prove_consistency(2).await.err(),
-    ] {
-        assert!(
-            matches!(
-                outcome,
-                Some(SqliteError::LogNotDense {
-                    expected: 0,
-                    found: 5
-                })
-            ),
-            "expected the hole to be named, got {outcome:?}"
-        );
-    }
+    // A surviving entry proves as before …
+    assert!(
+        h.store
+            .prove_inclusion(LogIndex::new(7))
+            .await
+            .expect("in range")
+            .verify(&kept, &head),
+        "pruning a prefix must not disturb the entries that remain"
+    );
+
+    // … and so does an *archived* one, against the leaf the archive holds.
+    assert!(
+        h.store
+            .prove_inclusion(LogIndex::new(3))
+            .await
+            .expect("in range")
+            .verify(&archived, &head),
+        "the tree does not live in `entries`, so archiving one does not erase it"
+    );
+
+    // The proof is bound to that entry and no other: a pruned row cannot be
+    // quietly replaced by whatever is convenient.
+    assert!(
+        !h.store
+            .prove_inclusion(LogIndex::new(3))
+            .await
+            .expect("in range")
+            .verify(&kept, &head)
+    );
+
+    // Consistency across the pruned prefix still holds.
+    let earlier = h.store.head_at(2).await.expect("in range");
+    assert!(
+        h.store
+            .prove_consistency(2)
+            .await
+            .expect("in range")
+            .verify(&earlier, &head)
+    );
+
+    // What *is* gone is the entry body, and the store says so plainly rather
+    // than inventing one.
+    assert!(
+        h.store
+            .page(Cursor::start())
+            .await
+            .expect("reads")
+            .records
+            .iter()
+            .all(|r| r.index.is_some_and(|i| i.get() >= 5)),
+        "the pruned bodies are gone; only the tree survived"
+    );
 }
 
 #[tokio::test]
@@ -447,6 +468,70 @@ async fn open_items_track_partial_settlement() {
     );
 }
 
+/// The hierarchical report is a pure function of what a store already serves.
+#[tokio::test]
+async fn a_rollup_over_the_store_matches_one_over_a_journal() {
+    // The hierarchical report is a pure function of a trial balance and a
+    // registry, so a store and a journal holding the same books must produce the
+    // same report — byte for byte, grouping nodes included. That is the whole
+    // reason no backend method exists for it, and this is what says so.
+    let h = Harness::start().await;
+    let mut journal = doubleentry::Journal::<2>::new(h.store.ledger().clone());
+    for record in h.accounts.records() {
+        journal.restore_account(record).expect("restores");
+    }
+
+    for i in 0..7i64 {
+        let entry = h.entry(format!("rollup-{i}").as_bytes(), 100 + i);
+        h.store
+            .append(&EntryBatch::single(entry.clone()))
+            .await
+            .expect("appends");
+        journal.record_validated(entry).expect("records");
+    }
+
+    let registry = AccountRegistry::from_records(h.store.accounts().await.expect("reads"))
+        .expect("stored bindings are usable");
+    let balances = h
+        .store
+        .trial_balance(BalanceQuery::all())
+        .await
+        .expect("reads");
+    let from_store = doubleentry::Rollup::of(
+        &balances,
+        &registry,
+        doubleentry::Currency::EUR,
+        doubleentry::Layer::Settled,
+    )
+    .expect("no overflow");
+
+    let from_journal = journal
+        .rollup(
+            BalanceQuery::all(),
+            doubleentry::Currency::EUR,
+            doubleentry::Layer::Settled,
+        )
+        .expect("no overflow");
+
+    assert_eq!(from_store, from_journal);
+
+    // `Sq` was never registered, and heads the tree either way.
+    let root = from_store
+        .get(&"Sq".parse().expect("valid"))
+        .expect("inferred from its children");
+    assert!(!root.is_registered());
+    assert_eq!(
+        root.subtree.debits, root.subtree.credits,
+        "the books balance"
+    );
+    assert_eq!(
+        from_store.total().expect("no overflow"),
+        balances
+            .totals(doubleentry::Currency::EUR, doubleentry::Layer::Settled)
+            .expect("no overflow")
+    );
+}
+
 /// The abstraction is only real if independent implementations agree.
 #[tokio::test]
 async fn all_three_backends_agree() {
@@ -469,8 +554,14 @@ async fn all_three_backends_agree() {
         "both backends must commit to the same root"
     );
     assert_eq!(
-        h.store.trial_balance(None).await.expect("reads"),
-        memory.trial_balance(None).await.expect("reads"),
+        h.store
+            .trial_balance(BalanceQuery::all())
+            .await
+            .expect("reads"),
+        memory
+            .trial_balance(BalanceQuery::all())
+            .await
+            .expect("reads"),
     );
 
     // And every entry is provable under the shared root.
@@ -526,11 +617,19 @@ async fn two_ledgers_share_nothing() {
 
     // Balances are per ledger: both have exactly their own one movement.
     assert_eq!(
-        a.store.balance(a.key(), None).await.expect("reads").debits,
+        a.store
+            .balance(a.key(), BalanceQuery::all())
+            .await
+            .expect("reads")
+            .debits,
         Eur::from_minor(5_00)
     );
     assert_eq!(
-        b.store.balance(b.key(), None).await.expect("reads").debits,
+        b.store
+            .balance(b.key(), BalanceQuery::all())
+            .await
+            .expect("reads")
+            .debits,
         Eur::from_minor(5_00)
     );
 
@@ -641,5 +740,78 @@ async fn a_database_will_not_serve_a_second_ledger() {
             assert_eq!(found.as_str(), "ledger-a");
         }
         other => panic!("expected WrongLedger, got {other:?}"),
+    }
+}
+
+/// Proofs cost `O(log n)` reads, not a replay of the log.
+///
+/// The claim the `log_nodes` table exists for, measured rather than asserted.
+/// Rows read is the thing that scales; a duration would measure the machine.
+#[tokio::test]
+async fn a_proof_reads_a_logarithmic_number_of_rows() {
+    use doubleentry::merkle::nodes;
+
+    let h = Harness::start_named("sqlite-proof-cost").await;
+    for n in 0..512i64 {
+        h.store
+            .append(&EntryBatch::single(
+                h.entry(format!("cost{n}").as_bytes(), 100 + n),
+            ))
+            .await
+            .expect("appends");
+    }
+
+    let head = h.store.head().await.expect("reads");
+    assert_eq!(head.size, 512);
+
+    // Nine levels, so a proof is at most about ten nodes — against 512 leaves
+    // and 1015 stored nodes in total.
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM log_nodes")
+        .fetch_one(h.store.pool())
+        .await
+        .expect("counts");
+    assert_eq!(u64::try_from(total).expect("small"), nodes::count(512));
+
+    for index in [0u64, 1, 255, 256, 511] {
+        let read = nodes::InclusionPlan::new(index, 512)
+            .expect("in range")
+            .nodes()
+            .len();
+        assert!(
+            read <= 10,
+            "an inclusion proof at {index} of 512 planned {read} node reads"
+        );
+    }
+    for old in [1u64, 7, 256, 511] {
+        let read = nodes::ConsistencyPlan::new(old, 512)
+            .expect("in range")
+            .nodes()
+            .len();
+        assert!(
+            read <= 10,
+            "a consistency proof from {old} to 512 planned {read} node reads"
+        );
+    }
+
+    // And the proofs those plans produce actually verify, so the bound is on
+    // real work rather than on a shortcut.
+    let records = h
+        .store
+        .page(Cursor::start().with_limit(4096))
+        .await
+        .expect("reads")
+        .records;
+    for index in [0u64, 255, 511] {
+        let record = records
+            .iter()
+            .find(|r| r.index == Some(LogIndex::new(index)))
+            .expect("in the log");
+        assert!(
+            h.store
+                .prove_inclusion(LogIndex::new(index))
+                .await
+                .expect("in range")
+                .verify(&record.content_hash, &head)
+        );
     }
 }

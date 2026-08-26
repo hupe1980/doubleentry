@@ -22,7 +22,7 @@ env:
   RUSTUP_TOOLCHAIN: stable
   # Every feature except `postgres`, which needs a Docker daemon and so runs in
   # a Linux-only job of its own.
-  PORTABLE_FEATURES: serde,sqlite,iceberg
+  PORTABLE_FEATURES: serde,sqlite,iceberg,witness
 
 jobs:
   fmt:
@@ -63,13 +63,19 @@ jobs:
       # to a database is their whole job — so the check covers the core only.
       # Cheap to verify, easy to regress, and a regression silently breaks
       # reproducible hashing rather than failing a test.
+      # Kept identical to the `purity` recipe in the justfile. `now_v7` is in
+      # the pattern because it reads the clock as surely as `SystemTime::now`
+      # does; the two identifier generators that legitimately call it opt out
+      # with an explicit `purity-exempt` marker, so a third cannot appear by
+      # accident.
       - name: no ambient state in the engine
         run: |
           hits="$(grep -rn --include='*.rs' -E \
-            'now_utc|SystemTime::now|Instant::now|std::(fs|env|net|process)|\basync\b|\bunsafe\b' \
+            'now_utc|now_v7|SystemTime::now|Instant::now|std::(fs|env|net|process)|\basync\b|\bunsafe\b' \
             src/ \
             | grep -v '^src/storage' \
-            | grep -vE ':[[:space:]]*(///|//!|//)' || true)"
+            | grep -vE ':[[:space:]]*(///|//!|//)' \
+            | grep -v 'purity-exempt' || true)"
           if [ -n "$hits" ]; then
             echo "::error::ambient state, async or unsafe reached the engine"
             echo "$hits"
@@ -129,6 +135,7 @@ jobs:
       - run: cargo build --no-default-features --features sqlite
       - run: cargo build --no-default-features --features postgres
       - run: cargo build --no-default-features --features iceberg
+      - run: cargo build --no-default-features --features witness
       - run: cargo build --all-features
 
   msrv:

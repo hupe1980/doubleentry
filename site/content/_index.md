@@ -26,8 +26,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut journal = Journal::<2>::new(LedgerId::new("acme-gmbh")?);
 
     // Accounts are paths in a hierarchy you define. Only leaves are postable.
-    let cash    = journal.accounts_mut().register_path("Assets:Cash",  date!(2026-01-01))?;
-    let revenue = journal.accounts_mut().register_path("Income:Sales", date!(2026-01-01))?;
+    let cash    = journal.register_path("Assets:Cash",  date!(2026-01-01))?;
+    let revenue = journal.register_path("Income:Sales", date!(2026-01-01))?;
 
     let recorded = journal.record(
         Entry::new(

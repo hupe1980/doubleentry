@@ -62,27 +62,26 @@ const fn value_of(c: u8) -> Option<u32> {
 /// it, several distinct texts decode to the same bytes, and a note's signature
 /// covers the text rather than the bytes.
 pub(crate) fn decode(input: &str) -> Option<Vec<u8>> {
-    let bytes = input.as_bytes();
-    if bytes.is_empty() || !bytes.len().is_multiple_of(4) {
+    // A length that is not a positive multiple of four leaves a remainder or no
+    // groups at all, so the two length rules are one check on the split.
+    let (groups, remainder) = input.as_bytes().as_chunks::<4>();
+    if groups.is_empty() || !remainder.is_empty() {
         return None;
     }
-    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
-    let mut chunks = bytes.chunks_exact(4).peekable();
-    while let Some(chunk) = chunks.next() {
-        let last = chunks.peek().is_none();
-        let [c0, c1, c2, c3] = chunk else {
-            return None;
-        };
+    let mut out = Vec::with_capacity(groups.len() * 3);
+    let final_group = groups.len() - 1;
+    for (at, &[c0, c1, c2, c3]) in groups.iter().enumerate() {
+        let last = at == final_group;
         // Padding is only ever in the final group, and only in the last two
         // positions. Anywhere else it is a second encoding of the same bytes.
-        let pad = usize::from(*c2 == b'=') + usize::from(*c3 == b'=');
-        if pad > 0 && (!last || *c2 == b'=' && *c3 != b'=') {
+        let pad = usize::from(c2 == b'=') + usize::from(c3 == b'=');
+        if pad > 0 && (!last || c2 == b'=' && c3 != b'=') {
             return None;
         }
-        let v0 = value_of(*c0)?;
-        let v1 = value_of(*c1)?;
-        let v2 = if *c2 == b'=' { 0 } else { value_of(*c2)? };
-        let v3 = if *c3 == b'=' { 0 } else { value_of(*c3)? };
+        let v0 = value_of(c0)?;
+        let v1 = value_of(c1)?;
+        let v2 = if c2 == b'=' { 0 } else { value_of(c2)? };
+        let v3 = if c3 == b'=' { 0 } else { value_of(c3)? };
         let packed = (v0 << 18) | (v1 << 12) | (v2 << 6) | v3;
 
         // The bits the padding stands in for must be zero, or two texts decode

@@ -731,6 +731,18 @@ a field, so a struct literal needs `opening`.
   of scanning them. Rows come out of a `TrialBalance` in key order, so proving a
   hundred accounts out of a hundred thousand costs `O(k log n)`.
 
+- **The three hand-rolled hex and base64 decoders use `as_chunks` rather than
+  `chunks_exact`.** A fixed-size chunk destructures irrefutably, so each loop
+  loses an error arm that could not be reached, and `IdempotencyKey::parse_hex`
+  and `base64::decode` read their length rules off the split instead of
+  duplicating them in a separate test.
+
+- **`just lint`, `fmt-check`, `test`, `doc` and `package` run on `stable`.**
+  `rust-toolchain.toml` pins the MSRV, which is right for compiling and wrong for
+  linting: clippy gains lints with every release, so those recipes checked an
+  older rulebook than the CI jobs they mirror and passed locally while CI failed.
+  `just msrv` stays the one lane that deliberately uses the pin.
+
 - **The merkle property tests no longer reject two thirds of what they
   generate.** Sizes and indices were drawn from independent ranges and filtered
   with `prop_assume!`, so the tests explored a fraction of the cases their count

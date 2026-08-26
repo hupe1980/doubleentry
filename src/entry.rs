@@ -165,15 +165,16 @@ impl IdempotencyKey {
 
     /// Parses a key from lowercase or uppercase hex.
     pub fn parse_hex(s: &str) -> Result<Self, EntryFieldError> {
-        if s.len() & 1 == 1 {
+        // `as_chunks` hands back fixed-size arrays, so the pair destructures
+        // irrefutably and an odd length shows up as a non-empty remainder
+        // rather than as a length test that has to agree with the loop.
+        let (pairs, remainder) = s.as_bytes().as_chunks::<2>();
+        if !remainder.is_empty() {
             return Err(EntryFieldError::MalformedIdempotencyKey);
         }
-        let mut out = Vec::with_capacity(s.len() / 2);
-        for pair in s.as_bytes().chunks_exact(2) {
-            let [hi, lo] = pair else {
-                return Err(EntryFieldError::MalformedIdempotencyKey);
-            };
-            let (hi, lo) = (hex_to_nibble(*hi)?, hex_to_nibble(*lo)?);
+        let mut out = Vec::with_capacity(pairs.len());
+        for &[hi, lo] in pairs {
+            let (hi, lo) = (hex_to_nibble(hi)?, hex_to_nibble(lo)?);
             out.push(hi.wrapping_shl(4) | lo);
         }
         Self::new(out)

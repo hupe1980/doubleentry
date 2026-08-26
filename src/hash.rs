@@ -50,11 +50,11 @@ impl Hash {
             return Err(ParseHashError::Length { got: s.len() });
         }
         let mut out = [0u8; 32];
-        for (slot, pair) in out.iter_mut().zip(s.as_bytes().chunks_exact(2)) {
-            let [hi, lo] = pair else {
-                return Err(ParseHashError::InvalidDigit);
-            };
-            *slot = hex_val(*hi)?.wrapping_shl(4) | hex_val(*lo)?;
+        // Exactly 64 bytes, so this is 32 pairs and an empty remainder. The
+        // pair is a fixed-size array, so it destructures irrefutably.
+        let (pairs, _) = s.as_bytes().as_chunks::<2>();
+        for (slot, &[hi, lo]) in out.iter_mut().zip(pairs) {
+            *slot = hex_val(hi)?.wrapping_shl(4) | hex_val(lo)?;
         }
         Ok(Self(out))
     }

@@ -8,6 +8,15 @@ set shell := ["bash", "-uc"]
 # the `msrv` job in .github/workflows/ci.yml, and the badge in README.md.
 msrv := "1.94"
 
+# The toolchain CI runs everything but the `msrv` job on.
+#
+# `rust-toolchain.toml` pins the MSRV, which is right for compiling and wrong for
+# linting: clippy gains lints with every release, so a recipe left on the pin
+# checks an older rulebook than CI does and passes locally while CI fails. The
+# recipes below that mirror a CI job therefore name the toolchain CI uses, and
+# `msrv` stays the one lane that deliberately does not.
+stable := "stable"
+
 # Every feature except `postgres`, which needs a running Docker daemon.
 portable := "serde,sqlite,iceberg,witness"
 
@@ -50,16 +59,19 @@ purity:
 
 # 🎨 Format the workspace
 fmt:
-    cargo fmt --all
+    RUSTUP_TOOLCHAIN={{ stable }} cargo fmt --all
 
 # 🎨 Fail if anything is unformatted
 fmt-check:
-    cargo fmt --all -- --check
+    RUSTUP_TOOLCHAIN={{ stable }} cargo fmt --all -- --check
 
 # 📎 Clippy with warnings denied (default + all features)
+#
+# On stable, not the pinned MSRV: a new release adds lints, and the pin would
+# quietly check an older rulebook than the CI job does.
 lint:
-    cargo clippy --all-targets -- -D warnings
-    cargo clippy --all-targets --all-features -- -D warnings
+    RUSTUP_TOOLCHAIN={{ stable }} cargo clippy --all-targets -- -D warnings
+    RUSTUP_TOOLCHAIN={{ stable }} cargo clippy --all-targets --all-features -- -D warnings
 
 # 🔎 Fast type-check, all features
 check:
@@ -67,7 +79,7 @@ check:
 
 # 🧪 Full test suite, Docker-backed PostgreSQL included
 test:
-    cargo test --all-features
+    RUSTUP_TOOLCHAIN={{ stable }} cargo test --all-features
 
 # 🧪 Everything that runs without a Docker daemon
 test-portable:
@@ -110,7 +122,7 @@ msrv:
 
 # 📚 Build the docs with warnings denied
 doc:
-    RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
+    RUSTUP_TOOLCHAIN={{ stable }} RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 
 # 📚 Build and open the docs
 doc-open:
@@ -127,7 +139,7 @@ site-serve:
 # 📦 Dry-run the crates.io package (catches bad metadata before tagging)
 package:
     # `--allow-dirty` is local convenience; CI runs this on a clean checkout.
-    cargo publish --dry-run --all-features --allow-dirty
+    RUSTUP_TOOLCHAIN={{ stable }} cargo publish --dry-run --all-features --allow-dirty
 
 # 🛡️ Audit dependencies for advisories (needs `cargo install cargo-audit`)
 audit:

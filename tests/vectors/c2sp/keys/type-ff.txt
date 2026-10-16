@@ -1,0 +1,6 @@
+# a verifier key: type-ff
+# input
+vkey: example.com/ledgers/acme+689aff11+/+pKbGPinFIKvvVQexMuxfmVR3auvr57kkIe6mkURtIs
+# expect
+go: reject
+crate: UnsupportedKeyType:255

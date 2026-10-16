@@ -1,0 +1,7 @@
+# a checkpoint evaluated by formats/policy.TLogPolicy.Verify
+# input
+policy: log-only
+checkpoint_b64: ZXhhbXBsZS5jb20vbGVkZ2Vycy9hY21lCjEzCnFPOUlSTWpoMWJwSnlCSE51RzZWZVI5ZE1zcDlsd212MmlqOTlsNlVtbE09CgrigJQgZXhhbXBsZS5jb20vbGVkZ2Vycy9hY21lIHc3YlpsQzVtZkEwNkRwVGk2Mm1QMHFNdUQxRkpXOW1NQ0tmWVZWcHYvT2xKTFc5bVVoa3QyWlJkVGdtR2J5WnFEUGdsa0xzTnJBUHFLaml5Qit3KzhKa2gxZ0E9Cg==
+# expect
+go: accept
+crate: accept

@@ -1,0 +1,4 @@
+log example.com/ledgers/acme+c3b6d994+AepKbGPinFIKvvVQexMuxfmVR3auvr57kkIe6mkURtIs
+witness attacker witness.example/w1+24b5d9fe+BJ6PNR8AAAAAWgAAAAAAAAAAAAAAAAAAAAMAAAAAAAAA
+witness w1 witness.example/w1+24b5d9fe+BP0XJDhaoMdbZPt4zWAvodmR/ev3axPFjtcC6sg16fYY
+quorum w1

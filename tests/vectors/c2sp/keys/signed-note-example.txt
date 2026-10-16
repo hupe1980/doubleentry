@@ -1,0 +1,6 @@
+# a verifier key: signed-note-example
+# input
+vkey: example.com/foo+530d903a+AekyeRrm56hApGFkyQR4ZCbV54Id2LKaANYcrnKv3U2k
+# expect
+go: accept
+crate: Ed25519

@@ -1,0 +1,7 @@
+# a checkpoint note that breaks one rule: size-leading-zero
+# input
+note_b64: ZXhhbXBsZS5jb20vbGVkZ2Vycy9hY21lCjAxMwpxTzlJUk1qaDFicEp5QkhOdUc2VmVSOWRNc3A5bHdtdjJpajk5bDZVbWxNPQoK4oCUIGV4YW1wbGUuY29tL2xlZGdlcnMvYWNtZSB3N2JabEdlSWNBRk9ZQnd6YzFlQUljL1FHa0toaTlIMUQ5bHFReG1yMGdVVkE1Z25vRkVpZXRjL24rUnV0cUJkM0hwcml4bFNIcE1Fdm1oS0p5OFFEVUp1N1FzPQo=
+vkey: example.com/ledgers/acme+c3b6d994+AepKbGPinFIKvvVQexMuxfmVR3auvr57kkIe6mkURtIs
+# expect
+go: accept
+crate: Malformed:Decimal

@@ -1,0 +1,14 @@
+error[E0308]: mismatched types
+ --> tests/ui/amount_not_a_string.rs:2:55
+  |
+2 |     let _: doubleentry::Amount = doubleentry::amount!(1.00);
+  |                                  ---------------------^^^^-
+  |                                  |                    |
+  |                                  |                    expected `&str`, found floating-point number
+  |                                  arguments to this function are incorrect
+  |
+note: associated function defined here
+ --> src/model/amount.rs
+  |
+  |     pub const fn parse_const(text: &str) -> Result<Self, AmountError> {
+  |                  ^^^^^^^^^^^

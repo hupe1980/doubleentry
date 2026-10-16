@@ -1,0 +1,7 @@
+# a tlog-policy parsed by formats/policy.Unmarshal
+# input
+policy_b64: bG9nIGV4YW1wbGUuY29tL2xlZGdlcnMvYWNtZStjM2I2ZDk5NCtBZXBLYkdQaW5GSUt2dlZRZXhNdXhmbVZSM2F1dnI1N2trSWU2bWtVUnRJcwpxdW9ydW0gbm9uZQo=
+# expect
+go: accept
+marshal_b64: bG9nIGV4YW1wbGUuY29tL2xlZGdlcnMvYWNtZStjM2I2ZDk5NCtBZXBLYkdQaW5GSUt2dlZRZXhNdXhmbVZSM2F1dnI1N2trSWU2bWtVUnRJcwpxdW9ydW0gbm9uZQo=
+crate: accept

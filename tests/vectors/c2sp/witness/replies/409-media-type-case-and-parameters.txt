@@ -1,0 +1,9 @@
+# a synthesised witness reply
+# input
+request_b64: b2xkIDAKCmV4YW1wbGUuY29tL2xlZGdlcnMvYWNtZQoxMwpxTzlJUk1qaDFicEp5QkhOdUc2VmVSOWRNc3A5bHdtdjJpajk5bDZVbWxNPQoK4oCUIGV4YW1wbGUuY29tL2xlZGdlcnMvYWNtZSB3N2JabEM1bWZBMDZEcFRpNjJtUDBxTXVEMUZKVzltTUNLZllWVnB2L09sSkxXOW1VaGt0MlpSZFRnbUdieVpxRFBnbGtMc05yQVBxS2ppeUIrdys4SmtoMWdBPQo=
+witness: witness.example/w1+24b5d9fe+BP0XJDhaoMdbZPt4zWAvodmR/ev3axPFjtcC6sg16fYY
+status: 409
+content_type: Text/X.TLOG.SIZE; charset=utf-8
+body_b64: OQo=
+# expect
+crate: Conflict:9

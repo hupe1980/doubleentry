@@ -1,0 +1,6 @@
+# a verifier key: uppercase-key-id
+# input
+vkey: example.com/ledgers/acme+C3B6D994+AepKbGPinFIKvvVQexMuxfmVR3auvr57kkIe6mkURtIs
+# expect
+go: accept
+crate: Malformed:Vkey

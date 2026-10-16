@@ -1,13 +1,17 @@
 [package]
 name        = "doubleentry"
-version     = "0.7.0"
+version     = "0.8.0"
 edition     = "2024"
+# MSRV, the single source: `just msrv` (and CI) checks it and the README badge.
+# 1.94 is required by sqlx 0.9. Never raised in a patch release, and only to a
+# stable release at least six months old.
 rust-version = "1.94"
 authors     = ["hupe1980"]
 description = """\
-An immutable, tamper-evident double-entry bookkeeping engine. Balanced-by-construction \
-entries, exact integer money, deterministic identity, and an append-only Merkle log with \
-inclusion and consistency proofs. Zero I/O. No async. No chart of accounts.\
+An immutable, tamper-evident double-entry bookkeeping engine: one pure rule core, exact \
+integer money, identity derived from the idempotency key, and one append-only RFC 6962 \
+Merkle log with inclusion, consistency and sealed-balance proofs and C2SP checkpoints, \
+in memory (sync) or over SQLite and PostgreSQL (async).\
 """
 keywords    = ["accounting", "ledger", "double-entry", "bookkeeping", "merkle"]
 categories  = ["finance", "data-structures", "cryptography"]
@@ -17,111 +21,194 @@ homepage    = "https://hupe1980.github.io/doubleentry"
 documentation = "https://docs.rs/doubleentry"
 readme      = "README.md"
 
-# An allowlist, not a denylist. `.gitignore` does not govern what `cargo
-# package` ships — untracked files are included regardless — so anything not
-# named here stays out by default: design notes, scratch files, the toolchain
-# pin. `schema/*.sql` is not optional; the backends `include_str!` it.
+# What `cargo package` ships: an allowlist. Top-level files are anchored with
+# `/` (a bare name matches at any depth). `just package-list` checks the result.
 include = [
-    "src/**/*.rs",
-    "schema/*.sql",
-    "tests/*.rs",
-    "README.md",
-    "CHANGELOG.md",
-    "LICENSE-APACHE",
-    "LICENSE-MIT",
+    "src/**",
+    "tests/**",
+    "examples/**",
+    "benches/**",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/LICENSE-APACHE",
+    "/LICENSE-MIT",
 ]
 
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
+# `##` lines are rendered into the crate docs by `document-features`.
 [features]
 default = []
 ## Enable serde `Serialize` / `Deserialize` on all public types.
 ##
 ## Serde is a transport concern only. The canonical encoding used for hashing is
 ## independent of it and is never routed through serde.
-serde = ["dep:serde", "time/serde", "uuid/serde"]
+serde = ["dep:serde", "time/serde"]
 
-## A PostgreSQL-backed `LedgerStore`, on sqlx.
-##
-## The reference DDL is `schema/postgres.sql`; the backend applies it itself via
-## `PostgresStore::migrate`.
+## `SqlStore<Postgres>`, on sqlx. Enables no TLS stack: for TLS, add
+## `sqlx = { version = "0.9", features = ["tls-rustls-aws-lc-rs"] }` (or
+## `tls-rustls-ring-webpki`, `tls-native-tls`) to your application.
+## One schema, `doubleentry/1`; no migrations.
 postgres = ["dep:sqlx", "sqlx/postgres"]
 
-## A SQLite-backed `LedgerStore`, on sqlx.
-##
-## The reference DDL is `schema/sqlite.sql`; the backend applies it itself via
-## `SqliteStore::migrate`.
-sqlite = ["dep:sqlx", "sqlx/sqlite"]
+## `SqlStore<Sqlite>`, on sqlx, with SQLite bundled. One schema,
+## `doubleentry/1`; no migrations.
+sqlite = ["dep:sqlx", "sqlx/sqlite-bundled", "sqlx/sqlite-unlock-notify"]
 
-## Ed25519 cosigning of tree heads, in the C2SP signed-note format.
-##
-## The `witness` module's state machine — which decides whether a head may be
-## vouched for, and refuses a second history at the same size — needs no
-## cryptography and is always available. This feature adds the keys, so a
-## decision can be turned into a signature a third party can check.
-##
-## No HTTP: `AddCheckpoint` is the C2SP `tlog-witness` request and response as
-## bytes, for whatever client you already have.
-witness = ["dep:ed25519-dalek", "dep:sha2"]
+## Ed25519 for `transparency`: `LogKey` signs checkpoints; cosignatures and
+## policies are verified; `WitnessSession` and `Verifier` work. The C2SP text
+## formats parse and render without it. No HTTP: requests and replies are bytes.
+witness = ["dep:ed25519-dalek"]
 
-## An Apache Iceberg cold tier: compacts sealed periods into Parquet.
-##
-## Pulls in Arrow, Parquet and object storage, so it is off by default.
-iceberg = ["dep:iceberg", "dep:arrow-array", "dep:arrow-schema", "dep:parquet"]
+## `doubleentry::testing`: the public conformance suite for `Store`
+## implementations and, with `witness`, `TestWitness`. Adds `tokio`.
+testing = ["dep:tokio"]
+
+## `tracing` spans per façade operation and per SQL store write. Never an
+## amount, memo or account path.
+tracing = ["dep:tracing"]
 
 [dependencies]
-blake3   = "1"
-smallvec = "1"
-thiserror = "2"
-time     = { version = "0.3", features = ["std", "macros"] }
-uuid     = { version = "1", features = ["v7"] }
+# Every always-on dependency is a review item: the rule core must stay free of
+# clock, randomness, I/O and global state, and `just purity` cannot see inside
+# a dependency.
+# sha2: SHA-256 for the log, `EntryId`, memo commitments and C2SP key hashes.
+sha2     = { version = "0.11.1", default-features = false }
+thiserror = "2.0.18"
+time     = { version = "0.3.47", features = ["std", "macros"] }
+# unicode-normalization: NFC for `AccountPath` and `Label`.
+unicode-normalization = { version = "0.1.25", default-features = false }
+# document-features: renders the `##` feature docs (build time only).
+# Non-optional, or it would become a public feature of its own.
+document-features = "0.2.12"
+# getrandom: a memo's salt when the caller supplies none. Called only from the
+# façades (`src/facade.rs`), never from the rule core.
+getrandom = { version = "0.3.4", features = ["std"] }
 
-serde    = { version = "1", features = ["derive"], optional = true }
-# No `macros`: every query in this crate is built at runtime with `sqlx::query`,
-# and the feature exists only to enable the compile-time `query!` family. It
-# pulls in `sqlx-macros-core`, which depends on *every* sqlx driver including
-# MySQL, which depends on `rsa` — a crate carrying an unfixed timing-sidechannel
-# advisory (RUSTSEC-2023-0071) that this crate can never reach.
-sqlx     = { version = "0.8", default-features = false, features = [
-    "runtime-tokio-rustls", "time", "uuid",
+serde    = { version = "1.0.220", features = ["derive"], optional = true }
+# No `macros` (it pulls every driver, MySQL's `rsa` included) and no `tls-*`:
+# the TLS stack is the application's choice (see the `postgres` feature).
+sqlx     = { version = "0.9.0", default-features = false, features = [
+    "runtime-tokio", "time",
 ], optional = true }
 
-# Cosigning. `rand_core` is deliberately off: this crate reads no randomness and
-# no clock, so a key is built from caller-supplied bytes and a cosignature's
-# timestamp is a caller-supplied argument. Nothing here can be non-deterministic.
-ed25519-dalek = { version = "2", default-features = false, features = [
-    "std", "zeroize",
+# Feature `witness`. No `rand_core`: keys come from caller-supplied seeds.
+ed25519-dalek = { version = "3.0.0", default-features = false, features = [
+    "alloc", "zeroize",
 ], optional = true }
-# The note key hash is specified as SHA-256, and interoperating is the whole
-# point of using a specified format — BLAKE3 is already here and cannot be
-# substituted.
-sha2 = { version = "0.10", default-features = false, optional = true }
 
-# Cold tier. Arrow and Parquet must match what `iceberg` itself resolves.
-iceberg      = { version = "0.10", optional = true }
-arrow-array  = { version = "58", optional = true }
-arrow-schema = { version = "58", optional = true }
-parquet      = { version = "58", optional = true }
+# Feature `testing`: the conformance suite runs concurrent tasks against a store.
+tokio    = { version = "1.51.0", default-features = false, features = [
+    "rt-multi-thread", "sync", "macros", "time",
+], optional = true }
+
+# Feature `tracing`. The crate only emits; the subscriber is the caller's.
+tracing  = { version = "0.1.37", default-features = false, features = ["std", "attributes"], optional = true }
 
 [dev-dependencies]
 proptest   = "1"
-serde_json = "1"
-tokio      = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+serde_json = "1.0.151"
+tokio      = { version = "1.51.0", features = ["macros", "rt-multi-thread", "sync", "time"] }
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["postgres"] }
 tempfile   = "3"
+# The façade-span test's collector answers `Span::current()` (tests/tracing.rs).
+tracing-core = "0.1.36"
+# Compile-fail tests of `amount!` and `date!` (tests/macros.rs, tests/ui/).
+trybuild   = "1.0.110"
+# Benchmarks: no plots, no rayon.
+criterion  = { version = "0.8.2", default-features = false, features = ["cargo_bench_support", "async_tokio"] }
+# The counting allocator of benches/journal_memory.rs (no hand-written unsafe).
+stats_alloc = "0.1.10"
+
+# `just examples` runs every example.
+[[example]]
+name = "holds"
+
+[[example]]
+name              = "transparency"
+required-features = ["witness", "testing"]
+
+# Line budgets for the next nine: tests/examples_loc.rs.
+[[example]]
+name = "wallet"
+
+[[example]]
+name = "invoice_clearing"
+
+[[example]]
+name = "month_close"
+
+[[example]]
+name = "multi_currency"
+
+[[example]]
+name = "reversal"
+
+[[example]]
+name = "reporting"
+
+[[example]]
+name              = "sqlite_service"
+required-features = ["sqlite"]
+
+[[example]]
+name              = "restore_audit"
+required-features = ["sqlite"]
+
+[[example]]
+name              = "witness"
+required-features = ["witness", "testing"]
+
+# Rule-core timings.
+[[bench]]
+name    = "core"
+harness = false
+
+# Report timings.
+[[bench]]
+name    = "report"
+harness = false
+
+# Throughput per store; PostgreSQL with `postgres` and Docker.
+[[bench]]
+name              = "throughput"
+harness           = false
+required-features = ["sqlite"]
+
+# Proof and audit cost per store.
+[[bench]]
+name              = "proofs"
+harness           = false
+required-features = ["sqlite"]
+
+# `Journal` heap per entry.
+[[bench]]
+name    = "journal_memory"
+harness = false
 
 [lints.rust]
 missing_docs = "warn"
 unsafe_code  = "forbid"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
 
 [lints.clippy]
-# Money arithmetic must be total. Every arithmetic path in this crate goes through
-# a checked operation that surfaces overflow as a typed error.
+# Library code never panics: arithmetic is checked, overflow is a typed error.
 arithmetic_side_effects = "deny"
 indexing_slicing        = "deny"
 unwrap_used             = "deny"
 expect_used             = "deny"
 panic                   = "deny"
+
+# Optimise the hash and signature crates in test builds (property tests).
+# Profiles never reach the crate's users.
+[profile.dev.package.sha2]
+opt-level = 3
+
+[profile.dev.package.curve25519-dalek]
+opt-level = 3
+
+[profile.dev.package.ed25519-dalek]
+opt-level = 3

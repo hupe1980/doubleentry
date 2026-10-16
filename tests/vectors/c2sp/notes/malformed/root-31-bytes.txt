@@ -1,0 +1,7 @@
+# a checkpoint note that breaks one rule: root-31-bytes
+# input
+note_b64: ZXhhbXBsZS5jb20vbGVkZ2Vycy9hY21lCjEzCnFPOUlSTWpoMWJwSnlCSE51RzZWZVI5ZE1zcDlsd212MmlqOTlsNlVtZz09CgrigJQgZXhhbXBsZS5jb20vbGVkZ2Vycy9hY21lIHc3YlpsRU8xWXBLRVVMNGE0TjZsUWJFTGJ0TXRIZStwcTZOZE9iZTluVXdkZ1kvWGRxNWE2VFZsTXczbWVPdE4xTXBNTnhlWmMxaVBNdCtUZnhwYm5kL0VPd1U9Cg==
+vkey: example.com/ledgers/acme+c3b6d994+AepKbGPinFIKvvVQexMuxfmVR3auvr57kkIe6mkURtIs
+# expect
+go: accept
+crate: Malformed:RootLength

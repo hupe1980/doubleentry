@@ -1,0 +1,13 @@
+# A downstream crate that depends on doubleentry only — no `time` — and
+# uses `date!` and `amount!` in `const` items (022 FR-018, SC-006). Built by
+# tests/macros.rs; not part of the package or a workspace.
+[package]
+name = "no_time_dep"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+doubleentry = { path = "../.." }
+
+[workspace]

@@ -1,14 +1,20 @@
-{# Docs sidebar.
-   Expects `nav_section` (the docs section) and `nav_current` (a permalink, or ""
-   on the section index) to be set by the including template. Zola 0.23 has no
-   template macros, so context is passed by assignment before the include. #}
+{# Docs sidebar: the five sections (Start, Concepts, Reporting, Operating,
+   Assurance) in weight order, each with its pages in weight order.
+   Expects `nav_section` (the docs root section) and `nav_current` (a
+   permalink, or "" on an index) to be set by the including template. Zola
+   0.23 has no template macros, so context is passed by assignment before the
+   include. #}
 <nav class="doc-nav" aria-label="Documentation">
-  <p class="doc-nav-title">Documentation</p>
+  <p class="doc-nav-title"><a href="{{ nav_section.permalink }}">Documentation</a></p>
+  {% for path in nav_section.subsections %}
+  {% set sub = get_section(path=path) %}
+  <p class="doc-nav-group"><a href="{{ sub.permalink }}"{% if sub.permalink == nav_current %} aria-current="page"{% endif %}>{{ sub.title }}</a></p>
   <ol>
-    {% for p in nav_section.pages %}
+    {% for p in sub.pages %}
     <li>
       <a href="{{ p.permalink }}"{% if p.permalink == nav_current %} aria-current="page"{% endif %}>{{ p.title }}</a>
     </li>
     {% endfor %}
   </ol>
+  {% endfor %}
 </nav>

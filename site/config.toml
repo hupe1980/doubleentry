@@ -8,9 +8,9 @@
 base_url = "https://hupe1980.github.io/doubleentry"
 title = "doubleentry"
 description = """\
-An immutable, tamper-evident double-entry bookkeeping engine for Rust. \
-Balanced by construction, exact integer money, and an append-only Merkle log \
-with inclusion, consistency and balance proofs."""
+An immutable, tamper-evident double-entry bookkeeping engine for Rust: one pure \
+rule core, exact integer money, and one RFC 6962 Merkle log with inclusion, \
+consistency and sealed-balance proofs and C2SP checkpoints."""
 
 default_language = "en"
 compile_sass = true

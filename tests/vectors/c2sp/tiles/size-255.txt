@@ -1,0 +1,8 @@
+# tlog-tiles of the tree of leaves leaf-i (tlog.NewTiles, tlog.ReadTileData; height element removed)
+# input
+size: 255
+# expect
+changed: tile/0/000.p/255
+changed_half: tile/0/000.p/255
+tile: tile/0/000.p/255 ab29038fc0d3b061b3ed47c342d2a35f3859653b9e3df2d5d82f3e321aae718a
+entries: tile/entries/000.p/255 cdb59bb7cb0dc27f391eb0f03756ef0aa68cc3029de74d20f0513a84cb63d155

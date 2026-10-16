@@ -1,0 +1,6 @@
+# a verifier key: type-05
+# input
+vkey: example.com/ledgers/acme+052b6fba+BepKbGPinFIKvvVQexMuxfmVR3auvr57kkIe6mkURtIs
+# expect
+go: reject
+crate: UnsupportedKeyType:5

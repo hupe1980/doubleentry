@@ -1,0 +1,48 @@
+# cargo-deny (https://embarkstudios.github.io/cargo-deny/). Run with `just deny`;
+# CI runs it on every push and pull request.
+
+# ── Graph ────────────────────────────────────────────────────────────────────
+# Every target; features come from the command line (`--all-features`).
+[graph]
+targets = []
+all-features = false
+
+# ── Security advisories ──────────────────────────────────────────────────────
+# RustSec. An ignore entry needs a reason and a re-check date.
+[advisories]
+version = 2
+ignore = []
+
+# ── Licenses ─────────────────────────────────────────────────────────────────
+# Permissive licenses only; an unused entry is removed.
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "Unicode-3.0",
+    "BSD-3-Clause",
+    "Zlib",
+    "CC0-1.0",
+    "BSL-1.0",
+    "Unlicense",
+    "MIT-0",
+]
+confidence-threshold = 0.8
+
+# ── Bans ─────────────────────────────────────────────────────────────────────
+# Duplicate versions warn (sqlx-core 0.9 still uses sha2 0.10).
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+highlight = "all"
+deny = []
+
+# ── Sources ──────────────────────────────────────────────────────────────────
+# crates.io only.
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

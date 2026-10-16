@@ -1,0 +1,9 @@
+# a reply of the stock witness to an add-checkpoint request
+# input
+request_b64: b2xkIDE0CgpleGFtcGxlLmNvbS9sZWRnZXJzL2FjbWUKMTMKcU85SVJNamgxYnBKeUJITnVHNlZlUjlkTXNwOWx3bXYyaWo5OWw2VW1sTT0KCuKAlCBleGFtcGxlLmNvbS9sZWRnZXJzL2FjbWUgdzdiWmxDNW1mQTA2RHBUaTYybVAwcU11RDFGSlc5bU1DS2ZZVlZwdi9PbEpMVzltVWhrdDJaUmRUZ21HYnlacURQZ2xrTHNOckFQcUtqaXlCK3crOEpraDFnQT0K
+witness: witness.example/w1+24b5d9fe+BP0XJDhaoMdbZPt4zWAvodmR/ev3axPFjtcC6sg16fYY
+status: 400
+content_type: 
+body_b64: 
+# expect
+crate: BadRequest

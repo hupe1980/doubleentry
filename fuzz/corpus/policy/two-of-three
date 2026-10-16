@@ -1,0 +1,6 @@
+log example.com/ledgers/acme+c3b6d994+AepKbGPinFIKvvVQexMuxfmVR3auvr57kkIe6mkURtIs
+witness w1 witness.example/w1+24b5d9fe+BP0XJDhaoMdbZPt4zWAvodmR/ev3axPFjtcC6sg16fYY
+witness w2 witness.example/w2+0863ad1e+BEOnLnFEAXYt9mtowm373yaCquyfJHTspGE+QkoPuv08
+witness w3 witness.example/w3+3f558bfa+BGa+fjMsekUzMr2dCn99sFX1xe8aBq2mbZizn7aBDEc6
+group g 2 w1 w2 w3
+quorum g

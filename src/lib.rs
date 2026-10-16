@@ -1,111 +1,156 @@
 //! An immutable, tamper-evident double-entry bookkeeping engine.
 //!
-//! `doubleentry` enforces the invariants of double-entry bookkeeping inside the
-//! engine and can prove afterwards that it did. It is a calculation library, not
-//! a platform: no I/O, no async, no database, and no opinion about your chart of
-//! accounts.
+//! A **ledger** is one entity's books, kept as one append-only
+//! [RFC 6962](https://www.rfc-editor.org/rfc/rfc6962) SHA-256 Merkle log of
+//! typed records: a genesis record, account events, currency declarations,
+//! policy events, period definitions, entries, clearings and seals. Every record has exactly one
+//! canonical byte form, so a position in the log, a leaf hash and a proof mean
+//! the same thing to every implementation.
 //!
-//! # What it guarantees
+//! Every write is decided by **one pure function**, the rule core: it takes
+//! the draft and a read-only view of the ledger at the position the record
+//! will be appended, and returns either the record to write or one
+//! [`Rejection`] with a stable code. No façade and no store implements a
+//! rule; [`Journal::audit`] and [`Ledger::audit`] replay the whole log
+//! through the same core.
 //!
-//! - **Balanced by construction.** An entry reaches a persistable state only by
-//!   passing validation, and the validated type cannot be constructed any other
-//!   way. Unbalanced data cannot reach storage without a bug in this crate.
-//!   Debits equal credits per currency *and per layer*: every balance the engine
-//!   reports is keyed on both, so an entry whose reservation were offset by a
-//!   settled movement would falsify the trial balance permanently.
-//! - **Exact.** Money is a scaled integer with a compile-time precision. Every
-//!   arithmetic operation that can overflow returns a `Result`. There is no
-//!   floating point and nothing panics on a hostile input.
-//! - **Bounded, where you say so.** An account can be forbidden from crossing
-//!   zero — a cash box that cannot be overdrawn, a wallet that cannot be drawn
-//!   beyond what was funded. The limit is checked against the balance an entry
-//!   would leave behind, with an outstanding reservation counted against it and
-//!   an expected inflow not, and the SQL backends check it inside the write, so
-//!   two concurrent draws cannot together breach it.
-//! - **Hierarchical.** Account paths are a tree and only leaves are postable,
-//!   which makes a *node's* balance a single defensible number rather than two.
-//!   [`Rollup`] is that number for every node at once — gross totals intact,
-//!   grouping nodes inferred from the paths that exist, summarisable to any
-//!   depth, and a pure function of a trial balance and a registry.
-//! - **Reportable on either date.** An entry carries a booking date and a value
-//!   date, and any balance, trial balance or statement folds by whichever the
-//!   query names — the books, or the cash. It stays a *reporting* choice: period
-//!   membership and what a seal commits to are booking-date questions, or a
-//!   settlement instruction could reopen sealed books.
-//! - **Deterministic.** The engine reads no clock and no random number generator.
-//!   Identical inputs produce identical bytes, hashes, and orderings, which is
-//!   what makes replay and reproducible testing possible.
-//! - **Verifiable.** Entries are leaves in an append-only Merkle log. A third
-//!   party holding only a tree head can be given an `O(log n)` proof that an
-//!   entry is included, and an `O(log n)` proof that the log was only appended
-//!   to. Closing a period emits a [`Seal`] that commits to its entries, its
-//!   closing balances, and the account registry those balances are keyed on,
-//!   chained to the seal before it — so a single closing balance can be proven
-//!   against that seal with a [`BalanceProof`], and *named* with an
-//!   [`AccountBindingProof`], without handing over the rest of the trial balance
-//!   or the rest of the chart of accounts. Seals chain, and each carries a
-//!   consistency proof from its predecessor's tree — so the chain establishes
-//!   that the log was only ever *appended to*, checkable by someone holding the
-//!   seals and nothing else.
-//! - **Witnessable.** Every guarantee above is relative to a tree head, so an
-//!   operator who can publish two heads can publish two histories and prove
-//!   either one. [`witness`] closes that: an independent party remembers the
-//!   last head it vouched for, demands a consistency proof to move forward, and
-//!   **refuses a second history at the same size**. With the `witness` feature
-//!   it cosigns in the C2SP signed-note format, so the refusal is something a
-//!   third party can check.
+//! # Where things are
 //!
-//! # Where to start
+//! - **The crate root** — what bookkeeping code names: the two façades with
+//!   the same methods, [`Journal`] (sync, in memory) and [`Ledger`] (async,
+//!   over a store); the one [`Error`] and its [`Rejection`]; the values
+//!   (exact [`Amount`]s, [`Currency`] codes, validated names such as
+//!   [`AccountPath`] and [`Label`], the derived [`EntryId`]); the [`Entry`]
+//!   draft; [`BalanceQuery`]; the [`TreeHead`] proofs verify against.
+//! - [`currency`](mod@currency) — the currency constants (`EUR`, `JPY`, …).
+//! - [`report`] — what the reads return: [`TrialBalance`](report::TrialBalance),
+//!   [`Statement`](report::Statement), [`Rollup`](report::Rollup),
+//!   [`OpenItem`](report::OpenItem)s and balance assertions.
+//! - [`export`] — the GoBD export view: verifiable flat rows.
+//! - [`error`] — the payloads [`Error`]'s variants carry.
+//! - [`log`] — proofs and the RFC 6962 hashing an independent verifier
+//!   re-implements; [`record`] — the eight record kinds and their canonical
+//!   bytes.
+//! - [`prelude`] — the everyday vocabulary in one import.
+//! - [`store`] — where a ledger is kept: the [`Store`](store::Store)
+//!   contract, [`MemoryStore`](store::MemoryStore), the SQL store, and the
+//!   rule core's protocol for implementers of another store.
+//! - [`transparency`] — C2SP checkpoints, witness requests and replies,
+//!   policies, the auditor's verifier, proof bundles and tiles.
+//! - `testing` (feature `testing`) — the conformance suite every store
+//!   passes.
 //!
-//! This page is the API reference. The guide — why each guarantee is built the
-//! way it is — lives at <https://hupe1980.github.io/doubleentry>.
+//! The user guide covers the same ground:
+//! [Start](https://hupe1980.github.io/doubleentry/docs/start/),
+//! [Concepts](https://hupe1980.github.io/doubleentry/docs/concepts/),
+//! [Reporting](https://hupe1980.github.io/doubleentry/docs/reporting/),
+//! [Operating](https://hupe1980.github.io/doubleentry/docs/operating/) and
+//! [Assurance](https://hupe1980.github.io/doubleentry/docs/assurance/).
 //!
-//! A [`Journal`] is one entity's books: its accounts, its calendar, its policy,
-//! its entries, its Merkle log, its seals, its clearings. Register accounts on
-//! it, hand it drafts, and read balances, statements and proofs back out. When
-//! the books have to survive the process, put a [`LedgerStore`] behind it —
-//! [`MemoryStore`], `SqliteStore` or `PostgresStore` — and the semantics are the
-//! same, because the [`conformance`](storage::conformance) suite is what decides
-//! whether a backend is one.
+//! # Example
 //!
-//! # Layout
+//! ```
+//! use doubleentry::{AccountKind, Entry, Journal, LedgerId, Rejection, amount, date, currency::EUR};
 //!
-//! | Module | Purpose |
-//! |---|---|
-//! | [`money`] | `Amount<P>`, `Currency` and `Rounding` — exact scaled-integer arithmetic |
-//! | [`account`] | The account tree, what may be posted to, and balance limits |
-//! | [`dimensions`] | `Label`, `DimensionFilter`, and the caller-named axes a posting is sliced by |
-//! | [`posting`] | `Direction`, `Layer`, and the atomic movement |
-//! | [`entry`] | The type-state entry and its validation |
-//! | [`balance`] | Gross-preserving balances, trial balances, and `BalanceQuery` |
-//! | [`period`] | Period definitions and their lifecycle |
-//! | [`journal`] | The books: accounts, calendar, entries, idempotency, corrections, statements |
-//! | [`clearing`] | Open-item matching and residual tracking |
-//! | [`closing`] | Year-end closing entries |
-//! | [`rollup`] | Hierarchical reporting: a trial balance folded up the account tree |
-//! | [`storage`] | Persistence traits, in-memory / SQLite / PostgreSQL backends, Iceberg cold tier, conformance suite |
-//! | [`merkle`] | The append-only log and its proofs |
-//! | [`seal`] | Period seals, the seal chain, and balance proofs |
-//! | [`checkpoint`] | Balance checkpoints and external assertions |
-//! | [`witness`] | Witness cosigning: the independent check on a split view |
-//! | [`canonical`] | The byte encoding everything is hashed from |
-//! | [`hash`] | Domain-separated digests |
+//! let mut books = Journal::new(LedgerId::new("example.com/acme")?).as_actor("setup");
+//! books.declare_currency(EUR, 2, date!("2026-01-01"))?;
+//! books.open("Assets:Cash", AccountKind::Asset, date!("2026-01-01"))?;
+//! books.open("Income:Sales", AccountKind::Income, date!("2026-01-01"))?;
+//! books.define_period("2026-03", date!("2026-03-01"), date!("2026-03-31"))?;
 //!
-//! # Serialisation
+//! let invoice = Entry::new("invoice-2026-0001", date!("2026-03-15"))
+//!     .debit("Assets:Cash", amount!("1190.00"), EUR)
+//!     .credit("Income:Sales", amount!("1190.00"), EUR);
+//! let recorded = books.record(invoice.clone())?;
+//! assert!(!recorded.replayed);
+//! assert!(books.record(invoice)?.replayed); // a retry changes nothing
 //!
-//! With the `serde` feature, values round-trip through their own constructors,
-//! so an invariant that holds for a constructed value also holds for one read
-//! back. Money serialises as a decimal string rather than a raw scaled integer,
-//! and deserialising an entry yields a [`Draft`] — the balanced witness is
-//! re-established by validation on the receiving side, never trusted from the
-//! wire.
+//! // An unbalanced draft is refused with a stable code.
+//! let refused = books.record(
+//!     Entry::new("invoice-2026-0002", date!("2026-03-16"))
+//!         .debit("Assets:Cash", amount!("10.00"), EUR)
+//!         .credit("Income:Sales", amount!("9.00"), EUR),
+//! );
+//! assert_eq!(refused.err().as_ref().and_then(|e| e.rejection()).map(Rejection::code), Some(106));
 //!
-//! # What it is not
+//! books.seal_period("2026-03")?;
+//! books.audit()?;
+//! # Ok::<(), doubleentry::Error>(())
+//! ```
 //!
-//! Not an ERP, not an ORM, not a reporting engine, not a chart of accounts, and
-//! not a payments library. It produces validated, balanced, provable entries and
-//! leaves every domain decision to the caller.
-
+//! # A guide
+//!
+//! 1. **Set up the books** — [`declare_currency`](Journal::declare_currency)
+//!    (with its exponent), [`define_months`](Journal::define_months) (or
+//!    [`define_period`](Journal::define_period)), [`open`](Journal::open)
+//!    accounts by path, and optionally [`set_limit`](Journal::set_limit).
+//!    Every setup call is idempotent — repeating it with the same definition
+//!    writes nothing, a different one is refused — so a service runs it on
+//!    every start.
+//! 2. **Draft and record** — [`Entry`] builders are infallible; a malformed
+//!    draft is refused by [`record`](Journal::record) with a [`Rejection`]
+//!    and a stable code. The idempotency key is the entry's identity: a
+//!    retry of the same draft returns the original [`Recorded`] with
+//!    `replayed == true`. [`record_batch`](Journal::record_batch) records
+//!    many drafts atomically, in order, in one transaction.
+//! 3. **Read** — [`balance`](Journal::balance) and the reports take a
+//!    [`BalanceQuery`] (a log prefix, a date window by booking or value
+//!    date, a period, dimension filters); both façades answer them alike.
+//! 4. **Close and prove** — [`seal_period`](Journal::seal_period) commits
+//!    every balance through the period's end; periods are sealed in
+//!    calendar order, and [`seal_through`](Journal::seal_through) seals every
+//!    open period up to one in a single call;
+//!    [`prove_entry`](Journal::prove_entry),
+//!    [`prove_consistency`](Journal::prove_consistency) and
+//!    [`prove_balance`](Journal::prove_balance) give proofs that verify
+//!    against a [`TreeHead`] alone; [`transparency`] signs heads and lets
+//!    independent witnesses cosign them.
+//! 5. **Keep it durable** — the same calls on a [`Ledger`] over a
+//!    [`store`] (`MemoryStore`, SQLite, PostgreSQL), each `.await`ed; the
+//!    store runs the rule core inside its write transaction.
+//!    [`audit`](Ledger::audit) replays the log and compares.
+//!
+//! # Errors
+//!
+//! Every operation of either façade returns [`Result`], whose error is the
+//! one [`Error`]. Match on its variant to decide what to do:
+//!
+//! | Error | [`is_transient`](Error::is_transient) | [`may_have_applied`](Error::may_have_applied) | What the caller does |
+//! |---|---|---|---|
+//! | [`Rejected(r)`](Error::Rejected) | false | false | show `r` and its code; fix the input; never retry unchanged |
+//! | [`BatchRejected { index, rejection }`](Error::BatchRejected) | false | false | nothing of the batch was written; fix draft `index` (or drop it) and record the batch again |
+//! | [`Value(e)`](Error::Value), [`Amount(e)`](Error::Amount) | false | false | fix the value or the arithmetic at the call site (never from a ledger operation) |
+//! | [`Query(e)`](Error::Query) | false | false | fix the question: the entry, period, window or position asked for |
+//! | [`Transparency(e)`](Error::Transparency) | false | false | the artefact is refused: a forged, stale or foreign checkpoint, bundle or reply; never retry it unchanged |
+//! | [`Integrity(e)`](Error::Integrity) | false | false | stop writing; investigate position `e.position()`; restore from a backup and [`audit`](Journal::audit) |
+//! | [`Backend(b)`](Error::Backend), transient, definite | true | false | retry later with the **same** draft |
+//! | [`Backend(b)`](Error::Backend), outcome unknown | either | true | retry with the **same** draft: it applies once, or comes back with `replayed == true` |
+//! | [`Backend(b)`](Error::Backend), permanent, definite | false | false | do not retry automatically: an operator problem (configuration, permissions) |
+//! | [`Config(e)`](Error::Config) | false | false | the store holds another ledger, scale or schema: fix the URL, schema name, ledger id or `P` — the data is fine |
+//!
+//! `{:?}` on an [`Error`] prints its `Display` line, stable code included, so
+//! `fn main() -> doubleentry::Result<()>` reports `rejected: [427] …`.
+//!
+//! ```
+//! use doubleentry::prelude::*;
+//!
+//! # fn record(books: &mut Journal, entry: Entry) -> Result<()> {
+//! match books.record(entry) {
+//!     Ok(recorded) if recorded.replayed => {} // a retry: nothing written
+//!     Ok(_) => {}
+//!     Err(Error::Rejected(rejection)) => eprintln!("refused: {rejection}"),
+//!     Err(error) if error.is_transient() => return Err(error), // retry later, same draft
+//!     Err(error) => return Err(error),
+//! }
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Feature flags
+//!
+//! All features are off by default.
+//!
+#![doc = document_features::document_features!()]
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
@@ -121,67 +166,190 @@
     )
 )]
 
-pub mod account;
-pub mod balance;
-pub mod canonical;
-pub mod checkpoint;
-pub mod clearing;
-pub mod closing;
-pub mod dimensions;
-pub mod entry;
-pub mod hash;
-pub mod journal;
-pub mod merkle;
-pub mod money;
-pub mod period;
-pub mod posting;
-pub mod rollup;
-pub mod seal;
-mod serde_support;
-pub mod storage;
-pub mod witness;
+mod core;
+pub mod error;
+pub mod export;
+mod facade;
+mod journal;
+mod ledger;
+pub mod log;
+mod model;
+pub mod prelude;
+pub mod report;
+pub mod store;
+#[cfg(feature = "testing")]
+pub mod testing;
+#[cfg(feature = "tracing")]
+mod trace;
+pub mod transparency;
 
-pub use account::{
-    Account, AccountBindingProof, AccountError, AccountId, AccountKind, AccountPath, AccountRecord,
-    AccountRegistry, BalanceLimit, account_binding_leaf,
-};
-pub use balance::{Balance, BalanceKey, BalanceQuery, DateBasis, EntryDates, TrialBalance};
-pub use canonical::{Canonical, CanonicalReader, CanonicalWriter};
-pub use checkpoint::{AssertAt, AssertionOutcome, BalanceAssertion, Checkpoint, CheckpointError};
-pub use clearing::{
-    ClearedItem, Clearing, ClearingError, ClearingEvent, ClearingId, ClearingRegister, OpenItem,
-    PostingLookup, PostingPosition, PostingRef,
-};
-pub use closing::{ClosingError, closing_postings};
-pub use dimensions::{DimensionError, DimensionFilter, Dimensions, Label};
-pub use entry::{
-    Balanced, CurrencyPolicy, Description, DocumentRef, Draft, Entry, EntryFieldError, EntryId,
-    IdempotencyKey, IntegrityError, LedgerPolicy, Provenance, SealContext, ValidationError,
-    ValidationErrors,
-};
-pub use hash::{Hash, ParseHashError, RESERVED_DOMAIN_PREFIX};
-pub use journal::{
-    AuditCheck, AuditReport, Journal, JournalError, LogIndex, NotSequenced, Recorded,
-};
-pub use merkle::{
-    ConsistencyProof, InclusionProof, MalformedAccumulator, MalformedProof, MerkleAccumulator,
-    MerkleLog, ProofError, TreeHead, empty_root, leaf_hash,
-};
-pub use money::{Amount, Currency, MoneyError, Rounding};
-pub use period::{LedgerId, Period, PeriodCalendar, PeriodError, PeriodId, PeriodState};
-pub use posting::{Direction, Layer, Posting};
-pub use rollup::{Rollup, RollupNode};
-pub use seal::{
-    BalanceProof, PeriodCoverage, Seal, SealChain, SealChainError, SealedBalance,
-    SealedBalanceError, SealedBalanceOutcome, TrialBalanceCommitment, balance_leaf,
-    trial_balance_head,
-};
-pub use storage::{
-    BatchError, Cursor, DynLedgerStore, EntryBatch, LedgerStore, MemoryStore, MemoryStoreError,
-    OpenItemPage, Page, PostingCursor, StatementLine, StatementPage, StoredEntry,
-};
+/// Hooks for the `fuzz/` package (cargo-fuzz sets `cfg(fuzzing)`): parsers
+/// that are not public API, reached only from the fuzz targets. Not built
+/// otherwise, so invisible to docs, `cargo public-api` and semver.
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub mod fuzz_api {
+    /// Decodes a seal balance-tree leaf (`0x81 ‖ i128 debit ‖ i128 credit ‖
+    /// u64 postings`) as a sealed-balance bundle does, refusing anything
+    /// that does not re-encode to the same bytes.
+    ///
+    /// # Errors
+    ///
+    /// The bundle's layout error for anything but a canonical balance leaf.
+    pub fn decode_balance_leaf<const P: u8>(
+        leaf: &[u8],
+    ) -> Result<crate::Balance<P>, crate::transparency::Error> {
+        crate::transparency::decode_balance_leaf(leaf)
+    }
+}
 
-/// Compiles and runs every example in the crate's README.
+pub use crate::core::{
+    AccountSpec, AuditReport, HoldState, HoldStatus, Recorded, ResolutionKind, SealReceipt,
+    validate,
+};
+pub use error::rejection::Rejection;
+pub use error::top::{Error, Result};
+pub use facade::Account;
+pub use journal::Journal;
+pub use ledger::Ledger;
+pub use log::proof::TreeHead;
+pub use model::{
+    AccountHandle, AccountKind, AccountPath, AccountRef, Amount, Balance, BalanceLimit,
+    CaptureTime, Currency, Dimensions, Document, Entry, EntryId, EntryRecord, IdempotencyKey,
+    Label, Layer, LedgerId, LedgerPolicy, MemoSalt, PeriodId, PostAmount, Posting, PostingRef,
+    Rate, Rounding, Side,
+};
+pub use report::query::BalanceQuery;
+pub use store::read::{HoldCursor, Page, PageRead};
+
+/// The currency codes as constants — `use doubleentry::currency::JPY;`. The
+/// [`prelude`] brings the five most common; any other ISO 4217 code is
+/// [`Currency::new`] or the [`currency!`] literal.
+pub mod currency {
+    pub use crate::model::{
+        AUD, BHD, BRL, CAD, CHF, CNY, CZK, DKK, EUR, GBP, HKD, HUF, INR, JPY, KRW, KWD, MXN, NOK,
+        NZD, PLN, SEK, SGD, TRY, USD, ZAR,
+    };
+}
+
+/// The log's record kinds and their canonical byte form — what an exporter
+/// or an independent verifier decodes; bookkeeping code rarely names them.
+///
+/// Every leaf is `kind ‖ canonical(record)`: `Record::decode` reads one
+/// strictly, `Record::to_leaf_bytes` writes it.
+pub mod record {
+    pub use crate::model::{
+        AccountAction, AccountChange, AccountEvent, AccountRegistration, ClearingAction,
+        ClearingEvent, CurrencyDeclaration, DecodeError, EntryParts, FORMAT, Fingerprint, Genesis,
+        HoldAction, MAX_LEAF_BYTES, MemoCommitment, PeriodDefinition, PolicyEvent, PostingRecord,
+        Record, RecordKind, Seal, SealOrderError, SealParts, TreeHeadEntry,
+    };
+}
+
+/// The calendar date every booking date, value date and effective date is
+/// (re-exported from `time`, so [`date!`] needs no dependency of yours).
+pub use time::Date;
+
+/// A [`Date`] from a `YYYY-MM-DD` literal, checked at compile time.
+///
+/// ```
+/// use doubleentry::{Date, date};
+///
+/// const MARCH_15: Date = date!("2026-03-15");
+/// assert_eq!(MARCH_15.to_string(), "2026-03-15");
+/// assert_eq!(date!("2024-02-29").ordinal(), 60); // a leap day
+/// ```
+///
+/// A day the month does not have:
+///
+/// ```compile_fail
+/// let _ = doubleentry::date!("2026-02-30");
+/// ```
+///
+/// Anything but four, two and two digits:
+///
+/// ```compile_fail
+/// let _ = doubleentry::date!("2026-3-1");
+/// ```
+#[macro_export]
+macro_rules! date {
+    ($literal:literal) => {
+        const {
+            // Total at run time: this panic can only fire while the inline
+            // `const` block is evaluated, i.e. as a compile error.
+            #[allow(clippy::panic)]
+            let date = match $crate::__date($literal) {
+                ::core::option::Option::Some(date) => date,
+                ::core::option::Option::None => ::core::panic!(::core::concat!(
+                    "date!(",
+                    ::core::stringify!($literal),
+                    "): expected an existing date written YYYY-MM-DD"
+                )),
+            };
+            date
+        }
+    };
+}
+
+/// The date a `YYYY-MM-DD` text names; `None` for any other text or a day
+/// that does not exist. The engine of [`date!`].
+#[doc(hidden)]
+#[must_use]
+pub const fn __date(text: &str) -> Option<Date> {
+    let [y0, y1, y2, y3, b'-', m0, m1, b'-', d0, d1] = text.as_bytes() else {
+        return None;
+    };
+    let (Some(year), Some(month), Some(day)) = (
+        digits(&[*y0, *y1, *y2, *y3]),
+        digits(&[*m0, *m1]),
+        digits(&[*d0, *d1]),
+    ) else {
+        return None;
+    };
+    let month = match month {
+        1 => time::Month::January,
+        2 => time::Month::February,
+        3 => time::Month::March,
+        4 => time::Month::April,
+        5 => time::Month::May,
+        6 => time::Month::June,
+        7 => time::Month::July,
+        8 => time::Month::August,
+        9 => time::Month::September,
+        10 => time::Month::October,
+        11 => time::Month::November,
+        12 => time::Month::December,
+        _ => return None,
+    };
+    // At most four and two digits: 9 999 fits an `i32`, 99 a `u8`.
+    match Date::from_calendar_date(year as i32, month, day as u8) {
+        Ok(date) => Some(date),
+        Err(_) => None,
+    }
+}
+
+/// The value of a run of ASCII digits; `None` for any other byte.
+const fn digits(bytes: &[u8]) -> Option<u16> {
+    let mut value: u16 = 0;
+    let mut rest = bytes;
+    while let [first, tail @ ..] = rest {
+        if !first.is_ascii_digit() {
+            return None;
+        }
+        value = match value.checked_mul(10) {
+            Some(value) => value,
+            None => return None,
+        };
+        value = match value.checked_add(first.wrapping_sub(b'0') as u16) {
+            Some(value) => value,
+            None => return None,
+        };
+        rest = tail;
+    }
+    Some(value)
+}
+
+/// Every code block of the README, compiled and run as a doctest.
 #[cfg(doctest)]
 #[doc = include_str!("../README.md")]
 pub struct ReadmeExamples;

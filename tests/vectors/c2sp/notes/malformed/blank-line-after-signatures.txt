@@ -1,0 +1,7 @@
+# a checkpoint note that breaks one rule: blank-line-after-signatures
+# input
+note_b64: ZXhhbXBsZS5jb20vbGVkZ2Vycy9hY21lCjEzCnFPOUlSTWpoMWJwSnlCSE51RzZWZVI5ZE1zcDlsd212MmlqOTlsNlVtbE09CgrigJQgZXhhbXBsZS5jb20vbGVkZ2Vycy9hY21lIHc3YlpsQzVtZkEwNkRwVGk2Mm1QMHFNdUQxRkpXOW1NQ0tmWVZWcHYvT2xKTFc5bVVoa3QyWlJkVGdtR2J5WnFEUGdsa0xzTnJBUHFLaml5Qit3KzhKa2gxZ0E9Cgo=
+vkey: example.com/ledgers/acme+c3b6d994+AepKbGPinFIKvvVQexMuxfmVR3auvr57kkIe6mkURtIs
+# expect
+go: reject
+crate: Malformed:NoSignature

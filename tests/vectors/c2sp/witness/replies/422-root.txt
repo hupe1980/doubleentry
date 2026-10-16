@@ -1,0 +1,9 @@
+# a reply of the stock witness to an add-checkpoint request
+# input
+request_b64: b2xkIDEzCgpleGFtcGxlLmNvbS9sZWRnZXJzL2FjbWUKMTMKWStFT3dzaWM3cjRmV29MbUsvY01LeHg4YVFaelN4aWx2SWNEakpaOUovcz0KCuKAlCBleGFtcGxlLmNvbS9sZWRnZXJzL2FjbWUgdzdiWmxIeXJvTjlPQUpRL3lDcTVXSmF0bkpveUJJaWRVbGR0T2szSGFncUhYOUk4OG5MM2p4VUl3RnBzU3Y1K2dLM1ZwTWNXdk5aZGJYL3IzY3A2aGM3dE5RVT0K
+witness: witness.example/w1+24b5d9fe+BP0XJDhaoMdbZPt4zWAvodmR/ev3axPFjtcC6sg16fYY
+status: 422
+content_type: 
+body_b64: 
+# expect
+crate: Unprocessable

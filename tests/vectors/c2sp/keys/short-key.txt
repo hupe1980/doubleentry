@@ -1,0 +1,6 @@
+# a verifier key: short-key
+# input
+vkey: example.com/ledgers/acme+157a33ae+AepKbGPinFIKvvVQexMuxfmVR3auvr57kkIe6mkURtI=
+# expect
+go: reject
+crate: Malformed:Vkey

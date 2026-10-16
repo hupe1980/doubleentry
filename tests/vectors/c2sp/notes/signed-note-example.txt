@@ -1,0 +1,6 @@
+# the example of c2sp.org/signed-note, verified by note.Open
+# input
+note_b64: VGhpcyBpcyBhbiBleGFtcGxlIG1lc3NhZ2UuCgrigJQgZXhhbXBsZS5jb20vZm9vIFV3MlFPa244c3JWMXlKR2gyVllSbEwxVG5hZ3YxWUVxNlRmWHBwemkyT05uY0FsVGdLN1p0ZzFFUllOWlhzWWpPQkgzbUZYbVJLdXdIakcxWXU3MkluZXlhUU09Cg==
+vkey: example.com/foo+530d903a+AekyeRrm56hApGFkyQR4ZCbV54Id2LKaANYcrnKv3U2k
+# expect
+go: accept

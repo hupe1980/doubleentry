@@ -1,20 +1,8 @@
-//! The PostgreSQL backend, exercised against a real database.
-//!
-//! Every test starts a throwaway PostgreSQL container, applies the reference
-//! schema, and runs against it. Nothing is mocked: the constraints, the advisory
-//! lock, the deferred triggers, and the concurrency behaviour are the real ones,
-//! because those are exactly the parts that cannot be checked any other way.
-//!
-//! The headline test is [`the_postgres_backend_conforms`], which runs the
-//! library's own conformance suite. A backend either passes it or is not a
-//! backend.
-//!
-//! One container is shared by the whole binary, and each test creates its own
-//! database inside it. Starting a container per test is both slow and unstable —
-//! twenty containers racing for the same daemon is a source of failures that
-//! have nothing to do with the code under test.
-
-#![cfg(feature = "postgres")]
+//! `SqlStore<Postgres>` against a real PostgreSQL 17 (testcontainers): the
+//! conformance suite, the store acceptance scenarios, isolation and locking,
+//! the database's own refusals, least privilege and the storage
+//! regressions.
+#![cfg(all(feature = "postgres", feature = "testing"))]
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -23,1218 +11,1256 @@
     clippy::arithmetic_side_effects
 )]
 
-use doubleentry::account::AccountRegistry;
-use doubleentry::clearing::{Clearing, ClearingId, PostingRef};
-use doubleentry::entry::{Draft, LedgerPolicy, SealContext};
-use doubleentry::period::{LedgerId, Period, PeriodCalendar, PeriodId, PeriodState};
-use doubleentry::storage::postgres::{DEFAULT_SCHEMA, PostgresError, PostgresStore, Sequencing};
-use doubleentry::storage::{Cursor, EntryBatch, LedgerStore, PostingCursor};
+mod store_checks;
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
+use doubleentry::store::{Postgres, SqlOptions, SqlStore, Store, StoreErrorKind};
+use doubleentry::testing::conformance;
 use doubleentry::{
-    AccountId, Amount, BalanceKey, BalanceQuery, Balanced, Currency, Entry, EntryId,
-    IdempotencyKey, Layer,
+    AccountKind, Entry, Error, Ledger, LedgerId, currency::EUR, date, record::Genesis,
 };
-use sqlx::postgres::PgPoolOptions;
+use sha2::{Digest, Sha256};
+use sqlx::{Connection, PgConnection, Row};
+use store_checks::{entry_by_key_and_id, eur, ledger, populated, sale};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, ImageExt};
-use testcontainers_modules::postgres::Postgres as PostgresImage;
-use time::macros::date;
+use testcontainers_modules::postgres::Postgres as Image;
 
-type Eur = Amount<2>;
+/// A running server: the container and its URL.
+type Server = (ContainerAsync<Image>, String);
 
-/// The one container this binary uses.
-static POSTGRES: tokio::sync::OnceCell<Shared> = tokio::sync::OnceCell::const_new();
+static ALPINE: tokio::sync::OnceCell<Server> = tokio::sync::OnceCell::const_new();
+static DEBIAN: tokio::sync::OnceCell<Server> = tokio::sync::OnceCell::const_new();
+static SCHEMAS: AtomicU64 = AtomicU64::new(0);
 
-struct Shared {
-    /// Held so it outlives every pool; dropping it stops the database.
-    _container: ContainerAsync<PostgresImage>,
-    port: u16,
+async fn start(tag: &str) -> Server {
+    let container = Image::default().with_tag(tag).start().await.unwrap();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    (
+        container,
+        format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres"),
+    )
 }
 
-async fn shared() -> &'static Shared {
-    POSTGRES
-        .get_or_init(|| async {
-            let container = PostgresImage::default()
-                .with_tag("17-alpine")
-                .start()
-                .await
-                .expect("postgres container starts");
-            let port = container
-                .get_host_port_ipv4(5432)
-                .await
-                .expect("port is mapped");
-            Shared {
-                _container: container,
-                port,
-            }
-        })
-        .await
+/// The shared `postgres:17-alpine` server.
+async fn url() -> &'static str {
+    &ALPINE.get_or_init(|| start("17-alpine")).await.1
 }
 
-/// Counter giving each test its own database name.
-static NEXT_DB: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-
-/// A private database and a store pointed at it.
-struct Harness {
-    /// Set when this harness owns its cluster rather than sharing one.
-    _owned_container: Option<ContainerAsync<PostgresImage>>,
-    /// The connection string, for tests that open a second store.
-    url: String,
-    store: PostgresStore<2>,
-    accounts: AccountRegistry,
-    calendar: PeriodCalendar,
-    policy: LedgerPolicy,
-    left: AccountId,
-    right: AccountId,
+/// The shared Debian `postgres:17` server (`en_US.utf8`).
+async fn debian() -> &'static str {
+    &DEBIAN.get_or_init(|| start("17")).await.1
 }
 
-impl Harness {
-    /// A harness on a **dedicated** cluster.
-    ///
-    /// Deferred sequencing advances on a cluster-wide watermark, so a
-    /// transaction held open by an unrelated test — in any database of the same
-    /// instance — stalls it. Tests of that mode therefore need their own
-    /// instance, which is a consequence of the technique rather than of the
-    /// tests.
-    async fn start_isolated() -> Self {
-        let container = PostgresImage::default()
-            .with_tag("17-alpine")
-            .start()
-            .await
-            .expect("postgres container starts");
-        let port = container
-            .get_host_port_ipv4(5432)
-            .await
-            .expect("port is mapped");
-        let mut harness = Self::connect(port, "postgres".to_owned()).await;
-        harness._owned_container = Some(container);
-        harness
-    }
-
-    async fn start() -> Self {
-        let shared = shared().await;
-        let port = shared.port;
-
-        // A private database per test: isolation without a container per test.
-        let name = format!(
-            "de_{}",
-            NEXT_DB.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        );
-        let admin = PgPoolOptions::new()
-            .max_connections(1)
-            .connect(&format!(
-                "postgres://postgres:postgres@127.0.0.1:{port}/postgres"
-            ))
-            .await
-            .expect("connects to the maintenance database");
-        sqlx::query(&format!("CREATE DATABASE {name}"))
-            .execute(&admin)
-            .await
-            .expect("creates a database");
-        admin.close().await;
-
-        Self::connect(port, name).await
-    }
-
-    async fn connect(port: u16, database: String) -> Self {
-        let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/{database}");
-        let ledger = LedgerId::new(format!("pg-{database}")).expect("valid");
-        // `connect` configures `search_path`, so the ledger's tables land in
-        // their own schema instead of competing with `public` for names.
-        let store = PostgresStore::<2>::connect(&url, ledger)
-            .await
-            .expect("connects");
-        store.migrate().await.expect("schema applies");
-        let url_for_reopen = url.clone();
-
-        let mut accounts = AccountRegistry::new();
-        let left = accounts
-            .register_path("Pg:Left", date!(2000 - 01 - 01))
-            .expect("registers");
-        let right = accounts
-            .register_path("Pg:Right", date!(2000 - 01 - 01))
-            .expect("registers");
-        // Persist the handle bindings, not just the paths: a handle is a
-        // position, and re-deriving positions on restart would repoint history.
-        for record in accounts.records() {
-            store.register_account(&record).await.expect("registers");
-        }
-
-        Self {
-            _owned_container: None,
-            url: url_for_reopen,
-            store,
-            accounts,
-            calendar: PeriodCalendar::new(),
-            policy: LedgerPolicy::default(),
-            left,
-            right,
-        }
-    }
-
-    fn ctx(&self) -> SealContext<'_> {
-        SealContext {
-            accounts: &self.accounts,
-            calendar: &self.calendar,
-            policy: &self.policy,
-        }
-    }
-
-    fn entry(&self, key: &[u8], minor: i64) -> Entry<Balanced, 2> {
-        self.entry_on(key, minor, date!(2026 - 03 - 15))
-    }
-
-    fn entry_on(&self, key: &[u8], minor: i64, on: time::Date) -> Entry<Balanced, 2> {
-        Entry::<Draft, 2>::new(
-            EntryId::generate(),
-            IdempotencyKey::new(key.to_vec()).expect("valid"),
-            on,
-        )
-        .debit(self.left, Eur::from_minor(minor), Currency::EUR)
-        .credit(self.right, Eur::from_minor(minor), Currency::EUR)
-        .seal(&self.ctx())
-        .expect("balances")
-    }
-
-    fn key(&self) -> BalanceKey {
-        BalanceKey {
-            account: self.left,
-            currency: Currency::EUR,
-            layer: Layer::Settled,
-        }
-    }
+fn next_schema() -> String {
+    format!("ledger_{}", SCHEMAS.fetch_add(1, Ordering::Relaxed))
 }
 
-/// The suite that decides whether an implementation is a backend.
-#[tokio::test]
-async fn the_postgres_backend_conforms() {
-    let h = Harness::start().await;
-    let report = doubleentry::storage::conformance::check_all(&h.store).await;
-    report.assert_passed();
-}
-
-/// The same suite, with positions assigned out of band instead of inline.
-#[tokio::test]
-async fn the_deferred_backend_conforms() {
-    let h = Harness::start_isolated().await;
-    let deferred = PostgresStore::<2>::with_sequencing(
-        h.store.pool().clone(),
-        h.store.ledger().clone(),
-        Sequencing::Deferred,
-    );
-    let report = doubleentry::storage::conformance::check_all(&deferred).await;
-    report.assert_passed();
-}
-
-#[tokio::test]
-async fn deferred_appends_are_durable_before_they_are_sequenced() {
-    // The window the mode exists to create: recorded and safe from loss, but not
-    // yet placed in the log and so not yet provable.
-    let h = Harness::start_isolated().await;
-    let store = PostgresStore::<2>::with_sequencing(
-        h.store.pool().clone(),
-        h.store.ledger().clone(),
-        Sequencing::Deferred,
-    );
-
-    let entry = h.entry(b"deferred", 1000);
-    let id = entry.id();
-    let recorded = store
-        .append(&EntryBatch::single(entry))
-        .await
-        .expect("appends");
-
-    assert_eq!(recorded[0].index, None, "no position before sequencing");
-    assert!(recorded[0].require_index().is_err());
-
-    // Durable and findable …
-    let found = store.get(id).await.expect("reads").expect("present");
-    assert_eq!(found.index, None);
-    // … but not in the log.
-    assert_eq!(store.len().await.expect("reads"), 0);
-    assert_eq!(store.head().await.expect("reads").size, 0);
-
-    // The watermark is cluster-wide, so a pass may decline until unrelated
-    // transactions elsewhere in the instance have finished.
-    let mut placed = 0;
-    for _ in 0..64 {
-        placed += store.sequence().await.expect("sequences");
-        if placed > 0 {
-            break;
-        }
-    }
-    assert_eq!(placed, 1);
-
-    let placed = store.get(id).await.expect("reads").expect("present");
-    assert_eq!(placed.require_index().expect("sequenced").get(), 0);
-    assert_eq!(store.len().await.expect("reads"), 1);
-
-    // And now provable.
-    let head = store.head().await.expect("reads");
-    let proof = store
-        .prove_inclusion(placed.index.expect("sequenced"))
-        .await
-        .expect("proves");
-    assert!(proof.verify(&placed.content_hash, &head));
-
-    // A second pass has nothing left to do.
-    assert_eq!(store.sequence().await.expect("sequences"), 0);
-}
-
-#[tokio::test]
-async fn deferred_sequencing_loses_nothing_under_concurrency() {
-    // The reason the sequencer advances on a commit-order watermark rather than
-    // a high-water mark: with concurrent writers, rows commit out of order, and
-    // a reader tracking "the highest thing I have seen" steps over the ones that
-    // commit late and never picks them up again.
-    let h = Harness::start_isolated().await;
-    let store = PostgresStore::<2>::with_sequencing(
-        h.store.pool().clone(),
-        h.store.ledger().clone(),
-        Sequencing::Deferred,
-    );
-
-    // Writers and sequencer run at the same time, so passes see partial state.
-    let mut writers = Vec::new();
-    for i in 0..48i64 {
-        let store = store.clone();
-        let entry = h.entry(format!("race-{i}").as_bytes(), 100 + i);
-        writers.push(tokio::spawn(async move {
-            store.append(&EntryBatch::single(entry)).await
-        }));
-    }
-    let sequencer = {
-        let store = store.clone();
-        tokio::spawn(async move {
-            let mut total = 0u64;
-            for _ in 0..24 {
-                total += store.sequence().await.expect("sequences");
-                tokio::task::yield_now().await;
-            }
-            total
-        })
+async fn store_in(url: &str, schema: &str) -> SqlStore<Postgres> {
+    let options = SqlOptions {
+        schema: schema.to_owned(),
+        max_connections: 4,
+        ..SqlOptions::default()
     };
+    SqlStore::postgres_with(url, options).await.unwrap()
+}
 
-    for writer in writers {
-        writer.await.expect("task completes").expect("appends");
-    }
-    sequencer.await.expect("task completes");
+async fn fresh() -> SqlStore<Postgres> {
+    store_in(url().await, &next_schema()).await
+}
 
-    // Drain whatever the interleaving left unplaced. Bounded, because the
-    // cluster-wide watermark means a pass can legitimately place nothing.
-    for _ in 0..256 {
-        store.sequence().await.expect("sequences");
-        if store.len().await.expect("reads") == 48 {
-            break;
-        }
-    }
+/// A fresh store and its schema.
+async fn fresh_named() -> (SqlStore<Postgres>, String) {
+    let schema = next_schema();
+    (store_in(url().await, &schema).await, schema)
+}
 
-    assert_eq!(
-        store.len().await.expect("reads"),
-        48,
-        "every recorded entry must end up in the log"
+async fn raw(url: &str) -> PgConnection {
+    PgConnection::connect(url).await.unwrap()
+}
+
+async fn execute(connection: &mut PgConnection, sql: &str) -> Result<u64, sqlx::Error> {
+    sqlx::raw_sql(sqlx::AssertSqlSafe(sql.to_owned()))
+        .execute(&mut *connection)
+        .await
+        .map(|done| done.rows_affected())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn postgres_conforms() {
+    let report = conformance(fresh)
+        .await
+        .unwrap_or_else(|failure| panic!("{failure}"));
+    assert!(
+        report.total() < Duration::from_secs(180),
+        "SC-001: {:?}",
+        report.total()
     );
+    println!("{} checks in {:?}", report.checks.len(), report.total());
+}
 
-    // Positions are dense and gap-free, with nothing skipped.
-    let mut seen = Vec::new();
-    let mut cursor = Some(Cursor::start().with_limit(10));
-    while let Some(c) = cursor {
-        let page = store.page(c).await.expect("pages");
-        seen.extend(
-            page.records
-                .iter()
-                .map(|r| r.require_index().expect("sequenced").get()),
-        );
-        cursor = page.next;
-    }
-    assert_eq!(seen, (0..48).collect::<Vec<_>>());
+#[tokio::test(flavor = "multi_thread")]
+async fn postgres_debian_conforms() {
+    let report = conformance(|| async { store_in(debian().await, &next_schema()).await })
+        .await
+        .unwrap_or_else(|failure| panic!("{failure}"));
+    println!("{} checks in {:?}", report.checks.len(), report.total());
+}
 
-    // And the log the sequencer built is the log the definition describes.
-    let head = store.head().await.expect("reads");
-    let mut leaves = Vec::new();
-    let mut cursor = Some(Cursor::start().with_limit(100));
-    while let Some(c) = cursor {
-        let page = store.page(c).await.expect("pages");
-        leaves.extend(page.records.iter().map(|r| r.content_hash));
-        cursor = page.next;
-    }
-    assert_eq!(head, doubleentry::MerkleLog::from_leaves(leaves).head());
+// ── US1 ─────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn us1_create_then_open() {
+    store_checks::us1_create_then_open(fresh().await).await;
 }
 
 #[tokio::test]
-async fn concurrent_sequencing_passes_do_not_duplicate_positions() {
-    let h = Harness::start_isolated().await;
-    let store = PostgresStore::<2>::with_sequencing(
-        h.store.pool().clone(),
-        h.store.ledger().clone(),
-        Sequencing::Deferred,
-    );
+async fn us1_journal_parity() {
+    store_checks::us1_journal_parity(fresh().await).await;
+}
 
-    for i in 0..20i64 {
+#[tokio::test]
+async fn us1_rejection_writes_nothing() {
+    store_checks::us1_rejection_writes_nothing(fresh().await).await;
+}
+
+#[tokio::test]
+async fn us1_replay_and_key_conflict() {
+    store_checks::us1_replay_and_key_conflict(fresh().await).await;
+}
+
+#[tokio::test]
+async fn us1_open_before_create_is_not_created() {
+    store_checks::us1_open_before_create_is_not_created(fresh().await).await;
+}
+
+#[tokio::test]
+async fn seal_through_and_exponents() {
+    store_checks::seal_through_and_exponents(fresh().await).await;
+}
+
+#[tokio::test]
+async fn us1_other_genesis_refused_identical_accepted() {
+    store_checks::us1_other_genesis_refused_identical_accepted(fresh().await).await;
+}
+
+#[tokio::test]
+async fn us4_postings_pages_with_filters() {
+    store_checks::us4_postings_pages_with_filters(fresh().await).await;
+}
+
+#[tokio::test]
+async fn us4_proofs_at_historical_sizes() {
+    store_checks::us4_proofs_at_historical_sizes(fresh().await).await;
+}
+
+/// `regress_f6_foreign_schema_is_refused` (PoC: F6), on PostgreSQL.
+#[tokio::test]
+// PoC: F6 poc_f6_migrate_over_a_0_6_database_is_silent_and_wrong
+async fn regress_f6_foreign_schema_is_refused() {
+    let (store, schema) = fresh_named().await;
+    let mut db = raw(url().await).await;
+    execute(
+        &mut db,
+        &format!(
+            "CREATE SCHEMA {schema}; CREATE TABLE {schema}.meta (singleton BIGINT PRIMARY KEY, schema_id TEXT, \
+             ledger_id TEXT, amount_scale BIGINT, genesis BYTEA); \
+             INSERT INTO {schema}.meta VALUES (1, 'doubleentry/0', 'example.com/acme', 2, '\\x00');"
+        ),
+    )
+    .await
+    .unwrap();
+    let expected = StoreErrorKind::SchemaMismatch {
+        found: String::from("doubleentry/0"),
+    };
+    assert_eq!(store.open().await.unwrap_err().kind(), &expected);
+    assert_eq!(
         store
-            .append(&EntryBatch::single(
-                h.entry(format!("dup-{i}").as_bytes(), 100 + i),
-            ))
+            .create(&Genesis { ledger: ledger() })
             .await
-            .expect("appends");
-    }
-
-    // Several sequencers at once; the advisory lock must make all but one wait.
-    let mut passes = Vec::new();
-    for _ in 0..6 {
-        let store = store.clone();
-        passes.push(tokio::spawn(async move { store.sequence().await }));
-    }
-    let mut total = 0u64;
-    for pass in passes {
-        total += pass.await.expect("task completes").expect("sequences");
-    }
-    for _ in 0..64 {
-        if store.len().await.expect("reads") == 20 {
-            break;
-        }
-        total += store.sequence().await.expect("sequences");
-    }
-
-    assert_eq!(total, 20, "each entry must be sequenced exactly once");
-    assert_eq!(store.len().await.expect("reads"), 20);
-}
-
-#[tokio::test]
-async fn migration_is_idempotent() {
-    // A backend is restarted far more often than it is created, so applying the
-    // schema again must be a no-op rather than a startup failure.
-    let h = Harness::start().await;
-    h.store.migrate().await.expect("second run succeeds");
-    h.store.migrate().await.expect("third run succeeds");
-
-    // And the schema still works afterwards.
-    h.store
-        .append(&EntryBatch::single(h.entry(b"after-migrate", 100)))
-        .await
-        .expect("appends");
-    assert_eq!(h.store.len().await.expect("reads"), 1);
-}
-
-#[tokio::test]
-async fn entries_round_trip_through_the_database() {
-    let h = Harness::start().await;
-    let original = h.entry(b"round-trip", 119_000);
-    let id = original.id();
-    let hash = original.content_hash();
-
-    h.store
-        .append(&EntryBatch::single(original.clone()))
-        .await
-        .expect("appends");
-
-    let loaded = h.store.get(id).await.expect("reads").expect("present");
-    assert_eq!(loaded.content_hash, hash);
-    assert_eq!(loaded.entry.postings().len(), 2);
-    assert_eq!(loaded.entry.booking_date(), original.booking_date());
-    // Byte-for-byte: the hash is recomputed on load and compared.
-    assert_eq!(loaded.entry.content_hash(), hash);
-}
-
-#[tokio::test]
-async fn a_tampered_row_is_caught_on_read() {
-    let h = Harness::start().await;
-    let entry = h.entry(b"tamper", 1000);
-    let id = entry.id();
-    h.store
-        .append(&EntryBatch::single(entry))
-        .await
-        .expect("appends");
-
-    // Reach past the engine and alter a posting, as a compromised operator or a
-    // corrupt page would.
-    sqlx::query("UPDATE postings SET amount_minor = amount_minor + 1 WHERE posting_index = 0")
-        .execute(h.store.pool())
-        .await
-        .expect("updates");
-
-    match h.store.get(id).await {
-        Err(PostgresError::Integrity(e)) => {
-            assert_ne!(e.actual, e.expected, "the mismatch must be reported");
-        }
-        other => panic!("expected an integrity failure, got {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn concurrent_appends_produce_dense_ordered_indices() {
-    // The reason `log_index` is not a SEQUENCE: values consumed before commit
-    // can commit out of order, leaving a gap a reader steps over permanently.
-    let h = Harness::start().await;
-
-    let mut tasks = Vec::new();
-    for i in 0..24i64 {
-        let store = h.store.clone();
-        let entry = h.entry(format!("concurrent-{i}").as_bytes(), 100 + i);
-        tasks.push(tokio::spawn(async move {
-            store
-                .append(&EntryBatch::single(entry))
-                .await
-                .expect("appends")
-        }));
-    }
-    for task in tasks {
-        task.await.expect("task completes");
-    }
-
-    assert_eq!(h.store.len().await.expect("reads"), 24);
-
-    let mut seen = Vec::new();
-    let mut cursor = Some(Cursor::start().with_limit(5));
-    while let Some(c) = cursor {
-        let page = h.store.page(c).await.expect("pages");
-        seen.extend(
-            page.records
-                .iter()
-                .map(|r| r.require_index().expect("sequenced").get()),
-        );
-        cursor = page.next;
-    }
-    assert_eq!(
-        seen,
-        (0..24).collect::<Vec<_>>(),
-        "indices must be dense and gap-free under concurrency"
+            .unwrap_err()
+            .kind(),
+        &expected
     );
+    let tables: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = '{schema}'"
+    )))
+    .fetch_one(&mut db)
+    .await
+    .unwrap();
+    assert_eq!(tables, 1, "nothing was created");
 }
 
-#[tokio::test]
-async fn concurrent_replays_of_one_key_append_once() {
-    // At-least-once delivery means the same transaction arrives twice at once.
-    let h = Harness::start().await;
+// ── US2 ─────────────────────────────────────────────────────────────────────
 
-    let mut tasks = Vec::new();
-    for _ in 0..8 {
-        let store = h.store.clone();
-        let entry = h.entry(b"same-key", 4242);
-        tasks.push(tokio::spawn(async move {
-            store.append(&EntryBatch::single(entry)).await
-        }));
-    }
-
-    let mut new_count = 0;
-    for task in tasks {
-        let outcome = task.await.expect("task completes").expect("appends");
-        if outcome[0].is_new {
-            new_count += 1;
-        }
-    }
-
-    assert_eq!(new_count, 1, "exactly one racer may win");
-    assert_eq!(h.store.len().await.expect("reads"), 1);
-}
-
-#[tokio::test]
-async fn concurrent_draws_cannot_together_breach_a_balance_limit() {
-    // The failure a balance limit exists to prevent, and the one a naive
-    // implementation still allows: two withdrawals that each fit the balance
-    // read separately, and together do not. Checking before the write reads a
-    // pre-image both racers see; the row lock inside the write is what makes
-    // the invariant hold rather than usually hold.
-    let h = Harness::start().await;
-
-    let mut limited = h.accounts.clone();
-    limited
-        .set_limit(h.left, doubleentry::account::BalanceLimit::NoCreditBalance)
-        .expect("registered");
-    for record in limited.records() {
-        h.store
-            .register_account(&record)
-            .await
-            .expect("master data updates");
-    }
-
-    // Fund it with exactly 10.00 …
-    h.store
-        .append(&EntryBatch::single(h.entry(b"limit-funding", 1_000)))
-        .await
-        .expect("appends");
-
-    // … then race eight withdrawals of 4.00. At most two can be accepted.
-    let draw = |key: &[u8]| {
-        Entry::<Draft, 2>::new(
-            EntryId::generate(),
-            IdempotencyKey::new(key.to_vec()).expect("valid"),
-            date!(2026 - 03 - 16),
-        )
-        .credit(h.left, Eur::from_minor(400), Currency::EUR)
-        .debit(h.right, Eur::from_minor(400), Currency::EUR)
-        .seal(&SealContext {
-            accounts: &limited,
-            calendar: &h.calendar,
-            policy: &h.policy,
+/// `regress_g2b_repeatable_read_default_is_overridden` (PoC: G2/G2b): with
+/// the database's default isolation `repeatable read`, 16 concurrent appends
+/// all succeed at dense positions — the pipeline pins `READ COMMITTED`.
+#[tokio::test(flavor = "multi_thread")]
+// PoC: G2b poc_g2b_inline_appends_fail_under_repeatable_read (G2 poc_g2_deferred_limit_breach_under_repeatable_read merged)
+async fn regress_g2b_repeatable_read_default_is_overridden() {
+    let mut db = raw(url().await).await;
+    execute(&mut db, "CREATE DATABASE g2b").await.unwrap();
+    execute(
+        &mut db,
+        "ALTER DATABASE g2b SET default_transaction_isolation = 'repeatable read'",
+    )
+    .await
+    .unwrap();
+    let g2b = format!("{}/g2b", url().await.rsplit_once('/').unwrap().0);
+    let store = SqlStore::<Postgres>::postgres_with(
+        &g2b,
+        SqlOptions {
+            max_connections: 16,
+            ..SqlOptions::default()
+        },
+    )
+    .await
+    .unwrap();
+    let (_, books) = store_checks::books(store).await;
+    let start = books.head().await.unwrap().size;
+    let tasks: Vec<_> = (0..16)
+        .map(|n| {
+            let books = books.clone();
+            tokio::spawn(async move {
+                books
+                    .record(sale(&format!("rr-{n}"), date!("2026-01-15"), "1.00"))
+                    .await
+            })
         })
-        .expect("balances")
-    };
+        .collect();
+    let mut positions = Vec::new();
+    for task in tasks {
+        positions.push(task.await.unwrap().unwrap().position);
+    }
+    positions.sort_unstable();
+    assert_eq!(positions, (start..start + 16).collect::<Vec<_>>());
+}
 
+/// The advisory lock key of ledger `id` in `schema` (FR-018; amended
+/// 2026-10-16, A3-S11: keyed by the schema and the ledger id).
+fn lock_key(schema: &str, id: &str) -> i64 {
+    let digest = Sha256::new()
+        .chain_update("doubleentry/ledger-lock")
+        .chain_update(format!("{schema}\u{0}{id}"))
+        .finalize();
+    i64::from_be_bytes(digest[..8].try_into().unwrap())
+}
+
+/// `regress_g3_two_schemas_two_locks` (PoC: G3): while ledger A's lock is
+/// held, an append to ledger B in another schema completes; A's waits.
+#[tokio::test(flavor = "multi_thread")]
+// PoC: G3 poc_g3_advisory_lock_is_shared_across_ledgers
+async fn regress_g3_two_schemas_two_locks() {
+    let (store_a, schema_a) = fresh_named().await;
+    let a = Ledger::new(store_a, LedgerId::new("example.com/a").unwrap())
+        .await
+        .unwrap();
+    let b = Ledger::new(fresh().await, LedgerId::new("example.com/b").unwrap())
+        .await
+        .unwrap();
+    let mut holder = raw(url().await).await;
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(lock_key(&schema_a, "example.com/a"))
+        .execute(&mut holder)
+        .await
+        .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        b.declare_currency(EUR, 2, date!("2026-01-01")),
+    )
+    .await
+    .expect("ledger B does not wait for ledger A")
+    .unwrap();
+    let waiting = tokio::time::timeout(
+        Duration::from_millis(500),
+        a.declare_currency(EUR, 2, date!("2026-01-01")),
+    )
+    .await;
+    assert!(waiting.is_err(), "ledger A waits for its lock");
+    sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(lock_key(&schema_a, "example.com/a"))
+        .execute(&mut holder)
+        .await
+        .unwrap();
+    a.declare_currency(EUR, 2, date!("2026-01-01"))
+        .await
+        .unwrap();
+}
+
+/// An open `REPEATABLE READ` reader does not delay a write.
+#[tokio::test(flavor = "multi_thread")]
+async fn readers_never_block() {
+    let (store, schema) = fresh_named().await;
+    let (_, books) = store_checks::books(store).await;
+    books
+        .record(sale("first", date!("2026-01-15"), "1.00"))
+        .await
+        .unwrap();
+    let mut reader = raw(url().await).await;
+    execute(&mut reader, "BEGIN ISOLATION LEVEL REPEATABLE READ")
+        .await
+        .unwrap();
+    execute(
+        &mut reader,
+        &format!("SELECT * FROM {schema}.postings; SELECT * FROM {schema}.balances"),
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        books.record(sale("second", date!("2026-01-15"), "1.00")),
+    )
+    .await
+    .expect("the write does not wait for the reader")
+    .unwrap();
+    execute(&mut reader, "ROLLBACK").await.unwrap();
+}
+
+// ── US4 ─────────────────────────────────────────────────────────────────────
+
+/// The plan of `sql` in `schema` with sequential and bitmap scans
+/// discouraged (the test tables are tiny): whether an index serves the read
+/// in order.
+async fn plan(db: &mut PgConnection, schema: &str, sql: &str) -> String {
+    execute(db, "SET enable_seqscan = off; SET enable_bitmapscan = off")
+        .await
+        .unwrap();
+    execute(db, &format!("SET search_path = {schema}"))
+        .await
+        .unwrap();
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!("EXPLAIN {sql}")))
+        .fetch_all(&mut *db)
+        .await
+        .unwrap();
+    rows.iter()
+        .map(|row| row.get::<String, _>(0))
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+/// Postings pages are index range scans without a sort (Q-S8); sealing
+/// reads `postings_by_day`; due holds read `holds_open_due`.
+#[tokio::test]
+async fn plan_reads_use_their_indexes_without_sorting() {
+    let (store, schema) = fresh_named().await;
+    populated(store).await;
+    let mut db = raw(url().await).await;
+    let by_position = plan(
+        &mut db,
+        &schema,
+        "SELECT p.position, p.idx FROM postings p WHERE p.handle = 0 AND p.currency = 'EUR' AND p.layer = 0 \
+         AND p.position < 100 AND (p.position, p.idx) > (-1, -1) ORDER BY p.position, p.idx LIMIT 10",
+    )
+    .await;
+    assert!(
+        by_position.contains("postings_by_key") && !by_position.contains("Sort"),
+        "{by_position}"
+    );
+    let by_booking = plan(
+        &mut db,
+        &schema,
+        "SELECT p.position, p.idx FROM postings p WHERE p.handle = 0 AND p.currency = 'EUR' AND p.layer = 0 \
+         AND p.position < 100 AND (p.booking, p.position, p.idx) > (0, -1, -1) ORDER BY p.booking, p.position, p.idx LIMIT 10",
+    )
+    .await;
+    assert!(
+        by_booking.contains("postings_by_key_day") && !by_booking.contains("Sort"),
+        "{by_booking}"
+    );
+    let after = plan(
+        &mut db,
+        &schema,
+        "SELECT handle FROM postings WHERE booking > 0 ORDER BY booking, position, idx",
+    )
+    .await;
+    assert!(
+        after.contains("postings_by_day") && !after.contains("Sort"),
+        "{after}"
+    );
+    let due = plan(
+        &mut db,
+        &schema,
+        "SELECT position FROM holds WHERE resolved_by IS NULL AND expires IS NOT NULL AND expires <= 9 \
+         AND (expires, position) > (0, -1) AND position < 100 ORDER BY expires, position LIMIT 10",
+    )
+    .await;
+    assert!(
+        due.contains("holds_open_due") && !due.contains("Sort"),
+        "{due}"
+    );
+}
+
+/// `regress_qs6_byte_order_on_every_collation` (PoC: Q-S6): on a database
+/// collating `en_US.utf8`, paths and dimension values compare by bytes — the
+/// leaf rule and year-end closing answer exactly as in memory.
+#[tokio::test(flavor = "multi_thread")]
+// PoC: Q-S6 q_s6_dimension_values_order_depends_on_collation
+// PoC: Q-S6 q_s6_baseline_dimension_values_byte_order_on_sqlite_and_memory
+async fn regress_qs6_byte_order_on_every_collation() {
+    let mut db = raw(debian().await).await;
+    let collation: String =
+        sqlx::query_scalar("SELECT datcollate FROM pg_database WHERE datname = 'postgres'")
+            .fetch_one(&mut db)
+            .await
+            .unwrap();
+    assert!(
+        collation.starts_with("en_US"),
+        "the database collates {collation}"
+    );
+    let store = store_in(debian().await, &next_schema()).await;
+    let (mut journal, books) = store_checks::books(store).await;
+    let names = ["apple", "émigré", "Network", "Zebra"];
+    for name in names {
+        let path = format!("Income:{name}");
+        assert_eq!(
+            journal
+                .open(&path, AccountKind::Income, date!("2026-01-01"))
+                .unwrap(),
+            books
+                .open(&path, AccountKind::Income, date!("2026-01-01"))
+                .await
+                .unwrap()
+        );
+    }
+    // `Income:apple:x` makes `Income:apple` a parent under byte order only.
+    journal
+        .open("Income:apple:x", AccountKind::Income, date!("2026-01-01"))
+        .unwrap();
+    books
+        .open("Income:apple:x", AccountKind::Income, date!("2026-01-01"))
+        .await
+        .unwrap();
+    for (n, name) in names.iter().enumerate() {
+        for value in names {
+            let entry = Entry::new(format!("s-{n}-{value}"), date!("2026-02-10"))
+                .debit("Assets:Cash", eur("1.00"), EUR)
+                .posting(
+                    doubleentry::Posting::credit(format!("Income:{name}"), eur("1.00"), EUR)
+                        .dimension("segment", value),
+                );
+            let expected = journal
+                .record(entry.clone())
+                .map_err(|error| error.rejection().map(|r| r.code()));
+            let actual = books
+                .record(entry)
+                .await
+                .map_err(|error| error.rejection().map(|r| r.code()));
+            assert_eq!(expected, actual, "Income:{name} / {value}");
+        }
+    }
+    let expected = journal
+        .close_year("close", date!("2026-12-31"), "Equity:Retained")
+        .unwrap();
+    let actual = books
+        .close_year("close", date!("2026-12-31"), "Equity:Retained")
+        .await
+        .unwrap();
+    assert_eq!(expected, actual);
+}
+
+// ── US5 ─────────────────────────────────────────────────────────────────────
+
+const APPEND_ONLY: [(&str, &str); 15] = [
+    ("meta", "schema_id"),
+    ("leaves", "kind"),
+    ("nodes", "hash"),
+    ("accounts", "kind"),
+    ("account_versions", "effective"),
+    ("currency_versions", "exponent"),
+    ("policy_versions", "effective"),
+    ("periods", "last_day"),
+    ("postings", "amount"),
+    ("posting_dims", "value"),
+    ("seals", "position"),
+    ("seal_leaves", "debit"),
+    ("clearings", "idem_key"),
+    ("clearing_resets", "position"),
+    ("clearing_refs", "layer"),
+];
+
+const ALL_TABLES: [&str; 22] = [
+    "meta",
+    "leaves",
+    "nodes",
+    "accounts",
+    "account_versions",
+    "currency_versions",
+    "policy_versions",
+    "periods",
+    "entries",
+    "postings",
+    "posting_dims",
+    "memos",
+    "holds",
+    "seals",
+    "seal_leaves",
+    "clearings",
+    "clearing_resets",
+    "clearing_refs",
+    "balances",
+    "cleared",
+    "outstanding",
+    "slices",
+];
+
+fn refused(result: Result<u64, sqlx::Error>, op: &str, table: &str) {
+    let error = result.expect_err(&format!("{op} on {table} must be refused"));
+    let message = error
+        .as_database_error()
+        .map(|error| error.message().to_owned())
+        .unwrap_or_default();
+    assert!(
+        message.starts_with("doubleentry:") && message.contains(op) && message.contains(table),
+        "{message}"
+    );
+}
+
+/// FR-032, FR-033, FR-050 on PostgreSQL, `TRUNCATE` included.
+#[tokio::test]
+async fn immutability_is_enforced_by_the_database() {
+    let (store, s) = fresh_named().await;
+    let (_books, inv) = populated(store).await;
+    let mut db = raw(url().await).await;
+    for (table, column) in APPEND_ONLY {
+        refused(
+            execute(
+                &mut db,
+                &format!("UPDATE {s}.{table} SET {column} = {column}"),
+            )
+            .await,
+            "UPDATE",
+            table,
+        );
+        refused(
+            execute(&mut db, &format!("DELETE FROM {s}.{table}")).await,
+            "DELETE",
+            table,
+        );
+    }
+    for table in ALL_TABLES {
+        refused(
+            execute(&mut db, &format!("TRUNCATE {s}.{table} CASCADE")).await,
+            "TRUNCATE",
+            "",
+        );
+    }
+    // The populated ledger has a row in every maintained table, the
+    // amounts open holds reserve included.
+    for table in ["balances", "cleared", "outstanding", "slices"] {
+        refused(
+            execute(&mut db, &format!("DELETE FROM {s}.{table}")).await,
+            "DELETE",
+            table,
+        );
+    }
+    execute(
+        &mut db,
+        &format!("UPDATE {s}.balances SET postings = postings"),
+    )
+    .await
+    .unwrap();
+    refused(
+        execute(&mut db, &format!("UPDATE {s}.memos SET text = 'other'")).await,
+        "UPDATE",
+        "memos",
+    );
+    refused(
+        execute(&mut db, &format!("DELETE FROM {s}.memos")).await,
+        "DELETE",
+        "memos",
+    );
+    assert_eq!(
+        execute(
+            &mut db,
+            &format!("UPDATE {s}.memos SET salt = NULL, text = NULL WHERE position = {inv}")
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    refused(
+        execute(
+            &mut db,
+            &format!("UPDATE {s}.entries SET idem_key = '\\x01'"),
+        )
+        .await,
+        "UPDATE",
+        "entries",
+    );
+    refused(
+        execute(
+            &mut db,
+            &format!("UPDATE {s}.entries SET fingerprint = '\\x{0:064}'", 0),
+        )
+        .await,
+        "UPDATE",
+        "entries",
+    );
+    refused(
+        execute(&mut db, &format!("DELETE FROM {s}.entries")).await,
+        "DELETE",
+        "entries",
+    );
+    assert_eq!(
+        execute(
+            &mut db,
+            &format!("UPDATE {s}.entries SET fingerprint = NULL WHERE position = {inv}")
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    execute(
+        &mut db,
+        &format!("INSERT INTO {s}.holds (position, entry_id, booking, debit_handle, credit_handle, currency, amount) \
+                  SELECT position, entry_id, 0, 0, 1, 'EUR', '\\x{0:032}' FROM {s}.entries WHERE position = {inv}", 0),
+    )
+    .await
+    .unwrap();
+    let resolve = format!(
+        "UPDATE {s}.holds SET resolved_by = (SELECT entry_id FROM {s}.entries WHERE position <> {inv} \
+         AND entry_id NOT IN (SELECT resolved_by FROM {s}.holds WHERE resolved_by IS NOT NULL) LIMIT 1), \
+         how = 1 WHERE position = {inv}"
+    );
+    refused(
+        execute(&mut db, &format!("UPDATE {s}.holds SET booking = 1")).await,
+        "UPDATE",
+        "holds",
+    );
+    assert_eq!(execute(&mut db, &resolve).await.unwrap(), 1);
+    refused(execute(&mut db, &resolve).await, "UPDATE", "holds");
+    refused(
+        execute(&mut db, &format!("DELETE FROM {s}.holds")).await,
+        "DELETE",
+        "holds",
+    );
+}
+
+/// Runs `tamper` (with `{s}` the schema) with triggers disabled; the audit
+/// must then fail as an integrity failure.
+async fn audit_catches(tamper: &str) {
+    let (store, schema) = fresh_named().await;
+    let (books, _) = populated(store).await;
+    let mut db = raw(url().await).await;
+    execute(&mut db, "SET session_replication_role = replica")
+        .await
+        .unwrap();
+    let tamper = tamper.replace("{s}", &schema);
+    assert!(
+        execute(&mut db, &tamper).await.unwrap() > 0,
+        "{tamper} changed nothing"
+    );
+    let error = books.audit().await.expect_err(&tamper);
+    assert!(matches!(error, Error::Integrity(_)), "{tamper}: {error}");
+}
+
+/// SC-007 on PostgreSQL.
+#[tokio::test]
+async fn tampering_fails_the_audit() {
+    audit_catches(
+        "UPDATE {s}.leaves SET bytes = overlay(bytes placing '\\xff' from octet_length(bytes)) \
+         WHERE position = (SELECT MIN(position) FROM {s}.entries)",
+    )
+    .await;
+    audit_catches(
+        "CREATE TEMP TABLE ids AS SELECT ordinal, entry_id FROM {s}.entries WHERE ordinal IN (0, 1); \
+         UPDATE {s}.entries SET entry_id = '\\x00000000000000000000000000000000' WHERE ordinal = 0; \
+         UPDATE {s}.entries SET entry_id = (SELECT entry_id FROM ids WHERE ordinal = 0) WHERE ordinal = 1; \
+         UPDATE {s}.entries SET entry_id = (SELECT entry_id FROM ids WHERE ordinal = 1) WHERE ordinal = 0",
+    )
+    .await;
+    audit_catches(
+        "UPDATE {s}.postings SET debit_after = credit_after WHERE handle = 0 AND idx = 0",
+    )
+    .await;
+    audit_catches("UPDATE {s}.balances SET postings = postings + 1 WHERE handle = 0").await;
+}
+
+/// 023 SC-006 on PostgreSQL: a resolved hold marked open, an open hold
+/// marked resolved, an edited reserved amount.
+#[tokio::test]
+async fn us5_audit_catches_hold_tampering() {
+    audit_catches(
+        "UPDATE {s}.holds SET resolved_by = NULL, how = NULL WHERE resolved_by IS NOT NULL",
+    )
+    .await;
+    audit_catches(
+        "UPDATE {s}.holds SET resolved_by = (SELECT entry_id FROM {s}.entries WHERE ordinal = 0), \
+         how = 1 WHERE resolved_by IS NULL",
+    )
+    .await;
+    audit_catches("UPDATE {s}.outstanding SET debit = credit WHERE debit <> credit").await;
+}
+
+/// `holds_resolution_link_is_committed` (023 R9; PoC: A1 / Q-E1) on
+/// PostgreSQL: the immutability trigger is disabled for the tampering
+/// statement only; pointing a resolution at another hold rewrites its leaf,
+/// which the audit refuses.
+#[tokio::test]
+async fn holds_resolution_link_is_committed() {
+    let (store, schema) = fresh_named().await;
+    let (books, _) = populated(store.clone()).await;
+    let (position, bytes) = store_checks::retargeted_resolution(&store).await;
+    let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    let mut db = raw(url().await).await;
+    let leaves = format!("{schema}.leaves");
+    let triggers: Vec<String> = sqlx::query(
+        "SELECT tgname::text FROM pg_trigger WHERE tgrelid = $1::regclass AND NOT tgisinternal",
+    )
+    .bind(&leaves)
+    .fetch_all(&mut db)
+    .await
+    .unwrap()
+    .iter()
+    .map(|row| row.get(0))
+    .collect();
+    assert!(!triggers.is_empty(), "the leaves table is guarded");
+    let tamper = format!(
+        "BEGIN; ALTER TABLE {leaves} DISABLE TRIGGER USER; \
+         UPDATE {leaves} SET bytes = '\\x{hex}' WHERE position = {position}; \
+         ALTER TABLE {leaves} ENABLE TRIGGER USER; COMMIT"
+    );
+    execute(&mut db, &tamper).await.unwrap();
+    let error = books.audit().await.unwrap_err();
+    assert!(matches!(error, Error::Integrity(_)), "{error}");
+}
+
+/// `regress_qs2_sparse_handle_fails_audit` (PoC: Q-S2), on PostgreSQL.
+#[tokio::test]
+// PoC: Q-S2 q_s2_sparse_account_handle_bricks_sealing
+async fn regress_qs2_sparse_handle_fails_audit() {
+    audit_catches("INSERT INTO {s}.accounts (handle, path, kind, position) SELECT 9, 'Assets:Sparse', 0, MAX(position) FROM {s}.entries").await;
+}
+
+/// `regress_g5_forged_entry_fails_audit` (PoC: G5), on PostgreSQL.
+#[tokio::test]
+// PoC: G5 poc_g5_entry_without_postings_passes_db_triggers
+async fn regress_g5_forged_entry_fails_audit() {
+    audit_catches(
+        "INSERT INTO {s}.leaves (position, kind, bytes) SELECT (SELECT MAX(position) + 1 FROM {s}.leaves), kind, bytes \
+         FROM {s}.leaves WHERE position = (SELECT MIN(position) FROM {s}.entries); \
+         INSERT INTO {s}.entries (position, ordinal, entry_id, idem_key) \
+         SELECT (SELECT MAX(position) FROM {s}.leaves), (SELECT MAX(ordinal) + 1 FROM {s}.entries), \
+         '\\x00000000000000000000000000000000', '\\x666f72676564'",
+    )
+    .await;
+}
+
+/// `regress_g8_schema_name_is_an_identifier` (PoC: G8): schema names with
+/// quotes, spaces and an option string address their schema as a quoted
+/// identifier and change no server setting.
+#[tokio::test]
+// PoC: G8 poc_g8_schema_name_handling
+// PoC: A3-S4 a3_s4_dollar_in_schema_name_redirects_writes
+async fn regress_g8_schema_name_is_an_identifier() {
+    // Amended 2026-10-16 (A3-S4): a schema name is `[A-Za-z_][A-Za-z0-9_]{0,62}`,
+    // refused with a typed error otherwise — before anything connects.
+    for refused in [
+        "Led \"x\"",
+        "led -c statement_timeout=1",
+        "acme$1",
+        "a{{s}}",
+    ] {
+        let options = SqlOptions {
+            schema: refused.to_owned(),
+            ..SqlOptions::default()
+        };
+        let error = SqlStore::<Postgres>::postgres_with(url().await, options)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            &StoreErrorKind::InvalidSchemaName {
+                name: refused.to_owned()
+            }
+        );
+    }
+    // A valid name is quoted: its case is kept.
+    let schema = format!("Ledger_G8_{}", SCHEMAS.fetch_add(1, Ordering::Relaxed));
+    let store = store_in(url().await, &schema).await;
+    let books = Ledger::new(store.clone(), ledger()).await.unwrap();
+    books
+        .declare_currency(EUR, 2, date!("2026-01-01"))
+        .await
+        .unwrap();
+    assert_eq!(store.open().await.unwrap().size, 2);
+    let mut db = raw(url().await).await;
+    let exists: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = $1)")
+            .bind(&schema)
+            .fetch_one(&mut db)
+            .await
+            .unwrap();
+    assert!(exists, "{schema}");
+}
+
+/// `regress_qs4_concurrent_create` (PoC: Q-S4): 16 concurrent `create` calls
+/// on an empty schema all succeed; one genesis is written.
+#[tokio::test(flavor = "multi_thread")]
+// PoC: Q-S4 q_s4_concurrent_migrate_fails
+async fn regress_qs4_concurrent_create() {
+    let schema = next_schema();
+    let tasks: Vec<_> = (0..16)
+        .map(|_| {
+            let schema = schema.clone();
+            tokio::spawn(async move {
+                let store = store_in(url().await, &schema).await;
+                store.create(&Genesis { ledger: ledger() }).await
+            })
+        })
+        .collect();
+    for task in tasks {
+        assert_eq!(task.await.unwrap().unwrap().size, 1);
+    }
+    assert_eq!(
+        store_in(url().await, &schema).await.size().await.unwrap(),
+        1
+    );
+}
+
+/// `regress_qs5_open_does_not_wait_for_readers` (PoC: Q-S5): `open` runs no
+/// DDL, so an open reader does not delay it.
+#[tokio::test(flavor = "multi_thread")]
+// PoC: Q-S5 q_s5_startup_migrate_blocks_behind_an_open_reader
+async fn regress_qs5_open_does_not_wait_for_readers() {
+    let (store, schema) = fresh_named().await;
+    let (_, books) = store_checks::books(store.clone()).await;
+    books
+        .record(sale("one", date!("2026-01-15"), "1.00"))
+        .await
+        .unwrap();
+    let mut reader = raw(url().await).await;
+    execute(
+        &mut reader,
+        &format!("BEGIN; SELECT * FROM {schema}.postings"),
+    )
+    .await
+    .unwrap();
+    let again = store_in(url().await, &schema).await;
+    tokio::time::timeout(Duration::from_secs(1), again.open())
+        .await
+        .expect("open does not wait")
+        .unwrap();
+    execute(&mut reader, "ROLLBACK").await.unwrap();
+}
+
+/// FR-034: the suite passes under exactly the documented grants.
+#[tokio::test(flavor = "multi_thread")]
+async fn least_privilege_role_conforms() {
+    let mut db = raw(url().await).await;
+    execute(&mut db, "CREATE ROLE app LOGIN PASSWORD 'app'")
+        .await
+        .unwrap();
+    let app = url().await.replace("postgres:postgres@", "app:app@");
+    let report = conformance(|| {
+        let app = app.clone();
+        async move {
+            let schema = next_schema();
+            let owner = store_in(url().await, &schema).await;
+            owner.create(&Genesis { ledger: LedgerId::new("example.com/conformance").unwrap() }).await.unwrap();
+            let mut db = raw(url().await).await;
+            execute(
+                &mut db,
+                &format!(
+                    "GRANT USAGE ON SCHEMA {schema} TO app; \
+                     GRANT SELECT, INSERT ON ALL TABLES IN SCHEMA {schema} TO app; \
+                     GRANT UPDATE ON {schema}.balances, {schema}.cleared, {schema}.outstanding, {schema}.slices TO app; \
+                     GRANT UPDATE (resolved_by, how) ON {schema}.holds TO app; \
+                     GRANT UPDATE (salt, text) ON {schema}.memos TO app; \
+                     GRANT UPDATE (fingerprint) ON {schema}.entries TO app;"
+                ),
+            )
+            .await
+            .unwrap();
+            store_in(&app, &schema).await
+        }
+    })
+    .await
+    .unwrap_or_else(|failure| panic!("{failure}"));
+    println!("{} checks as `app`", report.checks.len());
+}
+
+/// FR-035 and FR-050 on PostgreSQL: no text, salt or fingerprint after
+/// erasure.
+#[tokio::test]
+async fn erase_leaves_no_text_salt_or_fingerprint() {
+    let (store, schema) = fresh_named().await;
+    let (books, inv) = populated(store.clone()).await;
+    let entry = entry_by_key_and_id(&store, "inv").await;
+    books.erase_memo(entry.id).await.unwrap();
+    let mut db = raw(url().await).await;
+    let row = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SELECT m.salt IS NULL, m.text IS NULL, e.fingerprint IS NULL FROM {schema}.memos m \
+         JOIN {schema}.entries e ON e.position = m.position WHERE m.position = {inv}"
+    )))
+    .fetch_one(&mut db)
+    .await
+    .unwrap();
+    assert_eq!(
+        (
+            row.get::<bool, _>(0),
+            row.get::<bool, _>(1),
+            row.get::<bool, _>(2)
+        ),
+        (true, true, true)
+    );
+    books.audit().await.unwrap();
+}
+
+/// R9: the column names, order and nullability of all 23 tables are the
+/// same in both dialects.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn schema_columns_match() {
+    use sqlx::SqliteConnection;
+    let (store, schema) = fresh_named().await;
+    store.create(&Genesis { ledger: ledger() }).await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let file = format!("sqlite://{}", dir.path().join("schema.db").display());
+    doubleentry::store::SqlStore::<doubleentry::store::Sqlite>::sqlite(&file)
+        .await
+        .unwrap()
+        .create(&Genesis { ledger: ledger() })
+        .await
+        .unwrap();
+    let mut pg = raw(url().await).await;
+    let mut lite = SqliteConnection::connect(&file).await.unwrap();
+    for table in ALL_TABLES {
+        let postgres: Vec<(String, bool)> = sqlx::query(
+            "SELECT column_name, is_nullable = 'YES' FROM information_schema.columns \
+             WHERE table_schema = $1 AND table_name = $2 ORDER BY ordinal_position",
+        )
+        .bind(&schema)
+        .bind(table)
+        .fetch_all(&mut pg)
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+        let sqlite: Vec<(String, bool)> =
+            sqlx::query(sqlx::AssertSqlSafe(format!("PRAGMA table_info({table})")))
+                .fetch_all(&mut lite)
+                .await
+                .unwrap()
+                .iter()
+                .map(|row| {
+                    (
+                        row.get::<String, _>(1),
+                        row.get::<i64, _>(3) == 0 && row.get::<i64, _>(5) == 0,
+                    )
+                })
+                .collect();
+        assert_eq!(
+            postgres.iter().map(|(name, _)| name).collect::<Vec<_>>(),
+            sqlite.iter().map(|(name, _)| name).collect::<Vec<_>>(),
+            "{table}"
+        );
+        assert!(!postgres.is_empty(), "{table}");
+    }
+}
+
+// ── Round-3 audit regressions (2026-10-16) ──────────────────────────────────
+
+/// A3-S5: a memo holding NUL is refused structurally (108) on PostgreSQL as
+/// everywhere — never a backend failure of a valid draft.
+// PoC: A3-S5 a3_s5_nul_in_memo_splits_the_dialects
+#[tokio::test(flavor = "multi_thread")]
+async fn a3_s5_a_nul_memo_is_refused_like_everywhere() {
+    let (_, books) = store_checks::books(fresh().await).await;
+    let error = books
+        .record(sale("nul", date!("2026-03-15"), "1.00").memo("a\0b"))
+        .await
+        .unwrap_err();
+    assert_eq!(error.rejection().map(|r| r.code()), Some(108), "{error}");
+    books
+        .record(sale("ok", date!("2026-03-15"), "1.00").memo("line\nbreak"))
+        .await
+        .unwrap();
+    books.audit().await.unwrap();
+}
+
+/// A3-S1 under exactly the documented least-privilege grants: a version the
+/// application role inserts (no trigger fires on INSERT) fails the audit.
+// PoC: A3-S1 a3_s1_least_privilege_role_lifts_a_limit
+#[tokio::test(flavor = "multi_thread")]
+async fn a3_s1_an_app_role_insert_fails_the_audit() {
+    let (owner, schema) = fresh_named().await;
+    populated(owner).await;
+    let mut db = raw(url().await).await;
+    let _ = execute(&mut db, "CREATE ROLE a3app LOGIN PASSWORD 'app'").await;
+    execute(
+        &mut db,
+        &format!(
+            "GRANT USAGE ON SCHEMA {schema} TO a3app; \
+             GRANT SELECT, INSERT ON ALL TABLES IN SCHEMA {schema} TO a3app; \
+             GRANT UPDATE ON {schema}.balances, {schema}.cleared, {schema}.outstanding, {schema}.slices TO a3app; \
+             GRANT UPDATE (resolved_by, how) ON {schema}.holds TO a3app; \
+             GRANT UPDATE (salt, text) ON {schema}.memos TO a3app; \
+             GRANT UPDATE (fingerprint) ON {schema}.entries TO a3app;"
+        ),
+    )
+    .await
+    .unwrap();
+    let app_url = url().await.replace("postgres:postgres@", "a3app:app@");
+    let mut app = PgConnection::connect(&app_url).await.unwrap();
+    execute(
+        &mut app,
+        &format!(
+            "INSERT INTO {schema}.account_versions (handle, field, effective, position, limit_code) \
+             SELECT a.handle, 1, 0, (SELECT MAX(position) FROM {schema}.leaves), 0 \
+             FROM {schema}.accounts a WHERE a.path = 'Liabilities:Wallet'"
+        ),
+    )
+    .await
+    .unwrap();
+    // The role may not null a fingerprint whose memo it did not erase.
+    let refused = execute(
+        &mut app,
+        &format!("UPDATE {schema}.entries SET fingerprint = NULL WHERE idem_key = 'feb'::bytea"),
+    )
+    .await;
+    assert!(refused.is_err(), "{refused:?}");
+    let books = Ledger::new(store_in(&app_url, &schema).await, ledger())
+        .await
+        .unwrap();
+    let error = books.audit().await.unwrap_err();
+    assert!(matches!(error, Error::Integrity(_)), "{error}");
+}
+
+/// A3-S9: a `BEGIN` failing on a pooled connection the server closed ran
+/// nothing, and is tried again on the next one: after every backend of the
+/// pool is terminated, every write still succeeds.
+// PoC: A3-S9 a3_s9_dead_pooled_connections_fail_writes
+#[tokio::test(flavor = "multi_thread")]
+async fn a3_s9_dead_pooled_connections_do_not_fail_writes() {
+    // A database of its own, so terminating its backends touches no other
+    // test.
+    let mut admin = raw(url().await).await;
+    let _ = execute(&mut admin, "CREATE DATABASE a3_s9").await;
+    let database = format!("{}/a3_s9", url().await.rsplit_once('/').unwrap().0);
+    let store = SqlStore::<Postgres>::postgres_with(
+        &database,
+        SqlOptions {
+            schema: next_schema(),
+            max_connections: 6,
+            ..SqlOptions::default()
+        },
+    )
+    .await
+    .unwrap();
+    let (_, books) = store_checks::books(store).await;
+    let warm: Vec<_> = (0..6)
+        .map(|n| {
+            let books = books.clone();
+            tokio::spawn(async move {
+                books
+                    .record(sale(&format!("w{n}"), date!("2026-03-15"), "1.00"))
+                    .await
+            })
+        })
+        .collect();
+    for task in warm {
+        task.await.unwrap().unwrap();
+    }
+    execute(
+        &mut admin,
+        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+         WHERE datname = 'a3_s9' AND pid <> pg_backend_pid()",
+    )
+    .await
+    .unwrap();
+    for n in 0..10 {
+        books
+            .record(sale(&format!("x{n}"), date!("2026-03-15"), "1.00"))
+            .await
+            .unwrap_or_else(|error| panic!("write {n}: {error}"));
+    }
+    books.audit().await.unwrap();
+}
+
+/// A3-S8: two stores opened independently on one schema (two pools) race
+/// appends, limited draws and a hold's resolutions: the advisory lock holds
+/// across them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a3_s8_independent_pools_race_on_one_schema() {
+    let schema = next_schema();
+    let first = store_in(url().await, &schema).await;
+    let second = store_in(url().await, &schema).await;
+    first
+        .create(&Genesis {
+            ledger: LedgerId::new("example.com/conformance").unwrap(),
+        })
+        .await
+        .unwrap();
+    doubleentry::testing::independent_handles(first, second)
+        .await
+        .unwrap_or_else(|failure| panic!("{failure}"));
+}
+
+/// A3-S10: every write re-reads the meta row with the header: a schema
+/// re-created under a running store with another ledger is refused, never
+/// written with the old ledger id.
+#[tokio::test(flavor = "multi_thread")]
+async fn a3_s10_a_write_rechecks_the_ledger() {
+    let (store, schema) = fresh_named().await;
+    let (_, books) = store_checks::books(store).await;
+    let mut db = raw(url().await).await;
+    execute(&mut db, &format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .unwrap();
+    Ledger::new(
+        store_in(url().await, &schema).await,
+        LedgerId::new("example.com/other").unwrap(),
+    )
+    .await
+    .unwrap();
+    let error = books
+        .record(sale("after", date!("2026-03-01"), "1.00"))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::Config(_)), "{error}");
+}
+
+/// Round 3 (F9): one pool serves many ledgers, one schema each. Five
+/// tenants share a pool of two connections, write concurrently, stay
+/// apart, and audit clean; a tenant's schema opened under another ledger
+/// id is a configuration error; a hostile schema name connects nothing.
+#[tokio::test]
+async fn one_pool_serves_many_ledgers() {
+    let pool = SqlStore::<Postgres>::postgres_with(
+        url().await,
+        SqlOptions {
+            schema: next_schema(),
+            max_connections: 2,
+            ..SqlOptions::default()
+        },
+    )
+    .await
+    .unwrap();
+    let tenants: Vec<(String, LedgerId)> = (0..5)
+        .map(|n| {
+            (
+                next_schema(),
+                LedgerId::new(format!("example.com/tenant-{n}")).unwrap(),
+            )
+        })
+        .collect();
     let mut tasks = Vec::new();
-    for i in 0..8u8 {
-        let store = h.store.clone();
-        let entry = draw(format!("draw-{i}").as_bytes());
+    for (index, (schema, id)) in tenants.iter().cloned().enumerate() {
+        let store = pool.with_schema(&schema).unwrap();
         tasks.push(tokio::spawn(async move {
-            store.append(&EntryBatch::single(entry)).await
+            let books = Ledger::new(store, id).await.unwrap();
+            books
+                .declare_currency(EUR, 2, date!("2026-01-01"))
+                .await
+                .unwrap();
+            books
+                .open("Assets:Cash", AccountKind::Asset, date!("2026-01-01"))
+                .await
+                .unwrap();
+            books
+                .open("Income:Sales", AccountKind::Income, date!("2026-01-01"))
+                .await
+                .unwrap();
+            books.define_months(2026, 3..=3).await.unwrap();
+            for n in 0..=index {
+                books
+                    .record(sale(&format!("sale-{n}"), date!("2026-03-10"), "1.00"))
+                    .await
+                    .unwrap();
+            }
+            books.audit().await.unwrap();
         }));
     }
-
-    let mut accepted = 0;
     for task in tasks {
-        match task.await.expect("task completes") {
-            Ok(_) => accepted += 1,
-            Err(PostgresError::LimitBreached { .. }) => {}
-            Err(e) => panic!("unexpected failure: {e}"),
+        task.await.unwrap();
+    }
+    for (index, (schema, id)) in tenants.iter().enumerate() {
+        let books = Ledger::new(pool.with_schema(schema).unwrap(), id.clone())
+            .await
+            .unwrap();
+        let cash = books
+            .balance("Assets:Cash", EUR, &doubleentry::BalanceQuery::all())
+            .await
+            .unwrap();
+        assert_eq!(cash.postings(), index as u64 + 1, "{schema} stays apart");
+    }
+    let (schema, _) = &tenants[0];
+    let wrong = Ledger::new(pool.with_schema(schema).unwrap(), tenants[1].1.clone()).await;
+    assert!(matches!(wrong, Err(Error::Config(_))), "{wrong:?}");
+    assert_eq!(
+        pool.with_schema("x\"; DROP SCHEMA public; --")
+            .unwrap_err()
+            .kind(),
+        &StoreErrorKind::InvalidSchemaName {
+            name: String::from("x\"; DROP SCHEMA public; --")
         }
-    }
-
-    assert_eq!(accepted, 2, "10.00 funds exactly two withdrawals of 4.00");
-    let net = h
-        .store
-        .balance(h.key(), BalanceQuery::all())
-        .await
-        .expect("reads")
-        .signed_net()
-        .expect("no overflow");
-    assert_eq!(net, Eur::from_minor(200));
-    assert!(!net.is_negative(), "the limit must hold under concurrency");
-}
-
-#[tokio::test]
-async fn a_conflicting_key_is_refused_without_writing() {
-    let h = Harness::start().await;
-    h.store
-        .append(&EntryBatch::single(h.entry(b"key", 100)))
-        .await
-        .expect("appends");
-
-    let err = h
-        .store
-        .append(&EntryBatch::single(h.entry(b"key", 999)))
-        .await
-        .expect_err("must be refused");
-    assert!(matches!(err, PostgresError::IdempotencyConflict { .. }));
-    assert_eq!(h.store.len().await.expect("reads"), 1);
-}
-
-#[tokio::test]
-async fn a_batch_rolls_back_as_a_whole() {
-    let h = Harness::start().await;
-    h.store
-        .append(&EntryBatch::single(h.entry(b"existing", 100)))
-        .await
-        .expect("appends");
-
-    let good = h.entry(b"batch-good", 500);
-    let good_id = good.id();
-    let poison = h.entry(b"existing", 999); // same key, different content
-    let batch = EntryBatch::new(vec![good, poison]).expect("non-empty");
-
-    assert!(h.store.append(&batch).await.is_err());
-    assert_eq!(h.store.len().await.expect("reads"), 1);
-    assert!(
-        h.store.get(good_id).await.expect("reads").is_none(),
-        "the valid half of a refused batch must not survive"
     );
 }
 
-#[tokio::test]
-async fn the_database_refuses_an_unbalanced_entry_directly() {
-    // Defence in depth: the engine cannot produce one, but the deferred trigger
-    // is what protects the table from everything that is not the engine.
-    let h = Harness::start().await;
-    let mut tx = h.store.pool().begin().await.expect("begins");
+// ── PoC audit regressions (026) ─────────────────────────────────────────────
 
-    let entry_id = uuid::Uuid::now_v7();
-    sqlx::query(
-        "INSERT INTO entries (log_index, entry_id, idempotency_key, content_hash, \
-         booking_date, value_date) \
-         VALUES (0, $1, $2, $3, DATE '2026-03-15', DATE '2026-03-15')",
-    )
-    .bind(entry_id)
-    .bind(vec![1u8])
-    .bind(vec![0u8; 32])
-    .execute(&mut *tx)
-    .await
-    .expect("inserts the entry");
-
-    for (index, direction, amount) in [(0i16, "D", 100i64), (1, "C", 90)] {
-        sqlx::query(
-            "INSERT INTO postings (entry_id, posting_index, account_index, direction, \
-             amount_minor, currency, layer) VALUES ($1, $2, $3, $4, $5, 'EUR', 'settled')",
-        )
-        .bind(entry_id)
-        .bind(index)
-        .bind(0i32)
-        .bind(direction)
-        .bind(amount)
-        .execute(&mut *tx)
-        .await
-        .expect("inserts the posting");
-    }
-
-    assert!(
-        tx.commit().await.is_err(),
-        "the deferred trigger must reject an unbalanced entry at COMMIT"
-    );
-}
-
-/// A pending side offset by a settled one nets to zero per currency, and leaves
-/// both layers permanently out of balance. The trigger keys on the layer for
-/// exactly this shape.
-#[tokio::test]
-async fn the_database_refuses_an_entry_that_nets_across_layers() {
-    let h = Harness::start().await;
-    let mut tx = h.store.pool().begin().await.expect("begins");
-
-    let entry_id = uuid::Uuid::now_v7();
-    sqlx::query(
-        "INSERT INTO entries (log_index, entry_id, idempotency_key, content_hash, \
-         booking_date, value_date) \
-         VALUES (0, $1, $2, $3, DATE '2026-03-15', DATE '2026-03-15')",
-    )
-    .bind(entry_id)
-    .bind(vec![2u8])
-    .bind(vec![0u8; 32])
-    .execute(&mut *tx)
-    .await
-    .expect("inserts the entry");
-
-    for (index, direction, layer) in [(0i16, "D", "pending"), (1, "C", "settled")] {
-        sqlx::query(
-            "INSERT INTO postings (entry_id, posting_index, account_index, direction, \
-             amount_minor, currency, layer) VALUES ($1, $2, $3, $4, 100, 'EUR', $5)",
-        )
-        .bind(entry_id)
-        .bind(index)
-        .bind(0i32)
-        .bind(direction)
-        .bind(layer)
-        .execute(&mut *tx)
-        .await
-        .expect("inserts the posting");
-    }
-
-    assert!(
-        tx.commit().await.is_err(),
-        "the deferred trigger must reject an entry that only balances across layers"
-    );
-}
-
-#[tokio::test]
-async fn balances_and_trial_balances_agree_with_the_log() {
-    let h = Harness::start().await;
-    for i in 0..5i64 {
-        h.store
-            .append(&EntryBatch::single(
-                h.entry(format!("bal-{i}").as_bytes(), 100),
-            ))
-            .await
-            .expect("appends");
-    }
-
-    let balance = h
-        .store
-        .balance(h.key(), BalanceQuery::all())
-        .await
-        .expect("reads");
-    assert_eq!(balance.debits, Eur::from_minor(500));
-    assert_eq!(balance.credits, Eur::ZERO);
-
-    // Gross totals survive netting.
-    let tb = h
-        .store
-        .trial_balance(BalanceQuery::all())
-        .await
-        .expect("reads");
-    let totals = tb
-        .totals(Currency::EUR, Layer::Settled)
-        .expect("no overflow");
-    assert!(totals.is_balanced());
-    assert_eq!(totals.debits, Eur::from_minor(500));
-
-    // As-of reads reconstruct an earlier state.
-    let earlier = h
-        .store
-        .balance(h.key(), BalanceQuery::over_prefix(2))
-        .await
-        .expect("reads");
-    assert_eq!(earlier.debits, Eur::from_minor(200));
-}
-
-#[tokio::test]
-async fn proofs_verify_against_the_stored_log() {
-    let h = Harness::start().await;
-    for i in 0..9i64 {
-        h.store
-            .append(&EntryBatch::single(
-                h.entry(format!("proof-{i}").as_bytes(), 10 + i),
-            ))
-            .await
-            .expect("appends");
-    }
-
-    let head = h.store.head().await.expect("reads");
-    assert_eq!(head.size, 9);
-
-    let page = h
-        .store
-        .page(Cursor::start().with_limit(100))
-        .await
-        .expect("pages");
-    for record in &page.records {
-        let proof = h
-            .store
-            .prove_inclusion(record.require_index().expect("sequenced"))
-            .await
-            .expect("proves");
-        assert!(
-            proof.verify(&record.content_hash, &head),
-            "index {} must be provable",
-            record.require_index().expect("sequenced")
-        );
-    }
-
-    // Growth is provably append-only.
-    h.store
-        .append(&EntryBatch::single(h.entry(b"grown", 77)))
-        .await
-        .expect("appends");
-    let grown = h.store.head().await.expect("reads");
-    let proof = h.store.prove_consistency(head.size).await.expect("proves");
-    assert!(proof.verify(&head, &grown));
-}
-
-#[tokio::test]
-async fn sealing_a_period_excludes_later_entries() {
-    let h = Harness::start().await;
-
-    h.store
-        .append(&EntryBatch::single(h.entry_on(
-            b"march",
-            100,
-            date!(2026 - 03 - 15),
-        )))
-        .await
-        .expect("appends");
-    h.store
-        .append(&EntryBatch::single(h.entry_on(
-            b"april",
-            900,
-            date!(2026 - 04 - 10),
-        )))
-        .await
-        .expect("appends");
-
-    let march = PeriodId::new("2026-03").expect("valid");
-    h.store
-        .define_period(
-            &Period::new(march.clone(), date!(2026 - 03 - 01), date!(2026 - 03 - 31))
-                .expect("valid range"),
-        )
-        .await
-        .expect("defines");
-    h.store
-        .transition_period(&march, PeriodState::Closing)
-        .await
-        .expect("closes");
-
-    let seal = h.store.seal_period(&march).await.expect("seals");
-
-    // Seal a second period so the chain has an order to get wrong.
-    let april = PeriodId::new("2026-04").expect("valid");
-    h.store
-        .define_period(
-            &Period::new(april.clone(), date!(2026 - 04 - 01), date!(2026 - 04 - 30))
-                .expect("valid range"),
-        )
-        .await
-        .expect("defines");
-    h.store
-        .transition_period(&april, PeriodState::Closing)
-        .await
-        .expect("closes");
-    let second = h.store.seal_period(&april).await.expect("seals");
-    assert_eq!(second.prev_seal, Some(seal.seal_hash));
-
-    // Reading them back must reproduce the chain, and it must verify.
-    let stored = h.store.seals().await.expect("reads");
-    assert_eq!(stored.len(), 2);
-    assert_eq!(stored[0].seal_hash, seal.seal_hash);
-    assert_eq!(stored[1].seal_hash, second.seal_hash);
-
-    let chain = doubleentry::SealChain::from_seals(h.store.ledger().clone(), stored)
-        .expect("chains in the order it was read");
-    chain.verify().expect("the reloaded chain verifies");
-
-    assert!(seal.is_self_consistent());
-    assert_eq!(seal.entry_count, 1, "only March belongs to March");
-    assert_eq!(seal.prev_seal, None);
-}
-
-#[tokio::test]
-async fn open_items_track_partial_settlement() {
-    let h = Harness::start().await;
-
-    let invoice = h.entry(b"invoice", 1000);
-    let invoice_id = invoice.id();
-    h.store
-        .append(&EntryBatch::single(invoice))
-        .await
-        .expect("appends");
-
-    // A payment: credit the receivable.
-    let payment = Entry::<Draft, 2>::new(
-        EntryId::generate(),
-        IdempotencyKey::new(b"payment".to_vec()).expect("valid"),
-        date!(2026 - 03 - 20),
-    )
-    .credit(h.left, Eur::from_minor(400), Currency::EUR)
-    .debit(h.right, Eur::from_minor(400), Currency::EUR)
-    .seal(&h.ctx())
-    .expect("balances");
-    let payment_id = payment.id();
-    h.store
-        .append(&EntryBatch::single(payment))
-        .await
-        .expect("appends");
-
-    assert_eq!(
-        h.store
-            .open_items(h.key(), PostingCursor::start())
-            .await
-            .expect("reads")
-            .items
-            .len(),
-        2
-    );
-
-    let clearing_id = ClearingId::generate();
-    h.store
-        .clear(
-            Clearing::new(clearing_id, h.key(), date!(2026 - 03 - 20))
-                .apply(PostingRef::new(invoice_id, 0), Eur::from_minor(400))
-                .apply(PostingRef::new(payment_id, 0), Eur::from_minor(400)),
-        )
-        .await
-        .expect("clears");
-
-    let open = h
-        .store
-        .open_items(h.key(), PostingCursor::start())
-        .await
-        .expect("reads");
-    assert_eq!(open.items.len(), 1, "the payment is fully applied");
-    assert_eq!(open.items[0].posting, PostingRef::new(invoice_id, 0));
-    assert_eq!(open.items[0].residual, Eur::from_minor(600));
-
-    // Clearing is an assignment, never a movement.
-    let balance = h
-        .store
-        .balance(h.key(), BalanceQuery::all())
-        .await
-        .expect("reads");
-    assert_eq!(balance.debits, Eur::from_minor(1000));
-    assert_eq!(balance.credits, Eur::from_minor(400));
-
-    // Releasing it reopens both items.
-    h.store
-        .reset_clearing(clearing_id, date!(2026 - 04 - 01))
-        .await
-        .expect("resets");
-    assert_eq!(
-        h.store
-            .open_items(h.key(), PostingCursor::start())
-            .await
-            .expect("reads")
-            .items
-            .len(),
-        2
-    );
-}
-
-#[tokio::test]
-async fn over_applying_a_clearing_is_refused() {
-    let h = Harness::start().await;
-    let invoice = h.entry(b"invoice", 500);
-    let invoice_id = invoice.id();
-    h.store
-        .append(&EntryBatch::single(invoice))
-        .await
-        .expect("appends");
-
-    let payment = Entry::<Draft, 2>::new(
-        EntryId::generate(),
-        IdempotencyKey::new(b"payment".to_vec()).expect("valid"),
-        date!(2026 - 03 - 20),
-    )
-    .credit(h.left, Eur::from_minor(900), Currency::EUR)
-    .debit(h.right, Eur::from_minor(900), Currency::EUR)
-    .seal(&h.ctx())
-    .expect("balances");
-    let payment_id = payment.id();
-    h.store
-        .append(&EntryBatch::single(payment))
-        .await
-        .expect("appends");
-
-    let err = h
-        .store
-        .clear(
-            Clearing::new(ClearingId::generate(), h.key(), date!(2026 - 03 - 20))
-                .apply(PostingRef::new(invoice_id, 0), Eur::from_minor(900))
-                .apply(PostingRef::new(payment_id, 0), Eur::from_minor(900)),
-        )
-        .await
-        .expect_err("the invoice only has 500 open");
-    assert!(matches!(err, PostgresError::Clearing(_)));
-
-    // Nothing was written.
-    assert_eq!(
-        h.store
-            .open_items(h.key(), PostingCursor::start())
-            .await
-            .expect("reads")
-            .items
-            .len(),
-        2
-    );
-}
-
-#[tokio::test]
-async fn the_stored_tree_head_matches_a_full_rebuild() {
-    // `head()` reads one row instead of rebuilding the tree. That row is derived
-    // state, so it has to be checked against the definition — at every size,
-    // including the ragged ones between powers of two.
-    let h = Harness::start().await;
-    let mut leaves = Vec::new();
-
-    for i in 0..33i64 {
-        let entry = h.entry(format!("head-{i}").as_bytes(), 100 + i);
-        leaves.push(entry.content_hash());
-        h.store
-            .append(&EntryBatch::single(entry))
-            .await
-            .expect("appends");
-
-        let stored = h.store.head().await.expect("reads");
-        let rebuilt = doubleentry::MerkleLog::from_leaves(leaves.clone()).head();
-        assert_eq!(stored, rebuilt, "head diverged at size {}", i + 1);
-    }
-}
-
-#[tokio::test]
-async fn a_page_returns_complete_entries() {
-    // Postings are fetched for the whole page in one query; a grouping mistake
-    // would silently hand back entries with the wrong legs.
-    let h = Harness::start().await;
-    let mut expected = Vec::new();
-    for i in 0..12i64 {
-        let entry = h.entry(format!("page-{i}").as_bytes(), 100 + i);
-        expected.push((entry.id(), entry.content_hash()));
-        h.store
-            .append(&EntryBatch::single(entry))
-            .await
-            .expect("appends");
-    }
-
-    let mut seen = Vec::new();
-    let mut cursor = Some(Cursor::start().with_limit(5));
-    while let Some(c) = cursor {
-        let page = h.store.page(c).await.expect("pages");
-        for record in &page.records {
-            assert_eq!(
-                record.entry.postings().len(),
-                2,
-                "both legs must be present"
-            );
-            assert_eq!(
-                record.entry.content_hash(),
-                record.content_hash,
-                "each entry must hash to what was stored beside it"
-            );
-            seen.push((record.entry.id(), record.content_hash));
-        }
-        cursor = page.next;
-    }
-    assert_eq!(seen, expected);
-}
-
-#[tokio::test]
-async fn the_memory_and_postgres_backends_agree() {
-    // Differential check: the same operations against both backends must give
-    // the same log, the same head, and the same balances.
-    let h = Harness::start().await;
-    let memory = doubleentry::storage::MemoryStore::<2>::new(
-        doubleentry::storage::conformance::test_ledger(),
-    );
-
-    for i in 0..7i64 {
-        let entry = h.entry(format!("agree-{i}").as_bytes(), 100 + i);
-        let batch = EntryBatch::single(entry);
-        let pg = h.store.append(&batch).await.expect("appends");
-        let mem = memory.append(&batch).await.expect("appends");
-        assert_eq!(pg[0].index, mem[0].index);
-        assert_eq!(pg[0].content_hash, mem[0].content_hash);
-    }
-
-    assert_eq!(
-        h.store.head().await.expect("reads"),
-        memory.head().await.expect("reads"),
-        "both backends must commit to the same root"
-    );
-    assert_eq!(
-        h.store
-            .balance(h.key(), BalanceQuery::all())
-            .await
-            .expect("reads"),
-        memory
-            .balance(h.key(), BalanceQuery::all())
-            .await
-            .expect("reads"),
-    );
-    assert_eq!(
-        h.store
-            .trial_balance(BalanceQuery::all())
-            .await
-            .expect("reads"),
-        memory
-            .trial_balance(BalanceQuery::all())
-            .await
-            .expect("reads"),
-    );
-}
-
-/// The ledger can share a database with an application that already has its own
-/// `accounts` table.
-///
-/// This is the whole point of keeping the ledger's tables in their own schema:
-/// `accounts` is a name most accounting applications have already spent, and a
-/// ledger that squats on it in `public` cannot be adopted without a rename.
-#[tokio::test]
-async fn the_ledger_coexists_with_an_application_schema() {
-    let h = Harness::start().await;
-
-    // An application table with a colliding name and an incompatible shape.
-    sqlx::query(
-        "CREATE TABLE public.accounts (              customer_id TEXT PRIMARY KEY,              iban        TEXT NOT NULL,              balance_ct  BIGINT NOT NULL          )",
-    )
-    .execute(h.store.pool())
-    .await
-    .expect("application table is created");
-    sqlx::query("INSERT INTO public.accounts VALUES ('C-1', 'DE00', 4200)")
-        .execute(h.store.pool())
-        .await
-        .expect("application row is written");
-
-    // The ledger keeps working, and its own accounts are untouched.
-    h.store
-        .append(&EntryBatch::single(h.entry(b"coexist", 1_00)))
-        .await
-        .expect("appends");
-    let ledger_accounts = h.store.accounts().await.expect("reads");
-    assert_eq!(ledger_accounts.len(), 2);
-    assert!(
-        ledger_accounts
-            .iter()
-            .all(|r| r.account.path.to_string().starts_with("Pg:"))
-    );
-
-    // Two tables, two schemas, one database.
-    let names: Vec<(String, String)> =
-        sqlx::query_as("SELECT table_schema, table_name FROM information_schema.tables                         WHERE table_name = 'accounts' ORDER BY table_schema")
-            .fetch_all(h.store.pool())
-            .await
-            .expect("reads catalogue");
-    assert_eq!(
-        names,
+/// `regress_qs1_batch_order_is_log_order` (PoC: Q-S1): a batch of an entry
+/// and its reversal is sequenced in batch order, contiguously, as on the
+/// `Journal` — same receipts, same head — and the log replays in its own
+/// order.
+#[tokio::test(flavor = "multi_thread")]
+// PoC: Q-S1 q_s1_deferred_sequencer_reorders_a_batch_by_uuid
+async fn regress_qs1_batch_order_is_log_order() {
+    let (mut journal, books) = store_checks::books(fresh().await).await;
+    let batch = || {
         vec![
-            (DEFAULT_SCHEMA.to_owned(), "accounts".to_owned()),
-            ("public".to_owned(), "accounts".to_owned()),
+            sale("orig", date!("2026-03-15"), "5.00"),
+            Entry::new("rev", date!("2026-03-16"))
+                .credit("Assets:Cash", eur("5.00"), EUR)
+                .debit("Income:Sales", eur("5.00"), EUR)
+                .reverses(store_checks::id("orig")),
         ]
+    };
+    let start = books.head().await.unwrap().size;
+    let expected = journal.record_batch(batch()).unwrap();
+    let receipts = books.record_batch(batch()).await.unwrap();
+    assert_eq!(receipts, expected);
+    assert_eq!(
+        receipts.iter().map(|r| r.position).collect::<Vec<_>>(),
+        [start, start + 1]
     );
-
-    // And the application's row is still its own.
-    let balance: i64 =
-        sqlx::query_scalar("SELECT balance_ct FROM public.accounts WHERE customer_id = 'C-1'")
-            .fetch_one(h.store.pool())
-            .await
-            .expect("reads application row");
-    assert_eq!(balance, 4200);
+    assert_eq!(books.head().await.unwrap(), journal.head());
+    books.audit().await.unwrap();
 }
 
-/// A pool that does not resolve to the ledger's schema is refused, not silently
-/// pointed at `public`.
-#[tokio::test]
-async fn a_misconfigured_search_path_is_refused() {
-    let h = Harness::start().await;
-    let url = h.url.clone();
-
-    let pool = PgPoolOptions::new()
-        .max_connections(1)
-        .connect(&url)
-        .await
-        .expect("connects");
-    let store = PostgresStore::<2>::new(pool, LedgerId::new("stray").expect("valid"));
-
-    match store.migrate().await {
-        Err(PostgresError::WrongSearchPath { expected, found }) => {
-            assert_eq!(expected, DEFAULT_SCHEMA);
-            assert_eq!(found, "public");
+/// Kept from audit round 3 (PoC: cancellation): 300 batches dropped after
+/// 0–40 ms, many of them mid-transaction, leak no lock and no transaction —
+/// the next write completes and the audit passes.
+#[tokio::test(flavor = "multi_thread")]
+// PoC: a3_cancelled_writes_leak_nothing
+async fn cancelled_writes_leak_nothing() {
+    let (_, books) = store_checks::books(fresh().await).await;
+    let mut dropped = 0;
+    for n in 0..300u64 {
+        let books = books.clone();
+        let budget = Duration::from_micros((n * 997) % 40_000);
+        let write = async move {
+            books
+                .record_batch(
+                    (0..5).map(|k| sale(&format!("c{n}-{k}"), date!("2026-03-15"), "1.00")),
+                )
+                .await
+        };
+        if tokio::time::timeout(budget, write).await.is_err() {
+            dropped += 1;
         }
-        other => panic!("expected WrongSearchPath, got {other:?}"),
     }
-}
-
-/// Handles survive a restart: a second store over the same database rebuilds the
-/// registry from stored bindings rather than reissuing them.
-#[tokio::test]
-async fn a_reopened_ledger_keeps_its_account_handles() {
-    let h = Harness::start().await;
-    let before = h.store.accounts().await.expect("reads");
-    let original = AccountRegistry::from_records(before).expect("rebuilds");
-
-    // Reopen the same database with a fresh store, as a restart would.
-    let reopened = PostgresStore::<2>::connect(&h.url, h.store.ledger().clone())
-        .await
-        .expect("reconnects");
-    let rebuilt =
-        AccountRegistry::from_records(reopened.accounts().await.expect("reads")).expect("rebuilds");
-
-    assert_eq!(rebuilt.commitment(), original.commitment());
-    for record in original.records() {
-        assert_eq!(
-            rebuilt.get(record.id).map(|a| &a.path),
-            Some(&record.account.path)
-        );
-    }
-}
-
-/// The schema is a default, not a policy: a database that belongs to the ledger
-/// alone can keep the tables in `public`.
-#[tokio::test]
-async fn the_ledger_can_live_in_public() {
-    let h = Harness::start().await;
-
-    // A second, independent database, opened with a schema of the caller's choosing.
-    let url = h
-        .url
-        .replace(h.url.rsplit('/').next().expect("database name"), "postgres");
-    let store = PostgresStore::<2>::connect_with(
-        &url,
-        LedgerId::new("in-public").expect("valid"),
-        "public",
+    assert!(dropped > 0, "no write was cancelled");
+    let next = tokio::time::timeout(
+        Duration::from_secs(10),
+        books.record(sale("after", date!("2026-03-15"), "1.00")),
     )
-    .await
-    .expect("connects");
-    assert_eq!(store.schema(), "public");
-    store.migrate().await.expect("schema applies");
-
-    let names: Vec<String> = sqlx::query_scalar(
-        "SELECT table_schema::text FROM information_schema.tables WHERE table_name = 'entries'",
-    )
-    .fetch_all(store.pool())
-    .await
-    .expect("reads catalogue");
-    assert_eq!(names, vec!["public".to_owned()]);
+    .await;
+    assert!(matches!(next, Ok(Ok(_))), "{next:?}");
+    books.audit().await.unwrap();
 }

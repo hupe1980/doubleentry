@@ -1,6 +1,6 @@
 +++
 title = "doubleentry"
-description = "An immutable, tamper-evident double-entry bookkeeping engine for Rust. Balanced by construction, exact integer money, and an append-only Merkle log with inclusion, consistency and balance proofs."
+description = "An immutable, tamper-evident double-entry bookkeeping engine for Rust: one pure rule core, exact integer money, and one append-only RFC 6962 Merkle log with inclusion, consistency and sealed-balance proofs and C2SP checkpoints."
 template = "index.html"
 
 [extra]
@@ -11,43 +11,28 @@ home = true
 
 ## In practice
 
-A journal is one entity's books — its accounts, its calendar, its policy, its
-entries, and the Merkle log that commits to them. Record an entry, then prove it
-was recorded.
-
 ```rust
-use doubleentry::period::LedgerId;
-use doubleentry::{Amount, Currency, Entry, EntryId, IdempotencyKey, Journal};
-use time::macros::date;
+use doubleentry::prelude::*;
 
-type Eur = Amount<2>;
+let mut books = Journal::new(LedgerId::new("example.com/acme")?).as_actor("setup");
+books.declare_currency(EUR, 2, date!("2026-01-01"))?;
+books.open("Assets:Cash", AccountKind::Asset, date!("2026-01-01"))?;
+books.open("Income:Sales", AccountKind::Income, date!("2026-01-01"))?;
+books.define_period("2026-03", date!("2026-03-01"), date!("2026-03-31"))?;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut journal = Journal::<2>::new(LedgerId::new("acme-gmbh")?);
+let rec = books.record(
+    Entry::new("invoice-2026-0001", date!("2026-03-15"))
+        .debit("Assets:Cash", amount!("1190.00"), EUR)
+        .credit("Income:Sales", amount!("1190.00"), EUR),
+)?; // Ok(Recorded) | Err(Error::Rejected(r))
 
-    // Accounts are paths in a hierarchy you define. Only leaves are postable.
-    let cash    = journal.register_path("Assets:Cash",  date!(2026-01-01))?;
-    let revenue = journal.register_path("Income:Sales", date!(2026-01-01))?;
-
-    let recorded = journal.record(
-        Entry::new(
-            EntryId::generate(),
-            IdempotencyKey::new(b"invoice-2026-0001".to_vec())?,
-            date!(2026-03-15),
-        )
-        .debit(cash,     Eur::parse("1190.00")?, Currency::EUR)
-        .credit(revenue, Eur::parse("1190.00")?, Currency::EUR),
-    )?;
-
-    // Prove the entry is committed to, without revealing any other entry.
-    let head  = journal.head();
-    let proof = journal.prove_inclusion(recorded.require_index()?)?;
-    assert!(proof.verify(&recorded.content_hash, &head));
-
-    Ok(())
-}
+let proof = books.prove_entry(rec.id)?; // verifies against books.head()
+assert_eq!((proof.index, proof.size), (rec.position, books.head().size));
 ```
 
-Validation runs against *this* journal's accounts, calendar and policy. There is
-no separate context to build and no second object to keep in step — what
-validation consults and what stores the result are the same thing.
+A ledger is one append-only RFC 6962 log of typed records — master data,
+periods, entries, clearings, seals. One pure rule core decides every write,
+returning the records to append or one `Rejection` with a stable code. `Journal`
+runs it in memory; `Ledger` runs it inside a store's write transaction (SQLite,
+PostgreSQL or memory), with the same calls `.await`ed. The idempotency key is the entry's
+identity, so recording the same draft again returns the original receipt.

@@ -1,0 +1,7 @@
+# a checkpoint evaluated by formats/policy.TLogPolicy.Verify
+# input
+policy: log-only
+checkpoint_b64: ZXhhbXBsZS5jb20vbGVkZ2Vycy9hY21lCjEzCnFPOUlSTWpoMWJwSnlCSE51RzZWZVI5ZE1zcDlsd212MmlqOTlsNlVtbE09CgrigJQgZXhhbXBsZS5jb20vbGVkZ2Vycy9hY21lIDhtdzYwOVptRThSbmE5SHlLN3BZK2R4a0lMMlJTSUVodWZya0ViMTBWTEJVWThjMW1HWGE2dUZoanRzODFRMUt6L3pSMndFOVF0UGVyV1JRZk1KQThDNGVIZ0U9Cg==
+# expect
+go: reject
+crate: NoTrustedSignature

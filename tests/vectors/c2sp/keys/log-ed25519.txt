@@ -1,0 +1,6 @@
+# a verifier key: log-ed25519
+# input
+vkey: example.com/ledgers/acme+c3b6d994+AepKbGPinFIKvvVQexMuxfmVR3auvr57kkIe6mkURtIs
+# expect
+go: accept
+crate: Ed25519

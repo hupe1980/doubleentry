@@ -10,6 +10,11 @@
     <nav class="crumbs" aria-label="Breadcrumb">
       <a href="{{ get_url(path='@/docs/_index.md') }}">Docs</a>
       <span aria-hidden="true">/</span>
+      {% set parent = get_section(path=page.ancestors | last) %}
+      {% if parent.path != "/docs/" %}
+      <a href="{{ parent.permalink }}">{{ parent.title }}</a>
+      <span aria-hidden="true">/</span>
+      {% endif %}
       <span>{{ page.title }}</span>
     </nav>
 

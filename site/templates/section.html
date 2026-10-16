@@ -2,14 +2,37 @@
 
 {% block content %}
 <div class="wrap doc-layout">
-  {% set nav_section = section %}
-  {% set nav_current = "" %}
+  {% set nav_section = get_section(path="docs/_index.md") %}
+  {% set nav_current = section.permalink %}
   {% include "_doc_nav.html" %}
 
   <article class="doc prose">
+    {% if section.path != "/docs/" %}
+    <nav class="crumbs" aria-label="Breadcrumb">
+      <a href="{{ get_url(path='@/docs/_index.md') }}">Docs</a>
+      <span aria-hidden="true">/</span>
+      <span>{{ section.title }}</span>
+    </nav>
+    {% endif %}
     <h1>{{ section.title }}</h1>
+    {% if section.description %}<p class="doc-lede">{{ section.description }}</p>{% endif %}
     {{ section.content | safe }}
 
+    {% if section.subsections %}
+    {% for path in section.subsections %}
+    {% set sub = get_section(path=path) %}
+    <h2 id="{{ sub.title | slugify }}"><a href="{{ sub.permalink }}">{{ sub.title }}</a></h2>
+    {% if sub.description %}<p>{{ sub.description }}</p>{% endif %}
+    <ol class="doc-index">
+      {% for p in sub.pages %}
+      <li>
+        <a href="{{ p.permalink }}">{{ p.title }}</a>
+        {% if p.description %}<span>{{ p.description }}</span>{% endif %}
+      </li>
+      {% endfor %}
+    </ol>
+    {% endfor %}
+    {% else %}
     <h2 id="pages">Pages</h2>
     <ol class="doc-index">
       {% for p in section.pages %}
@@ -19,6 +42,7 @@
       </li>
       {% endfor %}
     </ol>
+    {% endif %}
   </article>
 </div>
 {% endblock %}

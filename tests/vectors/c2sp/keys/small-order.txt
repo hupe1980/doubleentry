@@ -1,0 +1,6 @@
+# a verifier key: small-order
+# input
+vkey: example.com/ledgers/acme+00dc1788+AQEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+# expect
+go: accept
+crate: WeakKey

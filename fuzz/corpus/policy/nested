@@ -1,0 +1,15 @@
+# Two operators' witnesses, both needed.
+log example.com/ledgers/acme+c3b6d994+AepKbGPinFIKvvVQexMuxfmVR3auvr57kkIe6mkURtIs
+
+witness X1 witness.example/w1+24b5d9fe+BP0XJDhaoMdbZPt4zWAvodmR/ev3axPFjtcC6sg16fYY https://x1.example/
+	witness X2 witness.example/w2+0863ad1e+BEOnLnFEAXYt9mtowm373yaCquyfJHTspGE+QkoPuv08
+witness X3 witness.example/x3+f20abb74+BJGiigt0OBWTpNlGlXkgiSavyK2CyIObdkQ1m566mks6
+group X-witnesses 2 X1 X2 X3
+
+witness Y1 witness.example/y1+1345e9f3+BAvu9anmeeaj4TT+J4N7/zLHy19dROoJvLDlQrrWpMDM
+witness Y2 witness.example/y2+a4955ef1+BNm/IUh0ioXInaWq2O4LD8LRBf051BpMeWU2NU8K4pAM
+witness Y3 witness.example/y3+f2e65c4f+BFycbfJhycuEBHV3aq782US0BTKPqyj5s6le9ASQ096E
+group Y-witnesses any Y1 Y2 Y3
+  # comment
+group X-and-Y all X-witnesses Y-witnesses
+quorum X-and-Y

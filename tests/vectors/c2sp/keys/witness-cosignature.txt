@@ -1,0 +1,6 @@
+# a verifier key: witness-cosignature
+# input
+vkey: witness.example/w1+24b5d9fe+BP0XJDhaoMdbZPt4zWAvodmR/ev3axPFjtcC6sg16fYY
+# expect
+go: accept
+crate: CosignatureEd25519

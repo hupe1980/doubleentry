@@ -1,0 +1,9 @@
+# a tlog-policy parsed by formats/policy.Unmarshal
+# input
+policy_b64: bG9nIGV4YW1wbGUuY29tL2xlZGdlcnMvYWNtZStjM2I2ZDk5NCtBZXBLYkdQaW5GSUt2dlZRZXhNdXhmbVZSM2F1dnI1N2trSWU2bWtVUnRJcwp3aXRuZXNzIHcgd2l0bmVzcy5leGFtcGxlL2luZGVwZW5kZW50K2U1MGE1YWNiK0JPcEtiR1BpbkZJS3Z2VlFleE11eGZtVlIzYXV2cjU3a2tJZTZta1VSdElzCnF1b3J1bSB3Cg==
+# expect
+go: accept
+marshal_b64: bG9nIGV4YW1wbGUuY29tL2xlZGdlcnMvYWNtZStjM2I2ZDk5NCtBZXBLYkdQaW5GSUt2dlZRZXhNdXhmbVZSM2F1dnI1N2trSWU2bWtVUnRJcwp3aXRuZXNzIHcgd2l0bmVzcy5leGFtcGxlL2luZGVwZW5kZW50K2U1MGE1YWNiK0JPcEtiR1BpbkZJS3Z2VlFleE11eGZtVlIzYXV2cjU3a2tJZTZta1VSdElzCnF1b3J1bSB3Cg==
+crate: PolicyRule:WitnessIsLog
+divergence: the crate refuses a witness key that is also the log's key (signed-note: no key reuse across types); formats accepts it, and the log alone then meets the quorum
+go_verify_cosigned: accept

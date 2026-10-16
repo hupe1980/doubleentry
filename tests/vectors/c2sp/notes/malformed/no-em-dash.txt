@@ -1,0 +1,7 @@
+# a checkpoint note that breaks one rule: no-em-dash
+# input
+note_b64: ZXhhbXBsZS5jb20vbGVkZ2Vycy9hY21lCjEzCnFPOUlSTWpoMWJwSnlCSE51RzZWZVI5ZE1zcDlsd212MmlqOTlsNlVtbE09CgotIGV4YW1wbGUuY29tL2xlZGdlcnMvYWNtZSB3N2JabEM1bWZBMDZEcFRpNjJtUDBxTXVEMUZKVzltTUNLZllWVnB2L09sSkxXOW1VaGt0MlpSZFRnbUdieVpxRFBnbGtMc05yQVBxS2ppeUIrdys4SmtoMWdBPQo=
+vkey: example.com/ledgers/acme+c3b6d994+AepKbGPinFIKvvVQexMuxfmVR3auvr57kkIe6mkURtIs
+# expect
+go: reject
+crate: Malformed:SignatureLine

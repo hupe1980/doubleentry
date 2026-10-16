@@ -1,0 +1,9 @@
+target
+artifacts
+coverage
+
+# Generated corpus entries (libFuzzer names them by SHA-1). Only the named seeds
+# under corpus/<target>/ are committed; `just fuzz` writes new inputs to
+# target/fuzz-corpus/, and `cargo fuzz run <target>` without a directory would
+# write them here, where this line keeps them out of the tree.
+corpus/*/[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]

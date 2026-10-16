@@ -1,0 +1,7 @@
+# a checkpoint evaluated by formats/policy.TLogPolicy.Verify
+# input
+policy: other-log
+checkpoint_b64: ZXhhbXBsZS5jb20vbGVkZ2Vycy9hY21lCjEzCnFPOUlSTWpoMWJwSnlCSE51RzZWZVI5ZE1zcDlsd212MmlqOTlsNlVtbE09CgrigJQgb3RoZXIuZXhhbXBsZS9sb2cgaURnV0VTNW1mQTA2RHBUaTYybVAwcU11RDFGSlc5bU1DS2ZZVlZwdi9PbEpMVzltVWhrdDJaUmRUZ21HYnlacURQZ2xrTHNOckFQcUtqaXlCK3crOEpraDFnQT0K
+# expect
+go: reject
+crate: OriginNotSigned

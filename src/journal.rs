@@ -1,4226 +1,1592 @@
-//! The in-memory journal — the engine's reference implementation.
+//! [`Journal`]: a ledger in memory, written synchronously.
 //!
-//! A journal is one entity's books: its accounts, its calendar, its policy, its
-//! entries in append order, the Merkle log that commits to them, its seals and
-//! its clearings. It holds all of that together because every one of those
-//! pieces is needed to decide whether the next booking is legal, and splitting
-//! them across the caller's own variables is how they drift apart.
+//! ```
+//! use doubleentry::{AccountKind, Entry, Journal, LedgerId, amount, date, currency::EUR};
 //!
-//! It has no storage. It is the semantics a [`LedgerStore`](crate::LedgerStore)
-//! is expected to agree with, the substrate for deterministic testing, and — for
-//! a process that does not need durability — a usable ledger on its own.
+//! let books = Journal::new(LedgerId::new("example.com/acme")?); // P = 2
+//! let mut books = books.as_actor("setup"); // actor for master data
+//! books.declare_currency(EUR, 2, date!("2026-01-01"))?;
+//! books.open("Assets:Cash", AccountKind::Asset, date!("2026-01-01"))?;
+//! books.open("Income:Sales", AccountKind::Income, date!("2026-01-01"))?;
+//! books.define_period("2026-03", date!("2026-03-01"), date!("2026-03-31"))?;
 //!
-//! # Idempotency
-//!
-//! Recording is keyed by [`IdempotencyKey`]. Submitting the same key twice with
-//! byte-identical content is a no-op that returns the original outcome, which is
-//! what makes a retry safe across an at-least-once delivery path. Submitting the
-//! same key with different content is a conflict and is refused — never a silent
-//! overwrite, and never a second entry.
-//!
-//! # Cost
-//!
-//! Balances and per-account posting lists are maintained as entries arrive, so
-//! reading the current trial balance, one account's balance, or one account's
-//! statement costs what the answer costs and not what the history costs. Asking
-//! for a *historical* state — a balance as of an earlier log position — replays
-//! that account's postings up to the position, which is linear in the postings
-//! on that account rather than in the journal.
-//!
-//! Recording costs the entry's own postings — not the number of accounts
-//! registered, and not the number already recorded.
-//!
-//! | Operation | Cost |
-//! |---|---|
-//! | [`record`](Journal::record) | `O(postings · log accounts)` |
-//! | [`balance`](Journal::balance), unrestricted | `O(log accounts)` |
-//! | [`balance`](Journal::balance), narrowed | `O(postings on that account)` |
-//! | [`trial_balance`](Journal::trial_balance), unrestricted | `O(rows)` — it is the answer |
-//! | [`statement`](Journal::statement) | `O(postings on that account)` |
-//! | [`head`](Journal::head), [`prove_inclusion`](Journal::prove_inclusion), [`prove_consistency`](Journal::prove_consistency) | `O(log n)` |
-//! | [`seal_period`](Journal::seal_period) | `O(n)` — once per period |
-//! | [`verify_log`](Journal::verify_log), [`audit`](Journal::audit) | `O(n)` — audit-time, not write-path |
+//! let rec = books.record(
+//!     Entry::new("invoice-2026-0001", date!("2026-03-15"))
+//!         .debit("Assets:Cash", amount!("1190.00"), EUR)
+//!         .credit("Income:Sales", amount!("1190.00"), EUR),
+//! )?; // Ok(Recorded) | Err(Error::Rejected(r))
+//! let proof = books.prove_entry(rec.id)?; // verifies against books.head()
+//! # let leaf = books.leaves().nth(usize::try_from(rec.position)?).map(|leaf| leaf.bytes.to_vec());
+//! # proof.verify_record::<2>(&books.head(), &leaf.unwrap_or_default())?;
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use std::ops::RangeInclusive;
+use std::sync::Arc;
 
-use smallvec::SmallVec;
 use time::Date;
 
-use crate::account::{
-    Account, AccountId, AccountPath, AccountRecord, AccountRegistry, BalanceLimit,
+use crate::core::{
+    self, AccountSpec, AuditFailure, AuditFailureKind, AuditReport, ChangeInput, Done, HoldState,
+    MemState, Op, Outcome, Recorded, ReplayLeaf, Replayer, SealReceipt, StateView,
 };
-use crate::balance::{Balance, BalanceKey, BalanceQuery, TrialBalance};
-use crate::checkpoint::{AssertionOutcome, BalanceAssertion, Checkpoint, CheckpointError};
-use crate::clearing::{
-    Clearing, ClearingError, ClearingId, ClearingRegister, OpenItem, PostingLookup,
-    PostingPosition, PostingRef,
+use crate::error::{Error, QueryError};
+use crate::export::{Export, ExportScope, Exporter};
+use crate::facade::{Account, Reads, SaltSource, now, seal_first, unexpected};
+use crate::log::{ConsistencyProof, InclusionProof, SealedBalanceProof, TreeHead};
+use crate::model::{
+    AccountHandle, AccountKind, AccountRef, Amount, Balance, BalanceLimit, Currency, Entry,
+    EntryId, EntryRecord, Layer, LedgerId, LedgerPolicy, MemoSalt, PostingRef, ValueError,
 };
-use crate::dimensions::Label;
-use crate::entry::{
-    Balanced, Draft, Entry, EntryId, IdempotencyKey, LedgerPolicy, SealContext, ValidationErrors,
+use crate::report::{
+    AccountName, AssertionOutcome, BalanceAssertion, BalanceQuery, OpenItem, Rollup, Statement,
+    TrialBalance,
 };
-use crate::hash::Hash;
-use crate::merkle::{ConsistencyProof, InclusionProof, MerkleLog, ProofError, TreeHead};
-use crate::money::{Currency, MoneyError};
-use crate::period::{LedgerId, Period, PeriodCalendar, PeriodError, PeriodId, PeriodState};
-use crate::posting::{Layer, Posting};
-use crate::rollup::Rollup;
-use crate::seal::{
-    PeriodCoverage, Seal, SealChain, SealChainError, SealedBalance, SealedBalanceError,
-    SealedBalanceOutcome,
-};
-use crate::storage::StatementLine;
+use crate::store::{Erasure, MemView, apply};
+#[cfg(feature = "witness")]
+use crate::transparency::{Checkpoint, KeyName, LogKey};
+use crate::transparency::{ProofBundle, SignedCheckpoint, TileId};
+use crate::{HoldCursor, Page, PageRead};
 
-/// Balance keys one entry's undo record holds before spilling to the heap.
+/// A ledger kept in memory and written synchronously: the rule core over an
+/// in-memory state.
 ///
-/// Matched to the entry's own inline posting capacity: a booking with four or
-/// fewer postings — which is nearly all of them — records its undo without
-/// allocating.
-const UNDO_INLINE: usize = 4;
-
-/// Position of an entry in the journal.
+/// Every write builds an operation, lets the rule core decide it against the
+/// journal's current state, and applies the outcome completely or not at
+/// all. A refused or already-applied operation leaves the journal
+/// byte-identical, whatever its history. `Ledger<S>` has the same methods,
+/// `async`, over a store.
 ///
-/// Ordering is by log index rather than by timestamp: a wall clock is neither
-/// monotonic nor agreed between writers, and the index is both.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct LogIndex(u64);
+/// Master data is written by the journal's actor ([`as_actor`](Self::as_actor),
+/// `system` by default). Names (account paths, period ids) are taken as text
+/// and validated by the core, so a malformed one is a
+/// [`Rejection`](crate::Rejection), never a panic.
+///
+/// The scale `P` is fixed per journal: [`Journal::new`] gives `P = 2`;
+/// other scales come from [`with_precision`](Self::with_precision).
+#[derive(Clone)]
+pub struct Journal<const P: u8 = 2> {
+    state: Arc<MemState<P>>,
+    actor: String,
+    salt: SaltSource,
+}
 
-impl LogIndex {
-    /// Wraps a raw index.
+impl Journal<2> {
+    /// A new journal with two decimal places (`P = 2`): the genesis record
+    /// of `ledger` and nothing else.
     #[must_use]
-    pub const fn new(index: u64) -> Self {
-        Self(index)
-    }
-
-    /// The underlying index.
-    #[must_use]
-    pub const fn get(self) -> u64 {
-        self.0
+    pub fn new(ledger: LedgerId) -> Self {
+        Self::with_precision(ledger)
     }
 }
 
-impl From<u64> for LogIndex {
-    fn from(index: u64) -> Self {
-        Self(index)
+impl<const P: u8> fmt::Debug for Journal<P> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Journal")
+            .field("ledger", self.state.ledger())
+            .field("head", &self.state.head())
+            .field("actor", &self.actor)
+            .finish_non_exhaustive()
     }
-}
-
-impl std::fmt::Display for LogIndex {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-/// The result of recording an entry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Recorded {
-    /// The entry's identifier.
-    pub id: EntryId,
-    /// Where it sits in the log, once it has been sequenced.
-    ///
-    /// `None` means the entry is durable and idempotency-checked but not yet
-    /// assigned a position — a backend that sequences out of band returns this
-    /// until its sequencer has run. Backends that sequence inline always return
-    /// `Some`.
-    ///
-    /// The distinction is not an implementation leak. It is the difference
-    /// between *recorded* and *committed to*: an entry with no index is safe
-    /// from loss but cannot yet be proven to sit anywhere in particular.
-    pub index: Option<LogIndex>,
-    /// Its content hash.
-    pub content_hash: Hash,
-    /// False when an identical submission had already been recorded.
-    pub is_new: bool,
-}
-
-impl Recorded {
-    /// The log position, or an error naming the entry that has none yet.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`NotSequenced`] when the entry has not been assigned a position.
-    pub fn require_index(&self) -> Result<LogIndex, NotSequenced> {
-        self.index.ok_or(NotSequenced { id: self.id })
-    }
-}
-
-/// An entry was expected to have a log position and did not.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("entry {id} has been recorded but not yet sequenced")]
-pub struct NotSequenced {
-    /// The entry without a position.
-    pub id: EntryId,
-}
-
-/// Failure recording an entry.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[non_exhaustive]
-pub enum JournalError {
-    /// The entry did not pass validation.
-    #[error(transparent)]
-    Invalid(#[from] ValidationErrors),
-
-    /// The idempotency key was reused with different content.
-    #[error("idempotency key already used by entry {existing} with different content")]
-    IdempotencyConflict {
-        /// The entry already holding the key.
-        existing: EntryId,
-        /// Content hash of the stored entry.
-        stored: Hash,
-        /// Content hash of the submission.
-        submitted: Hash,
-    },
-
-    /// The entry identifier was already used.
-    #[error("entry {id} is already recorded")]
-    DuplicateId {
-        /// The offending identifier.
-        id: EntryId,
-    },
-
-    /// The account registry refused a master-data change.
-    #[error(transparent)]
-    Account(#[from] crate::account::AccountError),
-
-    /// Registering this path would put postings on an aggregation node.
-    ///
-    /// Only leaves are postable, and `ancestor` has already been posted to.
-    /// Registering a descendant of it now would leave an account that is both a
-    /// bucket and a container — so "the balance of `{ancestor}`" would have two
-    /// defensible answers, its own postings or the subtree's, and every entry
-    /// already recorded against it would fail the rule it was accepted under.
-    ///
-    /// The rule is checked here rather than in
-    /// [`AccountRegistry`], which holds no postings and
-    /// so cannot see the conflict.
-    #[error(
-        "cannot register {path}: its ancestor {ancestor} has already been posted \
-         to, and only leaves are postable"
-    )]
-    AncestorHasPostings {
-        /// The path being registered.
-        path: crate::account::AccountPath,
-        /// The registered ancestor that already carries postings.
-        ancestor: crate::account::AccountPath,
-    },
-
-    /// A reversal referenced an entry that is not in the journal.
-    #[error("cannot reverse unknown entry {id}")]
-    UnknownOriginal {
-        /// The referenced identifier.
-        id: EntryId,
-    },
-
-    /// The referenced entry has already been reversed.
-    #[error("entry {id} has already been reversed by {by}")]
-    AlreadyReversed {
-        /// The entry being reversed.
-        id: EntryId,
-        /// The reversal already on file.
-        by: EntryId,
-    },
-
-    /// A reversal was aimed at another reversal.
-    #[error("entry {id} is itself a reversal and cannot be reversed")]
-    ReversalOfReversal {
-        /// The offending identifier.
-        id: EntryId,
-    },
-
-    /// An entry claiming to reverse another does not actually invert it.
-    ///
-    /// Postings must correspond one-to-one *in order*, which is what
-    /// [`Entry::reverse`] produces. Building a reversal by hand and reordering
-    /// its postings is refused rather than matched heuristically: a rule that
-    /// guesses is a rule an auditor cannot check.
-    #[error("entry claiming to reverse {id} does not invert its postings")]
-    NotAnInversion {
-        /// The entry it claims to reverse.
-        id: EntryId,
-    },
-
-    /// The entry would leave an account past its balance limit.
-    ///
-    /// The shortfall is reported in minor units at `scale`, so the variant stays
-    /// independent of the ledger's compile-time precision.
-    #[error(
-        "{account} in {currency} would be {} minor units past its {limit} limit \
-         at scale {scale}",
-        .headroom_minor.saturating_neg()
-    )]
-    LimitBreached {
-        /// The account whose limit would be breached.
-        account: AccountId,
-        /// The currency the limit was breached in.
-        currency: Currency,
-        /// The limit in force.
-        limit: BalanceLimit,
-        /// Room left under the limit, in minor units — negative here, and the
-        /// magnitude is the shortfall. See
-        /// [`BalanceLimit::headroom_minor`](crate::BalanceLimit::headroom_minor)
-        /// for how the settled and pending layers are folded into it.
-        headroom_minor: i128,
-        /// Decimal places the minor units are expressed in.
-        scale: u8,
-    },
-
-    /// Accumulating balances overflowed.
-    #[error(transparent)]
-    Money(#[from] MoneyError),
-
-    /// A clearing was refused.
-    #[error(transparent)]
-    Clearing(#[from] ClearingError),
-
-    /// The calendar refused a period operation.
-    ///
-    /// Covers the sealing preconditions too — that the period is defined, is
-    /// closing, and is next in date order. Those are questions about the
-    /// calendar, and [`PeriodCalendar::check_sealable`] is the one place they
-    /// are answered.
-    #[error(transparent)]
-    Period(#[from] PeriodError),
-
-    /// The seal did not chain onto the existing ones.
-    #[error(transparent)]
-    Seal(#[from] SealChainError),
-
-    /// A sealed balance could not be proven.
-    #[error(transparent)]
-    SealedBalance(#[from] SealedBalanceError),
-
-    /// A proof could not be built.
-    ///
-    /// Reachable from [`Journal::seal_period`], which derives the seal's
-    /// consistency proof from the log. It means the log is shorter than a seal
-    /// already committed to — entries were removed underneath the journal.
-    #[error(transparent)]
-    Proof(#[from] ProofError),
-}
-
-/// Where one posting sits: which entry, and which posting within it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Site {
-    index: LogIndex,
-    posting: u16,
-}
-
-/// An append-only journal of validated entries.
-///
-/// See the [module documentation](self) for what it owns and why.
-#[derive(Debug, Clone)]
-pub struct Journal<const P: u8> {
-    ledger: LedgerId,
-    accounts: AccountRegistry,
-    calendar: PeriodCalendar,
-    policy: LedgerPolicy,
-
-    entries: Vec<Entry<Balanced, P>>,
-    log: MerkleLog,
-    by_id: BTreeMap<EntryId, LogIndex>,
-    by_key: BTreeMap<IdempotencyKey, (EntryId, LogIndex, Hash)>,
-    reversed_by: BTreeMap<EntryId, EntryId>,
-
-    /// Current balances, maintained as entries arrive.
-    balances: TrialBalance<P>,
-    /// Where each balance key's postings are, in log order.
-    sites: BTreeMap<BalanceKey, Vec<Site>>,
-
-    seals: SealChain,
-    clearings: ClearingRegister<P>,
 }
 
 impl<const P: u8> Journal<P> {
-    /// Creates an empty journal for one ledger.
+    /// The compile-time scale check.
+    const SCALE_OK: () = assert!(P <= Amount::<P>::MAX_PRECISION, "P must be <= 18");
+
+    /// A new journal of scale `P` (at most 18 decimal places).
     ///
-    /// A journal is one entity's books, not a shared table: the ledger it names
-    /// is bound into every seal it produces, so seals from two journals can
-    /// never be mistaken for one chain.
+    /// ```
+    /// use doubleentry::{Journal, LedgerId};
     ///
-    /// It starts with no accounts, no periods, and a policy that constrains
-    /// nothing. Register accounts before posting to them; define periods when
-    /// you want to be able to seal them.
+    /// let books = Journal::<4>::with_precision(LedgerId::new("example.com/fx")?);
+    /// assert_eq!(books.head().size, 1); // the genesis record
+    /// # Ok::<(), doubleentry::error::ValueError>(())
+    /// ```
     #[must_use]
-    pub fn new(ledger: LedgerId) -> Self {
+    pub fn with_precision(ledger: LedgerId) -> Self {
+        let () = Self::SCALE_OK;
+        let mut state = MemState::new(ledger);
+        if let Ok(Outcome::Append(genesis)) = core::execute(&state, &Op::Genesis) {
+            // The genesis of an empty state always applies.
+            let _applied = state.apply(*genesis);
+        }
+        Self::from_state(state)
+    }
+
+    fn from_state(state: MemState<P>) -> Self {
         Self {
-            seals: SealChain::new(ledger.clone()),
-            ledger,
-            accounts: AccountRegistry::new(),
-            calendar: PeriodCalendar::new(),
-            policy: LedgerPolicy::default(),
-            entries: Vec::new(),
-            log: MerkleLog::new(),
-            by_id: BTreeMap::new(),
-            by_key: BTreeMap::new(),
-            reversed_by: BTreeMap::new(),
-            balances: TrialBalance::new(),
-            sites: BTreeMap::new(),
-            clearings: ClearingRegister::new(),
+            state: Arc::new(state),
+            actor: String::from("system"),
+            salt: SaltSource::Os,
         }
     }
 
-    /// Sets the ledger-wide policy.
-    ///
-    /// Applies to what is recorded next. It does not re-validate what is already
-    /// recorded, and it must not: an entry that was legal when written stays
-    /// readable forever.
-    #[must_use]
-    pub fn with_policy(mut self, policy: LedgerPolicy) -> Self {
-        self.policy = policy;
-        self
-    }
-
-    // ── master data ─────────────────────────────────────────────────────────
-
-    /// The ledger these books belong to.
-    #[must_use]
-    pub fn ledger(&self) -> &LedgerId {
-        &self.ledger
-    }
-
-    /// The accounts that may be posted to.
-    #[must_use]
-    pub fn accounts(&self) -> &AccountRegistry {
-        &self.accounts
-    }
-
-    /// Registers an account and returns its handle.
-    ///
-    /// Master data is mutable while the journal is not: what may be booked next
-    /// can change, what was booked already cannot.
-    ///
-    /// Registration goes through the journal rather than through the registry
-    /// directly because one of its rules needs the postings to decide. A
-    /// registry holds none, so it cannot see that the path it is being handed
-    /// would turn an account that has already been posted to into an
-    /// aggregation node — see [`JournalError::AncestorHasPostings`].
-    ///
-    /// # Errors
-    ///
-    /// Returns [`JournalError::Account`] for a duplicate path or an inverted
-    /// open window, and [`JournalError::AncestorHasPostings`] when a registered
-    /// ancestor of `account` already carries postings.
-    pub fn register_account(&mut self, account: Account) -> Result<AccountId, JournalError> {
-        self.refuse_if_an_ancestor_is_posted_to(&account.path)?;
-        Ok(self.accounts.register(account)?)
-    }
-
-    /// Registers an account from a path string, open from `opened_on`.
-    ///
-    /// # Errors
-    ///
-    /// As [`Journal::register_account`], plus [`JournalError::Account`] for a
-    /// malformed path.
-    pub fn register_path(
-        &mut self,
-        path: &str,
-        opened_on: Date,
-    ) -> Result<AccountId, JournalError> {
-        self.register_account(Account::new(AccountPath::parse(path)?, opened_on))
-    }
-
-    /// Restores a stored account at the handle it was issued.
-    ///
-    /// The replay path a durable backend takes on start-up. Unlike
-    /// [`Journal::register_account`] it insists the record land where it says it
-    /// belongs, because a handle is a position that every posting row and every
-    /// sealed balance already names.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`JournalError::Account`] when the handle is neither held nor the
-    /// next one, or is held by a different path, and
-    /// [`JournalError::AncestorHasPostings`] when the record introduces a *new*
-    /// account beneath one that has already been posted to.
-    pub fn restore_account(&mut self, record: AccountRecord) -> Result<(), JournalError> {
-        // Only a new handle can break the leaf rule: re-reading a record the
-        // journal already holds cannot change the shape of the tree.
-        if self.accounts.get(record.id).is_none() {
-            self.refuse_if_an_ancestor_is_posted_to(&record.account.path)?;
+    /// The journal a finished replay rebuilt, writing as `actor` with memo
+    /// salts from `salt`.
+    pub(crate) fn from_replay(replay: Replayer<P>, actor: &str, salt: SaltSource) -> Self {
+        Self {
+            state: Arc::new(replay.into_state()),
+            actor: actor.to_owned(),
+            salt,
         }
-        Ok(self.accounts.restore(record)?)
     }
 
-    /// Closes an account from `on`, so postings after that date are refused.
+    /// A journal rebuilt from its leaves and their side data, replaying each
+    /// through the rule core (so the result has passed the same checks as an
+    /// [`audit`](Self::audit)).
+    ///
+    /// ```
+    /// use doubleentry::{AccountKind, Journal, LedgerId};
+    /// use doubleentry::date;
+    ///
+    /// let mut books = Journal::new(LedgerId::new("example.com/acme")?);
+    /// books.open("Assets:Cash", AccountKind::Asset, date!("2026-01-01"))?;
+    /// let restored: Journal = Journal::from_log(books.id(), books.leaves())?;
+    /// assert_eq!(restored.head(), books.head());
+    /// # Ok::<(), doubleentry::Error>(())
+    /// ```
     ///
     /// # Errors
     ///
-    /// Returns [`JournalError::Account`] for an unknown handle, or a date before
-    /// the account opened.
-    pub fn close_account(&mut self, id: AccountId, on: Date) -> Result<(), JournalError> {
-        Ok(self.accounts.close(id, on)?)
-    }
-
-    /// Reopens a closed account.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`JournalError::Account`] for an unknown handle.
-    pub fn reopen_account(&mut self, id: AccountId) -> Result<(), JournalError> {
-        Ok(self.accounts.reopen(id)?)
-    }
-
-    /// Constrains which side an account's net balance may fall on.
-    ///
-    /// Governs what may be booked next and never what was booked already, so
-    /// tightening a limit an account already breaches is permitted — and freezes
-    /// it against any further movement the wrong way. See [`BalanceLimit`].
-    ///
-    /// # Errors
-    ///
-    /// Returns [`JournalError::Account`] for an unknown handle.
-    pub fn set_account_limit(
-        &mut self,
-        id: AccountId,
-        limit: BalanceLimit,
-    ) -> Result<(), JournalError> {
-        Ok(self.accounts.set_limit(id, limit)?)
-    }
-
-    /// Refuses a path whose registered ancestor has already been posted to.
-    ///
-    /// Scanning the balance keys is the whole cost, and only for a path that has
-    /// registered ancestors at all. Registration is master data — once per
-    /// account, not once per booking.
-    fn refuse_if_an_ancestor_is_posted_to(&self, path: &AccountPath) -> Result<(), JournalError> {
-        let ancestors: BTreeMap<AccountId, AccountPath> = path
-            .ancestors()
-            .into_iter()
-            .filter_map(|a| self.accounts.id_of(&a).map(|id| (id, a)))
-            .collect();
-        if ancestors.is_empty() {
-            return Ok(());
+    /// [`Error::Integrity`] at the first leaf the core would not have
+    /// written, or when the log has no genesis.
+    pub fn from_log<'a>(
+        ledger: &LedgerId,
+        leaves: impl IntoIterator<Item = ReplayLeaf<'a>>,
+    ) -> Result<Self, Error> {
+        let mut replay = Replayer::new(ledger);
+        for leaf in leaves {
+            replay.feed(leaf)?;
         }
-        for key in self.sites.keys() {
-            if let Some(ancestor) = ancestors.get(&key.account) {
-                return Err(JournalError::AncestorHasPostings {
-                    path: path.clone(),
-                    ancestor: ancestor.clone(),
-                });
+        if replay.head().size == 0 {
+            return Err(AuditFailure {
+                position: Some(0),
+                kind: AuditFailureKind::GenesisMissing,
             }
+            .into());
         }
-        Ok(())
+        Ok(Self::from_state(replay.into_state()))
     }
 
-    /// The period calendar.
+    /// The same journal, drawing memo salts from `source` instead of the
+    /// operating system — for deterministic tests and simulations. A salt
+    /// must be unpredictable for memo erasure to protect anything.
     #[must_use]
-    pub fn calendar(&self) -> &PeriodCalendar {
-        &self.calendar
+    pub fn with_salt_source(self, source: impl Fn() -> MemoSalt + Send + Sync + 'static) -> Self {
+        Self {
+            salt: SaltSource::custom(source),
+            ..self
+        }
     }
 
-    /// The period calendar, for defining periods and moving them through their
-    /// lifecycle.
-    ///
-    /// Sealing is [`Journal::seal_period`]'s job: it has to commit to the
-    /// balances before the period's state changes, which a bare transition
-    /// cannot do.
-    pub fn calendar_mut(&mut self) -> &mut PeriodCalendar {
-        &mut self.calendar
-    }
-
-    /// The ledger-wide policy.
+    /// The same journal, recording `actor` on master data from now on. An
+    /// invalid actor is refused by the next master-data write.
     #[must_use]
-    pub fn policy(&self) -> &LedgerPolicy {
-        &self.policy
+    pub fn as_actor(self, actor: impl AsRef<str>) -> Self {
+        Self {
+            actor: actor.as_ref().to_owned(),
+            ..self
+        }
     }
 
-    /// Defines a period.
+    /// The actor recorded on master data.
+    #[must_use]
+    pub fn actor(&self) -> &str {
+        &self.actor
+    }
+
+    /// The ledger's id.
+    #[must_use]
+    pub fn id(&self) -> &LedgerId {
+        self.state.ledger()
+    }
+
+    /// Every read, over the journal's state.
+    fn reads(&self) -> Reads<'_, MemView<P>, P> {
+        Reads::new(MemView(Arc::clone(&self.state)), self.state.ledger())
+    }
+
+    /// Runs one operation through the core and applies its outcome.
+    pub(crate) fn run(&mut self, op: &Op<P>) -> Result<Done<P>, Error> {
+        let outcome = core::execute(&*self.state, op)?;
+        self.commit(outcome)
+    }
+
+    fn commit(&mut self, outcome: Outcome<P>) -> Result<Done<P>, Error> {
+        Ok(apply(Arc::make_mut(&mut self.state), outcome)?)
+    }
+
+    // ── Master data and calendar ────────────────────────────────────────────
+
+    /// Declares a currency with its number of decimal places (at most `P`),
+    /// or raises it. Declared currencies are the only ones entries may use.
     ///
     /// # Errors
     ///
-    /// Returns [`PeriodError`] for a duplicate identifier or an overlapping
-    /// range.
-    pub fn define_period(&mut self, period: Period) -> Result<(), JournalError> {
-        self.calendar.define(period)?;
-        Ok(())
-    }
-
-    /// Moves a period through its lifecycle.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PeriodError`] when the transition is not permitted.
-    pub fn transition_period(
+    /// [`Error::Rejected`]: 107, 123, 309, 310, 424.
+    pub fn declare_currency(
         &mut self,
-        period: &PeriodId,
-        to: PeriodState,
-    ) -> Result<(), JournalError> {
-        self.calendar.transition(period, to)?;
-        Ok(())
-    }
-
-    /// Everything validation needs, borrowed from this journal.
-    ///
-    /// Use it to validate a draft without recording it — a dry run, or a batch
-    /// checked before any of it is committed. [`Journal::record`] builds it for
-    /// you.
-    #[must_use]
-    pub fn context(&self) -> SealContext<'_> {
-        SealContext {
-            accounts: &self.accounts,
-            calendar: &self.calendar,
-            policy: &self.policy,
-        }
-    }
-
-    // ── recording ───────────────────────────────────────────────────────────
-
-    /// Validates a draft against this journal and records it.
-    ///
-    /// The usual way in. [`Journal::record_validated`] exists for an entry that
-    /// was validated elsewhere — read what it costs before reaching for it.
-    ///
-    /// # Idempotency comes first
-    ///
-    /// The key is resolved *before* validation runs, not after. Otherwise a
-    /// retry of an entry that was accepted months ago would be refused today
-    /// because its period has since been sealed or its account has closed —
-    /// turning an at-least-once delivery path into a source of spurious errors
-    /// precisely when the ledger is least able to act on them. A safe retry must
-    /// not be able to trip a rule the original submission already passed.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`JournalError::Invalid`] with every violation found, and the
-    /// idempotency and correction errors of [`Journal::record_validated`].
-    pub fn record(&mut self, draft: Entry<Draft, P>) -> Result<Recorded, JournalError> {
-        let content_hash = draft.digest();
-        if let Some((existing_id, existing_index, stored)) =
-            self.by_key.get(draft.idempotency_key())
-        {
-            if *stored == content_hash {
-                return Ok(Recorded {
-                    id: *existing_id,
-                    index: Some(*existing_index),
-                    content_hash,
-                    is_new: false,
-                });
-            }
-            return Err(JournalError::IdempotencyConflict {
-                existing: *existing_id,
-                stored: *stored,
-                submitted: content_hash,
-            });
-        }
-
-        let entry = draft.seal(&self.context())?;
-        self.record_validated(entry)
-    }
-
-    /// Records an entry that has already passed validation.
-    ///
-    /// The entry must have been sealed against *this* journal's accounts,
-    /// calendar and policy. Sealing it against a different context and recording
-    /// it here would book against accounts this ledger does not have, or into a
-    /// period it has already sealed.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`JournalError::IdempotencyConflict`] when the key has been used
-    /// for different content, and the reversal errors when the entry violates
-    /// the correction rules.
-    pub fn record_validated(
-        &mut self,
-        entry: Entry<Balanced, P>,
-    ) -> Result<Recorded, JournalError> {
-        let content_hash = entry.content_hash();
-
-        // Idempotency is settled before anything else: a safe retry must not be
-        // able to trip a later rule that the original submission already passed.
-        if let Some((existing_id, existing_index, stored)) =
-            self.by_key.get(entry.idempotency_key())
-        {
-            if *stored == content_hash {
-                return Ok(Recorded {
-                    id: *existing_id,
-                    index: Some(*existing_index),
-                    content_hash,
-                    is_new: false,
-                });
-            }
-            return Err(JournalError::IdempotencyConflict {
-                existing: *existing_id,
-                stored: *stored,
-                submitted: content_hash,
-            });
-        }
-
-        if self.by_id.contains_key(&entry.id()) {
-            return Err(JournalError::DuplicateId { id: entry.id() });
-        }
-
-        if let Some(original) = entry.reverses() {
-            self.check_reversal(&entry, original)?;
-        }
-
-        // Everything that can fail has failed by now, except accumulating the
-        // balances and the limits they have to satisfy. Both happen inside
-        // `apply_balances`, which leaves the journal untouched if either does.
-        self.apply_balances(&entry)?;
-
-        let index = LogIndex(self.log.append(content_hash));
-        if let Some(original) = entry.reverses() {
-            self.reversed_by.insert(original, entry.id());
-        }
-        for (position, posting) in entry.postings().iter().enumerate() {
-            self.sites.entry(key_of(posting)).or_default().push(Site {
-                index,
-                posting: u16::try_from(position).unwrap_or(u16::MAX),
-            });
-        }
-        self.by_id.insert(entry.id(), index);
-        self.by_key.insert(
-            entry.idempotency_key().clone(),
-            (entry.id(), index, content_hash),
-        );
-        let id = entry.id();
-        self.entries.push(entry);
-
-        Ok(Recorded {
-            id,
-            index: Some(index),
-            content_hash,
-            is_new: true,
+        code: Currency,
+        exponent: u8,
+        effective: Date,
+    ) -> Result<(), Error> {
+        let actor = self.actor.clone();
+        self.run(&Op::Currency {
+            code,
+            exponent,
+            effective,
+            actor,
         })
+        .map(drop)
     }
 
-    /// Records several entries, or none of them.
-    ///
-    /// Atomicity across entries is not optional: an invoice and the entry that
-    /// offsets it must not be separable by a failure partway through. Entries
-    /// are applied in order and, if any is refused, everything this call added
-    /// is undone — leaving the journal byte-identical to how it started.
-    ///
-    /// An idempotent replay inside a batch is not a failure: it returns the
-    /// original outcome, like a single-entry replay, and the rest of the batch
-    /// proceeds.
+    /// Opens an account at `path` of `kind` from `on`: no class, no end, no
+    /// limit. Returns its handle; opening the same account again returns the
+    /// same handle and writes nothing.
     ///
     /// # Errors
     ///
-    /// Returns the first entry's failure, having applied nothing.
+    /// [`Error::Rejected`]: 103, 107, 309, 420, 421, 428.
+    pub fn open(
+        &mut self,
+        path: impl AsRef<str>,
+        kind: AccountKind,
+        on: Date,
+    ) -> Result<AccountHandle, Error> {
+        self.register(AccountSpec::new(path, kind, on))
+    }
+
+    /// Registers an account with its full master data.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Rejected`]: 103, 107, 122, 309, 420, 421, 428.
+    pub fn register(&mut self, spec: AccountSpec) -> Result<AccountHandle, Error> {
+        let actor = self.actor.clone();
+        self.run(&Op::Register { spec, actor })?.into_account()
+    }
+
+    fn change<A>(&mut self, account: A, change: ChangeInput, effective: Date) -> Result<(), Error>
+    where
+        A: TryInto<AccountRef>,
+        A::Error: Into<ValueError>,
+    {
+        let account = core::account_ref(account)?;
+        let actor = self.actor.clone();
+        self.run(&Op::Change {
+            account,
+            change,
+            effective,
+            actor,
+        })
+        .map(drop)
+    }
+
+    /// Sets an account's balance limit from `effective` on. The latest limit
+    /// applies to every entry, whatever its booking date.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Rejected`]: 103, 107, 302, 309, 310.
+    pub fn set_limit<A>(
+        &mut self,
+        account: A,
+        limit: BalanceLimit,
+        effective: Date,
+    ) -> Result<(), Error>
+    where
+        A: TryInto<AccountRef>,
+        A::Error: Into<ValueError>,
+    {
+        self.change(account, ChangeInput::Limit(limit), effective)
+    }
+
+    /// Sets (or removes) an account's class; refused once it has postings.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Rejected`]: 103, 107, 302, 309, 310, 422.
+    pub fn set_class<A>(
+        &mut self,
+        account: A,
+        class: Option<&str>,
+        effective: Date,
+    ) -> Result<(), Error>
+    where
+        A: TryInto<AccountRef>,
+        A::Error: Into<ValueError>,
+    {
+        self.change(
+            account,
+            ChangeInput::Class(class.map(str::to_owned)),
+            effective,
+        )
+    }
+
+    /// Closes an account: `last_day` is the last day it can be posted to.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Rejected`]: 103, 107, 122, 302, 309, 310, 423.
+    pub fn close_account<A>(&mut self, account: A, last_day: Date) -> Result<(), Error>
+    where
+        A: TryInto<AccountRef>,
+        A::Error: Into<ValueError>,
+    {
+        self.change(account, ChangeInput::OpenTo(Some(last_day)), last_day)
+    }
+
+    /// Reopens a closed account from `effective` on.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Rejected`]: 103, 107, 302, 309, 310.
+    pub fn reopen_account<A>(&mut self, account: A, effective: Date) -> Result<(), Error>
+    where
+        A: TryInto<AccountRef>,
+        A::Error: Into<ValueError>,
+    {
+        self.change(account, ChangeInput::OpenTo(None), effective)
+    }
+
+    /// Sets the ledger policy from `effective` on.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Rejected`]: 107, 309, 310, 431.
+    pub fn set_policy(&mut self, policy: LedgerPolicy, effective: Date) -> Result<(), Error> {
+        let actor = self.actor.clone();
+        self.run(&Op::Policy {
+            policy,
+            effective,
+            actor,
+        })
+        .map(drop)
+    }
+
+    /// Defines the next period of the calendar: the first may start on any
+    /// day, every later one the day after the last one ends.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Rejected`]: 107, 121, 425, 426.
+    pub fn define_period(
+        &mut self,
+        id: impl AsRef<str>,
+        start: Date,
+        end: Date,
+    ) -> Result<(), Error> {
+        self.run(&Op::Period {
+            id: id.as_ref().to_owned(),
+            start,
+            end,
+        })
+        .map(drop)
+    }
+
+    /// Defines one period per month of `year`, ids `YYYY-MM`, back to back —
+    /// sugar over [`define_period`](Self::define_period). Each month is one
+    /// period record; months already defined identically are skipped, so a
+    /// retry after a failure completes the calendar.
+    ///
+    /// ```
+    /// use doubleentry::{Journal, LedgerId};
+    ///
+    /// let mut books = Journal::new(LedgerId::new("example.com/acme")?);
+    /// books.define_months(2026, 1..=12)?;
+    /// books.define_months(2026, 1..=12)?; // already defined: writes nothing
+    /// assert_eq!(books.head().size, 13);
+    /// # Ok::<(), doubleentry::Error>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Rejected`]: 107 for a month outside `1..=12` (or a year whose
+    /// days cannot be represented), and those of
+    /// [`define_period`](Self::define_period).
+    pub fn define_months(&mut self, year: i32, months: RangeInclusive<u8>) -> Result<(), Error> {
+        for (id, start, end) in core::months(year, months)? {
+            self.define_period(id, start, end)?;
+        }
+        Ok(())
+    }
+
+    /// Seals a period: its seal record commits each account's balance
+    /// through the period's end. Sealing a sealed period returns its receipt
+    /// and writes nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Rejected`]: 107, 111, 311, 427, 500.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "seal_period", target = "doubleentry", level = "info", skip_all, fields(ledger = %self.id(), period = %crate::trace::key(id.as_ref()), outcome = tracing::field::Empty, code = tracing::field::Empty, position = tracing::field::Empty))
+    )]
+    pub fn seal_period(&mut self, id: impl AsRef<str>) -> Result<SealReceipt<P>, Error> {
+        let result = self
+            .run(&Op::Seal {
+                period: id.as_ref().to_owned(),
+            })
+            .and_then(Done::into_sealed);
+        #[cfg(feature = "tracing")]
+        crate::trace::sealed(result.as_ref());
+        result
+    }
+
+    /// Seals every period up to and including `id` that has no seal yet,
+    /// earliest first — one [`seal_period`](Self::seal_period) each — and
+    /// returns the receipts of the periods it sealed, `id`'s last (only
+    /// `id`'s when nothing earlier was open). Each seal is its own write: a
+    /// failure keeps the seals before it, and calling again continues.
+    ///
+    /// ```
+    /// use doubleentry::prelude::*;
+    ///
+    /// let mut books = Journal::new(LedgerId::new("example.com/acme")?);
+    /// books.define_months(2026, 1..=12)?;
+    /// // March alone is refused: January and February are open.
+    /// let refused = books.seal_period("2026-03").unwrap_err();
+    /// assert_eq!(refused.code(), Some(427));
+    /// assert!(refused.to_string().contains("seal from 2026-01 on"));
+    /// let sealed = books.seal_through("2026-03")?;
+    /// let periods: Vec<String> = sealed.iter().map(|r| r.period.to_string()).collect();
+    /// assert_eq!(periods, ["2026-01", "2026-02", "2026-03"]);
+    /// assert_eq!(books.seal_through("2026-03")?.len(), 1); // sealed: its receipt
+    /// # Ok::<(), doubleentry::Error>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Those of [`seal_period`](Self::seal_period) but 427.
+    pub fn seal_through(&mut self, id: impl AsRef<str>) -> Result<Vec<SealReceipt<P>>, Error> {
+        let mut sealed = Vec::new();
+        loop {
+            match self.seal_period(id.as_ref()) {
+                Ok(receipt) => {
+                    sealed.push(receipt);
+                    return Ok(sealed);
+                }
+                Err(error) => match seal_first(&error) {
+                    Some(earliest) => sealed.push(self.seal_period(earliest)?),
+                    None => return Err(error),
+                },
+            }
+        }
+    }
+
+    /// The year-end closing drafts: every income and expense slice through
+    /// `on` zeroed into `equity`, chunked to the posting and leaf limits
+    /// under the keys `{key}/1`, `{key}/2`, … Record them in order with
+    /// [`record`](Self::record). Nothing to close gives no drafts.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Rejected`]: 100, 103, 111, 113, 302, 303, 429, 430.
+    pub fn close_year<A>(&self, key: &str, on: Date, equity: A) -> Result<Vec<Entry<P>>, Error>
+    where
+        A: TryInto<AccountRef>,
+        A::Error: Into<ValueError>,
+    {
+        let op = Op::CloseYear {
+            key: key.to_owned(),
+            on,
+            equity: core::account_ref(equity)?,
+        };
+        match core::execute(&*self.state, &op)? {
+            Outcome::Unchanged(done) => done.into_closing(),
+            _ => Err(unexpected()),
+        }
+    }
+
+    // ── Bookings ────────────────────────────────────────────────────────────
+
+    /// Records an entry.
+    ///
+    /// A retry of a recorded draft returns the original receipt with
+    /// `replayed == true` and writes nothing — even after its period was
+    /// sealed or its account closed. "The same draft" means the same postings
+    /// (an account named by path or by handle is the same account), memo
+    /// text and capture time. A memo without a salt
+    /// gets one from the journal's salt source; retries are unaffected.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Rejected`] with the rejection of the highest precedence;
+    /// [`Error::Backend`] when the operating system has no randomness for a
+    /// memo salt.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "record", target = "doubleentry", level = "info", skip_all, fields(ledger = %self.id(), key = %crate::trace::draft_key(&entry), outcome = tracing::field::Empty, code = tracing::field::Empty, position = tracing::field::Empty))
+    )]
+    pub fn record(&mut self, entry: Entry<P>) -> Result<Recorded, Error> {
+        let result = self.record_entry(entry);
+        #[cfg(feature = "tracing")]
+        crate::trace::recorded(result.as_ref());
+        result
+    }
+
+    fn record_entry(&mut self, entry: Entry<P>) -> Result<Recorded, Error> {
+        let entry = self.salt.salted(entry)?;
+
+        let outcome = core::check(&*self.state, &entry)?;
+
+        self.commit(outcome)?.into_recorded()
+    }
+
+    /// Records `drafts` atomically, in order: each draft is checked against
+    /// the state the drafts before it leave, and either every draft is
+    /// recorded or none is. Returns one receipt per draft.
+    ///
+    /// A draft already recorded — by an earlier write, or earlier in the
+    /// same batch — replays as [`record`](Self::record) would, so recording
+    /// an identical batch again returns the original receipts, each with
+    /// `replayed == true`, and writes nothing.
+    ///
+    /// ```
+    /// use doubleentry::prelude::*;
+    ///
+    /// let mut books = Journal::new(LedgerId::new("example.com/payroll")?);
+    /// books.declare_currency(EUR, 2, date!("2026-01-01"))?;
+    /// books.define_months(2026, 3..=3)?;
+    /// books.open("Assets:Bank", AccountKind::Asset, date!("2026-01-01"))?;
+    /// books.open("Expenses:Wages", AccountKind::Expense, date!("2026-01-01"))?;
+    /// books.set_limit("Assets:Bank", BalanceLimit::NoCreditBalance, date!("2026-01-01"))?;
+    /// let pay = |key: &str, eur| {
+    ///     Entry::new(key, date!("2026-03-31"))
+    ///         .debit("Expenses:Wages", eur, EUR)
+    ///         .credit("Assets:Bank", eur, EUR)
+    /// };
+    /// let fund = Entry::new("fund", date!("2026-03-01"))
+    ///     .debit("Assets:Bank", amount!("3000.00"), EUR)
+    ///     .credit("Expenses:Wages", amount!("3000.00"), EUR);
+    ///
+    /// // The second wage would overdraw the bank: nothing of the batch is recorded.
+    /// let run = [fund.clone(), pay("alice", amount!("2000.00")), pay("bob", amount!("1500.00"))];
+    /// match books.record_batch(run) {
+    ///     Err(Error::BatchRejected { index: 2, rejection: Rejection::LimitExceeded { .. } }) => {}
+    ///     other => panic!("expected draft 2 refused, got {other:?}"),
+    /// }
+    /// assert!(books.entry_by_key("fund").is_none());
+    ///
+    /// let run = [fund, pay("alice", amount!("2000.00")), pay("bob", amount!("1000.00"))];
+    /// let first = books.record_batch(run.clone())?;
+    /// let again = books.record_batch(run)?; // a retry of the whole batch
+    /// assert!(again.iter().zip(&first).all(|(a, f)| a.replayed && a.id == f.id));
+    /// # Ok::<(), Error>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BatchRejected`] naming the first refused draft and its
+    /// rejection; [`Error::Backend`] when the operating system has no
+    /// randomness for a memo salt.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "record_batch", target = "doubleentry", level = "info", skip_all, fields(ledger = %self.id(), outcome = tracing::field::Empty, code = tracing::field::Empty, index = tracing::field::Empty, position = tracing::field::Empty))
+    )]
     pub fn record_batch(
         &mut self,
-        entries: impl IntoIterator<Item = Entry<Balanced, P>>,
-    ) -> Result<Vec<Recorded>, JournalError> {
-        let mark = self.entries.len();
-        let mut out = Vec::new();
-        for entry in entries {
-            match self.record_validated(entry) {
-                Ok(recorded) => out.push(recorded),
-                Err(e) => {
-                    self.rollback_to(mark);
-                    return Err(e);
-                }
-            }
-        }
-        Ok(out)
+        drafts: impl IntoIterator<Item = Entry<P>>,
+    ) -> Result<Vec<Recorded>, Error> {
+        let result = self
+            .salt
+            .salted_all(drafts)
+            .and_then(|drafts| self.run(&Op::Batch(drafts)))
+            .and_then(Done::into_batch);
+        #[cfg(feature = "tracing")]
+        crate::trace::batch(result.as_ref());
+        result
     }
 
-    /// Undoes every append since the journal held `mark` entries.
+    /// The draft that reverses entry `id`: its postings mirrored (sides
+    /// swapped), booked on `on` under `key`. It checks no rule; record it
+    /// with [`record`](Self::record).
     ///
-    /// The exact inverse of the appends it removes: identifiers, keys, reversal
-    /// links, posting sites and balances all come back to what they were. The
-    /// balance of a key an undone posting touched is recomputed from the
-    /// postings that remain, rather than subtracted from — subtraction would
-    /// have to trust that what is being removed is exactly what was added, and
-    /// recomputation does not.
-    fn rollback_to(&mut self, mark: usize) {
-        let mut touched: BTreeSet<BalanceKey> = BTreeSet::new();
-        while self.entries.len() > mark {
-            let Some(entry) = self.entries.pop() else {
-                break;
-            };
-            let index = LogIndex(self.entries.len() as u64);
-            self.by_id.remove(&entry.id());
-            self.by_key.remove(entry.idempotency_key());
-            if let Some(original) = entry.reverses() {
-                self.reversed_by.remove(&original);
-            }
-            for posting in entry.postings() {
-                let key = key_of(posting);
-                if let Some(sites) = self.sites.get_mut(&key) {
-                    sites.retain(|site| site.index != index);
-                }
-                touched.insert(key);
-            }
-        }
-        self.log.truncate(self.entries.len() as u64);
+    /// # Errors
+    ///
+    /// [`Error::Query`] when no entry has the id.
+    pub fn reversal(&self, id: EntryId, key: &str, on: Date) -> Result<Entry<P>, Error> {
+        now(self.reads().reversal(id, key, on))
+    }
 
-        for key in touched {
-            // Folded from the postings that remain, not read from the maintained
-            // totals — those are exactly what is being repaired.
-            let balance = self.fold_key(&key);
-            match self.sites.get(&key) {
-                Some(sites) if !sites.is_empty() => self.balances.set(key, balance),
-                _ => {
-                    self.sites.remove(&key);
-                    self.balances.remove(&key);
-                }
-            }
+    /// Clears `amount` of a debit posting against a credit posting of the
+    /// same balance; returns the clearing record's position (replays
+    /// included).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Rejected`]: 100, 120, 200, 300, 301, 410–415, 419.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "record", target = "doubleentry", level = "info", skip_all, fields(ledger = %self.id(), key = %crate::trace::key(key), outcome = tracing::field::Empty, code = tracing::field::Empty, position = tracing::field::Empty))
+    )]
+    pub fn clear(
+        &mut self,
+        key: &str,
+        debit: PostingRef,
+        credit: PostingRef,
+        amount: Amount<P>,
+        on: Date,
+    ) -> Result<u64, Error> {
+        let result = self.clearing(&Op::Clear {
+            key: key.to_owned(),
+            debit,
+            credit,
+            amount,
+            date: on,
+        });
+        #[cfg(feature = "tracing")]
+        crate::trace::cleared(result.as_ref());
+        result
+    }
+
+    /// Runs a clearing operation; its record's position.
+    fn clearing(&mut self, op: &Op<P>) -> Result<u64, Error> {
+        self.run(op)?.into_cleared()
+    }
+
+    /// Resets the clearing applied at position `clearing`; returns the reset
+    /// record's position.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Rejected`]: 100, 200, 300, 301, 416–418.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "record", target = "doubleentry", level = "info", skip_all, fields(ledger = %self.id(), key = %crate::trace::key(key), outcome = tracing::field::Empty, code = tracing::field::Empty, position = tracing::field::Empty))
+    )]
+    pub fn reset_clearing(&mut self, key: &str, clearing: u64, on: Date) -> Result<u64, Error> {
+        let result = self.clearing(&Op::ResetClearing {
+            key: key.to_owned(),
+            clearing,
+            date: on,
+        });
+        #[cfg(feature = "tracing")]
+        crate::trace::cleared(result.as_ref());
+        result
+    }
+
+    /// Erases entry `id`'s memo text and salt (GDPR Art. 17): no leaf, hash
+    /// or proof changes. The stored fingerprint of its draft goes too, so a
+    /// later submission of its key is a key conflict and a guessed memo
+    /// cannot be confirmed. Erasing again, or an entry without a memo,
+    /// changes nothing. When to erase is the caller's decision (the end of
+    /// the retention period).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Query`] when no entry has the id.
+    pub fn erase_memo(&mut self, id: EntryId) -> Result<(), Error> {
+        match Arc::make_mut(&mut self.state).erase_memo(id) {
+            Erasure::UnknownEntry => Err(Error::Query(QueryError::UnknownEntry { id })),
+            Erasure::Erased | Erasure::AlreadyErased | Erasure::NoMemo => Ok(()),
         }
     }
 
-    /// Sums every posting still on `key`, from the entries themselves.
-    ///
-    /// Deliberately not [`Journal::balance`], which serves the maintained total
-    /// for an unrestricted query — and the maintained total is precisely what a
-    /// rollback is repairing.
-    ///
-    /// A subset of a set of postings that already summed cannot overflow, so the
-    /// error arm is unreachable. Leaving a stale total in place would be worse
-    /// than reporting zero, and a zero is caught by
-    /// [`Journal::verify_balances`].
-    fn fold_key(&self, key: &BalanceKey) -> Balance<P> {
-        let mut balance = Balance::ZERO;
-        for site in self.sites.get(key).into_iter().flatten() {
-            let Some((_, posting)) = self.resolve(*site) else {
-                continue;
-            };
-            if balance.add(posting.direction, posting.amount).is_err() {
-                return Balance::ZERO;
-            }
-        }
-        balance
-    }
+    // ── Lookups (absence is `None`, never an error) ─────────────────────────
 
-    /// Accumulates an entry into the maintained balances, or leaves them exactly
-    /// as they were.
+    /// The entry with id `id`, as recorded.
     ///
-    /// **In place, not against a clone.** A clone costs
-    /// `O(accounts × currencies × layers)`, which would make a booking's price a
-    /// function of the chart of accounts rather than of the postings it carries.
-    ///
-    /// The undo is exact. Every key is saved before it is first changed and the
-    /// saves are replayed in reverse, so a key several postings touched comes
-    /// back to the value it held before the *first* of them. Absence is restored
-    /// as absence: a trial balance with no row for a key says the account never
-    /// moved, which is a different claim from a balance of zero.
-    ///
-    /// The limit check lives here because a breach is what the undo exists for:
-    /// the balances have to be complete for the check to read them, and
-    /// untouched once it refuses.
-    fn apply_balances(&mut self, entry: &Entry<Balanced, P>) -> Result<(), JournalError> {
-        let mut undo: SmallVec<[(BalanceKey, Option<Balance<P>>); UNDO_INLINE]> = SmallVec::new();
-        let mut refusal = None;
-
-        for posting in entry.postings() {
-            let key = key_of(posting);
-            undo.push((key, self.balances.get(&key).copied()));
-            if let Err(e) = self.balances.apply(posting) {
-                refusal = Some(JournalError::from(e));
-                break;
-            }
-        }
-        if refusal.is_none()
-            && let Err(e) = self.check_limits(entry, &self.balances)
-        {
-            refusal = Some(e);
-        }
-
-        let Some(refusal) = refusal else {
-            return Ok(());
-        };
-        // Reverse, so the earliest save for a key wins — it is the one that
-        // holds the value from before this entry touched anything.
-        for (key, previous) in undo.into_iter().rev() {
-            match previous {
-                Some(balance) => self.balances.set(key, balance),
-                None => {
-                    self.balances.remove(&key);
-                }
-            }
-        }
-        Err(refusal)
-    }
-
-    /// Enforces every touched account's balance limit against the state the
-    /// entry would leave behind.
-    ///
-    /// Checked on the *resulting* balance rather than posting by posting: an
-    /// entry that dips an account below its limit and back within the same
-    /// booking is one movement, and refusing it would make the answer depend on
-    /// the order the caller happened to list its postings in.
-    ///
-    /// One check per `(account, currency)`, folding **both layers** — see
-    /// [`BalanceLimit::headroom_minor`] for why a reservation counts against a
-    /// limit and why the fold is asymmetric.
-    ///
-    /// Deliberately here rather than in [`Entry::seal`]. Sealing asks whether an
-    /// entry is well formed against master data, which is a question about the
-    /// entry alone; a limit is a question about the *books*, and the same entry
-    /// is legal or not depending on what has already been recorded.
-    fn check_limits(
-        &self,
-        entry: &Entry<Balanced, P>,
-        after: &TrialBalance<P>,
-    ) -> Result<(), JournalError> {
-        let mut checked: BTreeSet<(AccountId, Currency)> = BTreeSet::new();
-        for posting in entry.postings() {
-            if !checked.insert((posting.account, posting.currency)) {
-                continue;
-            }
-            let limit = self.accounts.limit_of(posting.account);
-            if limit.is_unlimited() {
-                continue;
-            }
-            let at = |layer| {
-                after.get_or_zero(&BalanceKey {
-                    account: posting.account,
-                    currency: posting.currency,
-                    layer,
-                })
-            };
-            let (settled, pending) = (at(Layer::Settled), at(Layer::Pending));
-            if let Some(headroom) = limit.headroom_minor(&settled, &pending)
-                && headroom < 0
-            {
-                return Err(JournalError::LimitBreached {
-                    account: posting.account,
-                    currency: posting.currency,
-                    limit,
-                    headroom_minor: headroom,
-                    scale: P,
-                });
-            }
-        }
-        Ok(())
-    }
-
-    /// Enforces the correction rules against what is already recorded.
-    fn check_reversal(
-        &self,
-        entry: &Entry<Balanced, P>,
-        original: EntryId,
-    ) -> Result<(), JournalError> {
-        let Some(target) = self.get(original) else {
-            return Err(JournalError::UnknownOriginal { id: original });
-        };
-        if let Some(existing) = self.reversed_by.get(&original) {
-            return Err(JournalError::AlreadyReversed {
-                id: original,
-                by: *existing,
-            });
-        }
-        if target.reverses().is_some() {
-            return Err(JournalError::ReversalOfReversal { id: original });
-        }
-        if !is_inversion_of(target, entry) {
-            return Err(JournalError::NotAnInversion { id: original });
-        }
-        Ok(())
-    }
-
-    // ── reading ─────────────────────────────────────────────────────────────
-
-    /// Number of recorded entries.
+    /// ```
+    /// # use doubleentry::{AccountKind, Entry, Journal, LedgerId, amount, date, currency::EUR};
+    /// # let mut books = Journal::new(LedgerId::new("example.com/acme")?);
+    /// # books.declare_currency(EUR, 2, date!("2026-01-01"))?;
+    /// # books.open("Assets:Cash", AccountKind::Asset, date!("2026-01-01"))?;
+    /// # books.open("Income:Sales", AccountKind::Income, date!("2026-01-01"))?;
+    /// # books.define_months(2026, 3..=3)?;
+    /// let sale = books.record(
+    ///     Entry::new("sale-1", date!("2026-03-15"))
+    ///         .debit("Assets:Cash", amount!("10.00"), EUR)
+    ///         .credit("Income:Sales", amount!("10.00"), EUR)
+    ///         .memo("for the customer"),
+    /// )?;
+    /// assert_eq!(books.entry(sale.id).map(|entry| entry.parts().postings.len()), Some(2));
+    /// # Ok::<(), doubleentry::Error>(())
+    /// ```
     #[must_use]
-    pub fn len(&self) -> usize {
-        self.entries.len()
+    pub fn entry(&self, id: EntryId) -> Option<EntryRecord<P>> {
+        now(self.reads().entry(id)).ok().flatten()
     }
 
-    /// True when nothing has been recorded.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
-    /// The entries, in log order.
-    #[must_use]
-    pub fn entries(&self) -> &[Entry<Balanced, P>] {
-        &self.entries
-    }
-
-    /// The entry at a log index.
-    #[must_use]
-    pub fn at(&self, index: LogIndex) -> Option<&Entry<Balanced, P>> {
-        self.entries
-            .get(usize::try_from(index.get()).unwrap_or(usize::MAX))
-    }
-
-    /// The entry with a given identifier.
-    #[must_use]
-    pub fn get(&self, id: EntryId) -> Option<&Entry<Balanced, P>> {
-        self.by_id.get(&id).and_then(|i| self.at(*i))
-    }
-
-    /// The log position of an entry.
-    #[must_use]
-    pub fn index_of(&self, id: EntryId) -> Option<LogIndex> {
-        self.by_id.get(&id).copied()
-    }
-
-    /// The entry recorded under an idempotency key.
+    /// The entry recorded under idempotency key `key`.
     ///
-    /// The lookup the key is *for*. The guidance is to derive a key from the
-    /// source transaction — a message id, an external document reference, a
-    /// `(run, line)` pair from a batch import — and the question that follows is
-    /// "did we already book message X?". Rebuilding the entry and re-submitting
-    /// it answers by writing; this answers by asking.
+    /// ```
+    /// use doubleentry::{AccountKind, Entry, Journal, LedgerId, amount, date, currency::EUR};
+    ///
+    /// let mut books = Journal::new(LedgerId::new("example.com/acme")?);
+    /// books.declare_currency(EUR, 2, date!("2026-01-01"))?;
+    /// books.open("Assets:Cash", AccountKind::Asset, date!("2026-01-01"))?;
+    /// books.open("Income:Sales", AccountKind::Income, date!("2026-01-01"))?;
+    /// books.define_months(2026, 3..=3)?;
+    /// let recorded = books.record(
+    ///     Entry::new("invoice-1", date!("2026-03-15"))
+    ///         .debit("Assets:Cash", amount!("10.00"), EUR)
+    ///         .credit("Income:Sales", amount!("10.00"), EUR),
+    /// )?;
+    /// assert_eq!(books.entry_by_key("invoice-1"), books.entry(recorded.id));
+    /// assert_eq!(books.entry_by_key("invoice-2"), None);
+    /// # Ok::<(), doubleentry::Error>(())
+    /// ```
     #[must_use]
-    pub fn get_by_key(&self, key: &IdempotencyKey) -> Option<&Entry<Balanced, P>> {
-        self.index_of_key(key).and_then(|index| self.at(index))
+    pub fn entry_by_key(&self, key: impl AsRef<str>) -> Option<EntryRecord<P>> {
+        now(self.reads().entry_by_key(key.as_ref().as_bytes()))
+            .ok()
+            .flatten()
     }
 
-    /// The log position of the entry recorded under an idempotency key.
+    /// The master data in force of an account, by path or handle.
+    ///
+    /// ```
+    /// use doubleentry::{AccountKind, BalanceLimit, Journal, LedgerId, date};
+    ///
+    /// let mut books = Journal::new(LedgerId::new("example.com/acme")?);
+    /// let wallet = books.open("Liabilities:Wallet", AccountKind::Liability, date!("2026-01-01"))?;
+    /// books.set_limit(wallet, BalanceLimit::NoDebitBalance, date!("2026-01-01"))?;
+    /// let account = books.account("Liabilities:Wallet").expect("opened");
+    /// assert_eq!((account.handle, account.limit), (wallet, BalanceLimit::NoDebitBalance));
+    /// assert!(books.account("Liabilities:Other").is_none());
+    /// # Ok::<(), doubleentry::Error>(())
+    /// ```
     #[must_use]
-    pub fn index_of_key(&self, key: &IdempotencyKey) -> Option<LogIndex> {
-        self.by_key.get(key).map(|(_, index, _)| *index)
+    pub fn account<A>(&self, account: A) -> Option<Account>
+    where
+        A: TryInto<AccountRef>,
+        A::Error: Into<ValueError>,
+    {
+        let account = account.try_into().ok()?;
+        now(self.reads().account(account)).ok().flatten()
     }
 
-    /// The reversal of an entry, if one has been recorded.
+    /// The memo text of entry `id`; `None` without a memo, once erased, or
+    /// for an unknown entry.
+    ///
+    /// ```
+    /// # use doubleentry::{AccountKind, Entry, Journal, LedgerId, amount, date, currency::EUR};
+    /// # let mut books = Journal::new(LedgerId::new("example.com/acme")?);
+    /// # books.declare_currency(EUR, 2, date!("2026-01-01"))?;
+    /// # books.open("Assets:Cash", AccountKind::Asset, date!("2026-01-01"))?;
+    /// # books.open("Income:Sales", AccountKind::Income, date!("2026-01-01"))?;
+    /// # books.define_months(2026, 3..=3)?;
+    /// let sale = books.record(
+    ///     Entry::new("sale-1", date!("2026-03-15"))
+    ///         .debit("Assets:Cash", amount!("10.00"), EUR)
+    ///         .credit("Income:Sales", amount!("10.00"), EUR)
+    ///         .memo("for the customer"),
+    /// )?;
+    /// assert_eq!(books.memo(sale.id).as_deref(), Some("for the customer"));
+    /// books.erase_memo(sale.id)?;
+    /// assert_eq!(books.memo(sale.id), None);
+    /// # Ok::<(), doubleentry::Error>(())
+    /// ```
     #[must_use]
-    pub fn reversal_of(&self, id: EntryId) -> Option<EntryId> {
-        self.reversed_by.get(&id).copied()
+    pub fn memo(&self, id: EntryId) -> Option<String> {
+        self.memo_text(id)
     }
 
-    // ── proofs ──────────────────────────────────────────────────────────────
+    /// The declared exponent of `currency` — the decimal places its amounts
+    /// have and reports print (`0` for JPY) — or `None` while undeclared.
+    /// Write an amount with it through
+    /// [`Amount::display_at`](crate::Amount::display_at).
+    ///
+    /// ```
+    /// use doubleentry::prelude::*;
+    ///
+    /// let mut books = Journal::new(LedgerId::new("example.com/acme")?);
+    /// books.declare_currency(JPY, 0, date!("2026-01-01"))?;
+    /// assert_eq!(books.exponent(JPY), Some(0));
+    /// assert_eq!(books.exponent(EUR), None);
+    /// # Ok::<(), doubleentry::Error>(())
+    /// ```
+    #[must_use]
+    pub fn exponent(&self, currency: Currency) -> Option<u8> {
+        self.state
+            .currency_latest(currency)
+            .map(|latest| latest.value)
+    }
 
-    /// The current tree head.
+    /// The memo text of entry `id`, unless erased.
+    fn memo_text(&self, id: EntryId) -> Option<String> {
+        now(self.reads().memo(id)).ok().flatten()
+    }
+
+    // ── Integrity and proofs ────────────────────────────────────────────────
+
+    /// Replays the whole log through the rule core and compares the result
+    /// with the journal's state.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Integrity`] at the first difference.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "audit", target = "doubleentry", level = "info", skip_all, fields(ledger = %self.id(), records = tracing::field::Empty, outcome = tracing::field::Empty, code = tracing::field::Empty))
+    )]
+    pub fn audit(&self) -> Result<AuditReport, Error> {
+        let result = self.replay();
+        #[cfg(feature = "tracing")]
+        crate::trace::audited(result.as_ref());
+        result
+    }
+
+    /// The audit's replay of every leaf, compared with the journal's state.
+    fn replay(&self) -> Result<AuditReport, Error> {
+        let mut replay = Replayer::new(self.id());
+        for leaf in self.state.leaves() {
+            replay.feed(leaf)?;
+        }
+        Ok(replay.finish_state(&self.state)?)
+    }
+
+    /// The tree head: the log's size and root.
     #[must_use]
     pub fn head(&self) -> TreeHead {
-        self.log.head()
+        self.state.head()
     }
 
-    /// The tree head as of an earlier size.
+    /// The tree head the log had at `size` records: what a proof at that
+    /// size verifies against.
+    ///
+    /// ```
+    /// # use doubleentry::{AccountKind, Entry, Journal, LedgerId, amount, date, currency::EUR};
+    /// # let mut books = Journal::new(LedgerId::new("example.com/acme")?);
+    /// # books.declare_currency(EUR, 2, date!("2026-01-01"))?;
+    /// # books.open("Assets:Cash", AccountKind::Asset, date!("2026-01-01"))?;
+    /// # books.open("Income:Sales", AccountKind::Income, date!("2026-01-01"))?;
+    /// # books.define_months(2026, 3..=3)?;
+    /// let sale = books.record(
+    ///     Entry::new("sale-1", date!("2026-03-15"))
+    ///         .debit("Assets:Cash", amount!("10.00"), EUR)
+    ///         .credit("Income:Sales", amount!("10.00"), EUR)
+    ///         .memo("for the customer"),
+    /// )?;
+    /// let then = books.head();
+    /// books.define_months(2026, 4..=4)?;
+    /// assert_eq!(books.head_at(then.size)?, then);
+    /// # Ok::<(), doubleentry::Error>(())
+    /// ```
     ///
     /// # Errors
     ///
-    /// Returns [`ProofError::SizeOutOfRange`] for a size beyond the log.
-    pub fn head_at(&self, size: u64) -> Result<TreeHead, ProofError> {
-        self.log.head_at(size)
+    /// [`Error::Query`] for a size beyond the head.
+    pub fn head_at(&self, size: u64) -> Result<TreeHead, Error> {
+        now(self.reads().head_at(size))
     }
 
-    /// Proves that the entry at `index` is committed to by the current head.
+    /// The proof that entry `id` is in the log, against [`head`](Self::head).
     ///
     /// # Errors
     ///
-    /// Returns [`ProofError::IndexOutOfRange`] for a position beyond the log.
-    pub fn prove_inclusion(&self, index: LogIndex) -> Result<InclusionProof, ProofError> {
-        self.log.inclusion_proof(index.get())
+    /// [`Error::Query`] when no entry has the id.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "prove", target = "doubleentry", level = "debug", skip_all, fields(ledger = %self.id(), kind = "entry", size = tracing::field::Empty))
+    )]
+    pub fn prove_entry(&self, id: EntryId) -> Result<InclusionProof, Error> {
+        now(self.reads().inclusion(id, None))
     }
 
-    /// Proves that the entry at `index` was committed to by the head at `size`.
+    /// The proof that entry `id` is in the log as it was at `size` records,
+    /// against [`head_at(size)`](Self::head_at).
     ///
-    /// What an auditor holding an archived head can actually check. Their head
-    /// is not the current one, and the current root says nothing about it, so a
-    /// proof against the present log is no use to them. Pair the result with
-    /// [`head_at`](Self::head_at), or with the head they archived — the two must
-    /// agree, and [`InclusionProof::verify`] is what says so.
+    /// ```
+    /// use doubleentry::{AccountKind, Entry, Journal, LedgerId, amount, date, currency::EUR};
+    ///
+    /// let mut books = Journal::new(LedgerId::new("example.com/acme")?);
+    /// books.declare_currency(EUR, 2, date!("2026-01-01"))?;
+    /// books.open("Assets:Cash", AccountKind::Asset, date!("2026-01-01"))?;
+    /// books.open("Income:Sales", AccountKind::Income, date!("2026-01-01"))?;
+    /// books.define_months(2026, 3..=3)?;
+    /// let sale = books.record(
+    ///     Entry::new("sale-1", date!("2026-03-15"))
+    ///         .debit("Assets:Cash", amount!("10.00"), EUR)
+    ///         .credit("Income:Sales", amount!("10.00"), EUR),
+    /// )?;
+    /// let then = books.head();
+    /// books.define_months(2026, 4..=4)?;
+    /// let proof = books.prove_entry_at(sale.id, then.size)?;
+    /// assert_eq!(books.head_at(then.size)?, then);
+    /// assert_eq!((proof.index, proof.size), (sale.position, then.size));
+    /// // The old head is a prefix of the new one.
+    /// books.prove_consistency(then.size, books.head().size)?.verify(&then, &books.head())?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     ///
     /// # Errors
     ///
-    /// Returns [`ProofError::SizeOutOfRange`] for a size beyond the log, and
-    /// [`ProofError::IndexOutOfRange`] for an entry the log had not yet reached
-    /// at that size.
-    pub fn prove_inclusion_at(
-        &self,
-        index: LogIndex,
-        size: u64,
-    ) -> Result<InclusionProof, ProofError> {
-        self.log.inclusion_proof_at(index.get(), size)
+    /// [`Error::Query`] when no entry had the id at that size, or for a size
+    /// beyond the head.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "prove", target = "doubleentry", level = "debug", skip_all, fields(ledger = %self.id(), kind = "entry", size = tracing::field::Empty))
+    )]
+    pub fn prove_entry_at(&self, id: EntryId, size: u64) -> Result<InclusionProof, Error> {
+        now(self.reads().inclusion(id, Some(size)))
     }
 
-    /// Proves that the log at `old_size` is a prefix of the current log.
+    /// The proof that the log at `new_size` records extends the log at
+    /// `old_size`: nothing recorded by `old_size` was changed or removed.
     ///
-    /// A proof from `old_size == 0` is **refused**, not returned: every log
-    /// extends the empty tree, so it would constrain nothing about the newer one
-    /// and its `true` would mean nothing. See
-    /// [`ConsistencyProof::verify`](crate::ConsistencyProof::verify).
+    /// ```
+    /// # use doubleentry::{AccountKind, Entry, Journal, LedgerId, amount, date, currency::EUR};
+    /// # let mut books = Journal::new(LedgerId::new("example.com/acme")?);
+    /// # books.declare_currency(EUR, 2, date!("2026-01-01"))?;
+    /// # books.open("Assets:Cash", AccountKind::Asset, date!("2026-01-01"))?;
+    /// # books.open("Income:Sales", AccountKind::Income, date!("2026-01-01"))?;
+    /// # books.define_months(2026, 3..=3)?;
+    /// let sale = books.record(
+    ///     Entry::new("sale-1", date!("2026-03-15"))
+    ///         .debit("Assets:Cash", amount!("10.00"), EUR)
+    ///         .credit("Income:Sales", amount!("10.00"), EUR)
+    ///         .memo("for the customer"),
+    /// )?;
+    /// let then = books.head();
+    /// books.define_months(2026, 4..=4)?;
+    /// let proof = books.prove_consistency(then.size, books.head().size)?;
+    /// assert!(proof.verify(&then, &books.head()).is_ok());
+    /// # Ok::<(), doubleentry::Error>(())
+    /// ```
     ///
     /// # Errors
     ///
-    /// Returns [`ProofError::SizeOutOfRange`] for a size beyond the log.
-    pub fn prove_consistency(&self, old_size: u64) -> Result<ConsistencyProof, ProofError> {
-        self.log.consistency_proof(old_size)
-    }
-
-    /// Proves that the log at `old_size` is a prefix of the log at `new_size`.
-    ///
-    /// The general form: two auditors holding different archived heads, neither
-    /// of them current, can be shown that one is a prefix of the other without
-    /// either learning the log's present size.
-    ///
-    /// A proof from `old_size == 0` is **refused**, not returned: every log
-    /// extends the empty tree, so it would constrain nothing about the newer one
-    /// and its `true` would mean nothing. See
-    /// [`ConsistencyProof::verify`](crate::ConsistencyProof::verify).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ProofError::SizeOutOfRange`] if `new_size` is beyond the log or
-    /// `old_size` is beyond `new_size`.
-    pub fn prove_consistency_between(
+    /// [`Error::Query`] for an old size of 0 or above the new one, or a new
+    /// size beyond the head.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "prove", target = "doubleentry", level = "debug", skip_all, fields(ledger = %self.id(), kind = "consistency", size = tracing::field::Empty))
+    )]
+    pub fn prove_consistency(
         &self,
         old_size: u64,
         new_size: u64,
-    ) -> Result<ConsistencyProof, ProofError> {
-        self.log.consistency_proof_between(old_size, new_size)
+    ) -> Result<ConsistencyProof, Error> {
+        now(self.reads().consistency(old_size, new_size))
     }
 
-    /// Recomputes the Merkle log from the stored entries and compares it.
-    ///
-    /// Checks three things, because they can fail independently: the log commits
-    /// to as many leaves as there are entries, its stored nodes are internally
-    /// consistent — every interior node the hash of the two beneath it — and the
-    /// tree it describes is the one the entries produce.
-    ///
-    /// The last is the one the others cannot substitute for. A tree can be
-    /// perfectly well formed and be a tree over different leaves, so this
-    /// rebuilds from the entries and compares.
-    #[must_use]
-    pub fn verify_log(&self) -> bool {
-        if self.log.len() != self.entries.len() as u64 {
-            return false;
-        }
-        if !self.log.verify_structure() {
-            return false;
-        }
-        let recomputed =
-            MerkleLog::from_leaves(self.entries.iter().map(Entry::content_hash).collect());
-        recomputed.root() == self.log.root()
+    /// Every leaf with its side data (memo text and salt, draft fingerprint),
+    /// in position order — what [`from_log`](Self::from_log) takes.
+    pub fn leaves(&self) -> impl Iterator<Item = ReplayLeaf<'_>> {
+        self.state.leaves()
     }
 
-    // ── balances ────────────────────────────────────────────────────────────
+    // ── Holds ───────────────────────────────────────────────────────────────
 
-    /// The trial balance over the postings a query selects.
-    ///
-    /// [`BalanceQuery::all`] is the whole ledger and costs a clone of the
-    /// maintained totals; anything narrower re-folds. See [`BalanceQuery`] for
-    /// why a log prefix and a date range are different questions, and
-    /// [`DateBasis`](crate::DateBasis) for which date the range applies to.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`MoneyError::Overflow`] if accumulating overflows, which cannot
-    /// happen for a subset of a journal that accepted the entries in the first
-    /// place.
-    pub fn trial_balance(&self, query: BalanceQuery<'_>) -> Result<TrialBalance<P>, MoneyError> {
-        if query.is_unrestricted() {
-            return Ok(self.balances.clone());
-        }
-        let mut tb = TrialBalance::new();
-        for (index, entry) in self.entries.iter().enumerate() {
-            if !query.includes_entry(index as u64, entry.dates()) {
-                continue;
-            }
-            for posting in entry.postings() {
-                if query.includes_posting(posting) {
-                    tb.apply(posting)?;
-                }
-            }
-        }
-        Ok(tb)
-    }
-
-    /// The balance of one account, currency and layer over the postings a query
-    /// selects.
-    ///
-    /// Reading the current balance is a lookup. Anything narrower replays that
-    /// key's postings, which is linear in how much has moved through the account
-    /// rather than in the size of the journal.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`MoneyError::Overflow`] if accumulating overflows.
-    pub fn balance(
-        &self,
-        key: &BalanceKey,
-        query: BalanceQuery<'_>,
-    ) -> Result<Balance<P>, MoneyError> {
-        if query.is_unrestricted() {
-            return Ok(self.balances.get_or_zero(key));
-        }
-        let mut balance = Balance::ZERO;
-        for site in self.sites.get(key).into_iter().flatten() {
-            let Some((entry, posting)) = self.resolve(*site) else {
-                continue;
-            };
-            if query.includes_entry(site.index.get(), entry.dates())
-                && query.includes_posting(posting)
-            {
-                balance.add(posting.direction, posting.amount)?;
-            }
-        }
-        Ok(balance)
-    }
-
-    /// The trial balance a query selects, folded up the account tree.
-    ///
-    /// The hierarchical report — a balance sheet, an income statement, a
-    /// departmental rollup. See [`Rollup`] for what a node's figure means and
-    /// why grouping nodes are inferred rather than required.
-    ///
-    /// One `(currency, layer)` per report, because a parent cannot hold the sum
-    /// of its children in two currencies; [`Journal::currencies`] enumerates
-    /// them.
+    /// The hold opened by entry `id` and where it stands: open, or posted,
+    /// voided or expired by the entry that resolved it. `None` when `id` is
+    /// not a hold.
     ///
     /// ```
-    /// # use doubleentry::period::LedgerId;
-    /// # use doubleentry::{Amount, BalanceQuery, Currency, Entry, EntryId, IdempotencyKey, Journal, Layer};
-    /// # use time::macros::date;
-    /// # type Eur = Amount<2>;
-    /// # let mut journal = Journal::<2>::new(LedgerId::new("acme")?);
-    /// # let bank = journal.register_path("Assets:Bank:Main", date!(2026 - 01 - 01))?;
-    /// # let cash = journal.register_path("Assets:Cash", date!(2026 - 01 - 01))?;
-    /// # journal.record(
-    /// #     Entry::new(EntryId::generate(), IdempotencyKey::new(b"k".to_vec())?, date!(2026 - 03 - 01))
-    /// #         .debit(bank, Eur::parse("1000.00")?, Currency::EUR)
-    /// #         .credit(cash, Eur::parse("1000.00")?, Currency::EUR))?;
-    /// let sheet = journal.rollup(BalanceQuery::all(), Currency::EUR, Layer::Settled)?;
-    /// for node in sheet.nodes() {
-    ///     println!("{:indent$}{} {}", "", node.path, node.subtree.signed_net()?,
-    ///              indent = (node.depth() - 1) * 2);
-    /// }
+    /// use doubleentry::prelude::*;
+    /// use doubleentry::{HoldStatus, PostAmount};
+    ///
+    /// let mut books = Journal::new(LedgerId::new("example.com/payments")?);
+    /// books.declare_currency(EUR, 2, date!("2026-01-01"))?;
+    /// books.open("Liabilities:Wallets:alice", AccountKind::Liability, date!("2026-01-01"))?;
+    /// books.open("Liabilities:Card:clearing", AccountKind::Liability, date!("2026-01-01"))?;
+    /// books.define_months(2026, 11..=11)?;
+    /// let hold = books.record(
+    ///     Entry::open_hold("auth-4711", date!("2026-11-20"))
+    ///         .debit("Liabilities:Wallets:alice", amount!("100.00"), EUR)
+    ///         .credit("Liabilities:Card:clearing", amount!("100.00"), EUR),
+    /// )?;
+    /// let void = books.record(Entry::void_hold("void-4711", date!("2026-11-21"), hold.id))?;
+    /// let state = books.hold(hold.id).ok_or("no hold")?;
+    /// assert_eq!(state.status, HoldStatus::Voided { by: void.id });
+    /// assert!(books.hold(void.id).is_none()); // a resolution is no hold
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
+    #[must_use]
+    pub fn hold(&self, id: EntryId) -> Option<HoldState<P>> {
+        now(self.reads().hold(id)).ok().flatten()
+    }
+
+    /// The open holds that may be expired on `as_of` — their expiry date is
+    /// on or before it — ordered by (expiry date, position), one page at a
+    /// time: what a scheduler books an [`Entry::expire_hold`] for. Nothing
+    /// expires by itself, and no clock is read. A limit outside
+    /// `1..=1000` is clamped into it.
+    ///
+    /// ```
+    /// use doubleentry::prelude::*;
+    /// use doubleentry::PageRead;
+    ///
+    /// let mut books = Journal::new(LedgerId::new("example.com/payments")?);
+    /// books.declare_currency(EUR, 2, date!("2026-01-01"))?;
+    /// books.open("Liabilities:Wallets:alice", AccountKind::Liability, date!("2026-01-01"))?;
+    /// books.open("Liabilities:Card:clearing", AccountKind::Liability, date!("2026-01-01"))?;
+    /// books.define_months(2026, 11..=12)?;
+    /// let hold = books.record(
+    ///     Entry::open_hold("auth-4711", date!("2026-11-20"))
+    ///         .expires(date!("2026-11-30"))
+    ///         .debit("Liabilities:Wallets:alice", amount!("100.00"), EUR)
+    ///         .credit("Liabilities:Card:clearing", amount!("100.00"), EUR),
+    /// )?;
+    /// assert!(books.holds_due(date!("2026-11-29"), PageRead::first(50)).items.is_empty());
+    /// let due = books.holds_due(date!("2026-11-30"), PageRead::first(50));
+    /// assert_eq!(due.items.iter().map(|h| h.id).collect::<Vec<_>>(), [hold.id]);
+    ///
+    /// books.record(Entry::expire_hold("expire-4711", date!("2026-11-30"), hold.id))?;
+    /// assert!(books.holds_due(date!("2026-12-31"), PageRead::first(50)).items.is_empty());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    #[must_use]
+    pub fn holds_due(
+        &self,
+        as_of: Date,
+        page: PageRead<HoldCursor>,
+    ) -> Page<HoldState<P>, HoldCursor> {
+        let size = self.head().size;
+        // The state answers every page; the fallback is never taken.
+        now(self.reads().holds_due(as_of, page)).unwrap_or(Page {
+            items: Vec::new(),
+            next: None,
+            size,
+            through: size,
+        })
+    }
+
+    // ── Reports and export ──────────────────────────────────────────────────
+
+    /// The balance of `account` in `currency`: the gross debit, credit and
+    /// count of the postings `query` selects.
+    ///
+    /// ```
+    /// use doubleentry::prelude::*;
+    ///
+    /// let mut books = Journal::new(LedgerId::new("example.com/acme")?);
+    /// books.declare_currency(EUR, 2, date!("2026-01-01"))?;
+    /// books.open("Assets:Bank", AccountKind::Asset, date!("2026-01-01"))?;
+    /// books.open("Income:Sales", AccountKind::Income, date!("2026-01-01"))?;
+    /// books.define_months(2026, 3..=3)?;
+    /// let sale = books.record(
+    ///     Entry::new("sale-1", date!("2026-03-15"))
+    ///         .debit("Assets:Bank", amount!("100.00"), EUR)
+    ///         .credit("Income:Sales", amount!("100.00"), EUR),
+    /// )?;
+    /// assert_eq!(books.balance("Assets:Bank", EUR, &BalanceQuery::all())?.net(), amount!("100.00"));
+    /// let before = BalanceQuery::through_position(sale.position - 1);
+    /// assert!(books.balance("Assets:Bank", EUR, &before)?.is_zero());
+    /// # Ok::<(), Error>(())
+    /// ```
     ///
     /// # Errors
     ///
-    /// Returns [`MoneyError::Overflow`] if folding overflows.
-    pub fn rollup(
+    /// [`Error::Query`] for an invalid query or an account not registered
+    /// in the prefix read; [`Error::Integrity`] for a pinned head this log
+    /// does not have.
+    pub fn balance<A>(
         &self,
-        query: BalanceQuery<'_>,
+        account: A,
         currency: Currency,
-        layer: Layer,
-    ) -> Result<Rollup<P>, MoneyError> {
-        Rollup::of(&self.trial_balance(query)?, &self.accounts, currency, layer)
+        query: &BalanceQuery,
+    ) -> Result<Balance<P>, Error>
+    where
+        A: TryInto<AccountRef> + fmt::Display,
+        A::Error: Into<ValueError>,
+    {
+        now(self
+            .reads()
+            .balance(&AccountName::new(account), currency, query))
     }
 
-    /// Every value an axis takes across the journal, in order.
+    /// The trial balance: one row per (account, currency) with a posting
+    /// `query` selects.
     ///
-    /// What a report needs before it can slice by that axis: the values are the
-    /// caller's, the engine never interprets one, and nothing else knows which
-    /// ones are actually in use.
+    /// ```
+    /// use doubleentry::prelude::*;
     ///
-    /// Postings carrying no value for the axis are **not** represented here.
-    /// Reach them with [`DimensionFilter::missing`](crate::DimensionFilter::missing),
-    /// and do reach them — a set of slices that ignores the unattributed
-    /// postings does not add up to the trial balance.
-    #[must_use]
-    pub fn dimension_values(&self, axis: &str) -> Vec<Label> {
-        let mut out: BTreeSet<&Label> = BTreeSet::new();
-        for entry in &self.entries {
-            for posting in entry.postings() {
-                if let Some(value) = posting.dimensions.get(axis) {
-                    out.insert(value);
-                }
-            }
-        }
-        out.into_iter().cloned().collect()
-    }
-
-    /// Checks that debits equal credits across the whole journal.
-    ///
-    /// Every entry balances individually, so this must hold; running it is a
-    /// direct test that the maintained balances and the invariant have not
-    /// drifted apart.
+    /// let mut books = Journal::new(LedgerId::new("example.com/acme")?);
+    /// books.declare_currency(EUR, 2, date!("2026-01-01"))?;
+    /// books.open("Assets:Bank", AccountKind::Asset, date!("2026-01-01"))?;
+    /// books.open("Income:Sales", AccountKind::Income, date!("2026-01-01"))?;
+    /// books.define_months(2026, 3..=3)?;
+    /// books.record(
+    ///     Entry::new("sale-1", date!("2026-03-15"))
+    ///         .debit("Assets:Bank", amount!("100.00"), EUR)
+    ///         .credit("Income:Sales", amount!("100.00"), EUR),
+    /// )?;
+    /// let trial = books.trial_balance(&BalanceQuery::through(date!("2026-03-31")))?;
+    /// assert!(trial.is_balanced() && trial.rows().len() == 2);
+    /// # Ok::<(), Error>(())
+    /// ```
     ///
     /// # Errors
     ///
-    /// Returns [`MoneyError::Overflow`] if totalling overflows.
-    pub fn verify_balanced(&self) -> Result<bool, MoneyError> {
-        let tb = self.trial_balance(BalanceQuery::all())?;
-        for currency in tb.currencies() {
-            for layer in [Layer::Settled, Layer::Pending] {
-                if !tb.totals(currency, layer)?.is_balanced() {
-                    return Ok(false);
-                }
-            }
-        }
-        Ok(true)
+    /// As [`balance`](Self::balance), and [`Error::Integrity`] for a stored
+    /// account record that does not decode.
+    pub fn trial_balance(&self, query: &BalanceQuery) -> Result<TrialBalance<P>, Error> {
+        now(self.reads().trial_balance(query))
     }
 
-    /// Recomputes the maintained balances from the entries and compares them.
+    /// The statement of `account` in `currency` over `query`'s window: the
+    /// opening balance, every line in date order with a running balance,
+    /// and the closing balance.
     ///
-    /// The incremental trial balance is derived state, like the Merkle subtree
-    /// stack. This proves it has not drifted from the entries it summarises.
+    /// ```
+    /// use doubleentry::prelude::*;
+    ///
+    /// let mut books = Journal::new(LedgerId::new("example.com/acme")?);
+    /// books.declare_currency(EUR, 2, date!("2026-01-01"))?;
+    /// books.open("Assets:Bank", AccountKind::Asset, date!("2026-01-01"))?;
+    /// books.open("Income:Sales", AccountKind::Income, date!("2026-01-01"))?;
+    /// books.define_months(2026, 3..=3)?;
+    /// books.record(
+    ///     Entry::new("sale-1", date!("2026-03-15"))
+    ///         .debit("Assets:Bank", amount!("100.00"), EUR)
+    ///         .credit("Income:Sales", amount!("100.00"), EUR),
+    /// )?;
+    /// let march = books.statement("Assets:Bank", EUR, &BalanceQuery::period("2026-03"))?;
+    /// assert_eq!((march.opening.net(), march.closing.net()), (amount!("0.00"), amount!("100.00")));
+    /// # Ok::<(), Error>(())
+    /// ```
     ///
     /// # Errors
     ///
-    /// Returns [`MoneyError::Overflow`] if the recomputation overflows.
-    pub fn verify_balances(&self) -> Result<bool, MoneyError> {
-        let mut recomputed = TrialBalance::new();
-        for entry in &self.entries {
-            for posting in entry.postings() {
-                recomputed.apply(posting)?;
-            }
-        }
-        Ok(recomputed == self.balances)
-    }
-
-    /// Currencies present in the journal, in deterministic order.
-    #[must_use]
-    pub fn currencies(&self) -> Vec<Currency> {
-        self.balances.currencies()
-    }
-
-    // ── statements ──────────────────────────────────────────────────────────
-
-    /// Every posting touching `key`, in log order, with the running balance
-    /// after each.
-    ///
-    /// This is the account statement a reader actually wants: a trial balance
-    /// says where an account ended up, and says nothing about how it got there.
-    ///
-    /// Lines are in **log order**, which is the order the movements were
-    /// recorded, not the order they were booked. It is the order a
-    /// [`PostingCursor`](crate::PostingCursor) pages by and the only one that is
-    /// stable as the journal grows.
-    ///
-    /// The running balance starts at
-    /// [`statement_opening`](Self::statement_opening) — everything booked
-    /// *before* the query's window — and then adds the lines. So
-    /// `opening + movements` is the last line's `running`, whatever order the
-    /// entries happened to arrive in.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`MoneyError::Overflow`] if the running balance overflows.
-    pub fn statement(
+    /// As [`balance`](Self::balance).
+    pub fn statement<A>(
         &self,
-        key: &BalanceKey,
-        query: BalanceQuery<'_>,
-    ) -> Result<Vec<StatementLine<P>>, MoneyError> {
-        let mut running = self.statement_opening(key, query, None)?;
-        let mut out = Vec::new();
-        for site in self.sites.get(key).into_iter().flatten() {
-            let Some((entry, posting)) = self.resolve(*site) else {
-                continue;
-            };
-            if !query.includes_entry(site.index.get(), entry.dates())
-                || !query.includes_posting(posting)
-            {
-                continue;
-            }
-            running.add(posting.direction, posting.amount)?;
-            out.push(StatementLine {
-                index: site.index,
-                posting: PostingRef::new(entry.id(), site.posting),
-                booking_date: entry.booking_date(),
-                value_date: entry.value_date(),
-                direction: posting.direction,
-                amount: posting.amount,
-                running,
-                kind: entry.kind().cloned(),
-            });
-        }
-        Ok(out)
+        account: A,
+        currency: Currency,
+        query: &BalanceQuery,
+    ) -> Result<Statement<P>, Error>
+    where
+        A: TryInto<AccountRef> + fmt::Display,
+        A::Error: Into<ValueError>,
+    {
+        now(self
+            .reads()
+            .statement(&AccountName::new(account), currency, query))
     }
 
-    /// The balance a statement page opens at.
+    /// The trial balance of `currency` folded up the account tree.
     ///
-    /// Two disjoint sets, added together — see
-    /// [`StatementPage::opening`](crate::StatementPage::opening):
+    /// ```
+    /// use doubleentry::prelude::*;
     ///
-    /// 1. Everything [`BalanceQuery::opening`] selects: the postings this query
-    ///    narrows to that were booked **before** its window. Defined by date, so
-    ///    it does not depend on the order the entries were recorded in.
-    /// 2. The statement's own lines up to and including `after`, which is what
-    ///    the earlier pages already showed.
-    ///
-    /// `after` is the cursor position the page resumes from, so `None` — a page
-    /// starting at the beginning — gives the figure the window opened at. A
-    /// cursor past the last line gives the figure it closed at, which is what
-    /// "no activity this period" should read as.
+    /// let mut books = Journal::new(LedgerId::new("example.com/acme")?);
+    /// books.declare_currency(EUR, 2, date!("2026-01-01"))?;
+    /// books.open("Assets:Bank:Main", AccountKind::Asset, date!("2026-01-01"))?;
+    /// books.open("Income:Sales", AccountKind::Income, date!("2026-01-01"))?;
+    /// books.define_months(2026, 3..=3)?;
+    /// books.record(
+    ///     Entry::new("sale-1", date!("2026-03-15"))
+    ///         .debit("Assets:Bank:Main", amount!("100.00"), EUR)
+    ///         .credit("Income:Sales", amount!("100.00"), EUR),
+    /// )?;
+    /// let sheet = books.rollup(EUR, &BalanceQuery::all())?;
+    /// assert_eq!(sheet.roots().count(), 2); // Assets, Income
+    /// # Ok::<(), Error>(())
+    /// ```
     ///
     /// # Errors
     ///
-    /// Returns [`MoneyError::Overflow`] if accumulating overflows.
-    pub fn statement_opening(
+    /// As [`trial_balance`](Self::trial_balance), and [`Error::Query`] when
+    /// a subtree total does not fit an amount.
+    pub fn rollup(&self, currency: Currency, query: &BalanceQuery) -> Result<Rollup<P>, Error> {
+        now(self.reads().rollup(currency, query))
+    }
+
+    /// The open items of `account` in `currency`: the postings `query`
+    /// selects with an amount not offset by clearings (those dated on or
+    /// before the window's end, and not reset by then), by position.
+    ///
+    /// ```
+    /// use doubleentry::prelude::*;
+    ///
+    /// let mut books = Journal::new(LedgerId::new("example.com/acme")?);
+    /// books.declare_currency(EUR, 2, date!("2026-01-01"))?;
+    /// books.open("Assets:Receivables", AccountKind::Asset, date!("2026-01-01"))?;
+    /// books.open("Income:Sales", AccountKind::Income, date!("2026-01-01"))?;
+    /// books.open("Assets:Bank", AccountKind::Asset, date!("2026-01-01"))?;
+    /// books.define_months(2026, 3..=3)?;
+    /// let invoice = books.record(
+    ///     Entry::new("invoice-1", date!("2026-03-01"))
+    ///         .debit("Assets:Receivables", amount!("119.00"), EUR)
+    ///         .credit("Income:Sales", amount!("119.00"), EUR),
+    /// )?;
+    /// let payment = books.record(
+    ///     Entry::new("payment-1", date!("2026-03-10"))
+    ///         .debit("Assets:Bank", amount!("100.00"), EUR)
+    ///         .credit("Assets:Receivables", amount!("100.00"), EUR),
+    /// )?;
+    /// books.clear(
+    ///     "clear-1",
+    ///     PostingRef::at(invoice.id, 0),
+    ///     PostingRef::at(payment.id, 1),
+    ///     amount!("100.00"),
+    ///     date!("2026-03-10"),
+    /// )?;
+    /// let open = books.open_items("Assets:Receivables", EUR, &BalanceQuery::all())?;
+    /// assert_eq!(open.len(), 1);
+    /// assert_eq!(open[0].residual, amount!("19.00"));
+    /// # Ok::<(), Error>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// As [`balance`](Self::balance).
+    pub fn open_items<A>(
         &self,
-        key: &BalanceKey,
-        query: BalanceQuery<'_>,
-        after: Option<PostingPosition>,
-    ) -> Result<Balance<P>, MoneyError> {
-        let carried = query.opening();
-        let mut balance = Balance::ZERO;
-        // Nothing to carry in and no page before this one, so the answer is zero
-        // without reading a posting — which is every unscoped statement.
-        if carried.is_none() && after.is_none() {
-            return Ok(balance);
-        }
-        for site in self.sites.get(key).into_iter().flatten() {
-            let Some((entry, posting)) = self.resolve(*site) else {
-                continue;
-            };
-            let dates = entry.dates();
-            let index = site.index.get();
-
-            let carried_in = carried
-                .is_some_and(|q| q.includes_entry(index, dates) && q.includes_posting(posting));
-            let already_shown = after.is_some_and(|after| {
-                PostingPosition::new(site.index, site.posting) <= after
-                    && query.includes_entry(index, dates)
-                    && query.includes_posting(posting)
-            });
-            if carried_in || already_shown {
-                balance.add(posting.direction, posting.amount)?;
-            }
-        }
-        Ok(balance)
+        account: A,
+        currency: Currency,
+        query: &BalanceQuery,
+    ) -> Result<Vec<OpenItem<P>>, Error>
+    where
+        A: TryInto<AccountRef> + fmt::Display,
+        A::Error: Into<ValueError>,
+    {
+        now(self
+            .reads()
+            .open_items(&AccountName::new(account), currency, query))
     }
 
-    /// References to every posting on `key`, in log order.
-    #[must_use]
-    pub fn postings_on(&self, key: &BalanceKey) -> Vec<PostingRef> {
-        self.sites
-            .get(key)
-            .into_iter()
-            .flatten()
-            .filter_map(|site| {
-                self.at(site.index)
-                    .map(|entry| PostingRef::new(entry.id(), site.posting))
-            })
-            .collect()
-    }
-
-    fn resolve(&self, site: Site) -> Option<(&Entry<Balanced, P>, &Posting<P>)> {
-        let entry = self.at(site.index)?;
-        let posting = entry.postings().get(usize::from(site.posting))?;
-        Some((entry, posting))
-    }
-
-    // ── clearing ────────────────────────────────────────────────────────────
-
-    /// Records that a set of postings offset one another.
+    /// Checks one balance assertion.
+    ///
+    /// ```
+    /// use doubleentry::prelude::*;
+    /// use doubleentry::{report::{AssertAt, BalanceAssertion}};
+    ///
+    /// let mut books = Journal::new(LedgerId::new("example.com/acme")?);
+    /// books.declare_currency(EUR, 2, date!("2026-01-01"))?;
+    /// books.open("Assets:Bank", AccountKind::Asset, date!("2026-01-01"))?;
+    /// books.open("Income:Sales", AccountKind::Income, date!("2026-01-01"))?;
+    /// books.define_months(2026, 3..=3)?;
+    /// let sale = books.record(
+    ///     Entry::new("sale-1", date!("2026-03-15"))
+    ///         .debit("Assets:Bank", amount!("100.00"), EUR)
+    ///         .credit("Income:Sales", amount!("100.00"), EUR),
+    /// )?;
+    /// let claim = BalanceAssertion::new("Assets:Bank", EUR, AssertAt::Position(sale.position), amount!("100.00"));
+    /// assert!(books.check_assertion(&claim)?.is_held());
+    /// # Ok::<(), Error>(())
+    /// ```
     ///
     /// # Errors
     ///
-    /// Returns [`ClearingError`] when the clearing breaks one of its rules.
-    pub fn clear(&mut self, clearing: Clearing<P>) -> Result<(), JournalError> {
-        // Split the borrow: the register needs to read postings while mutating
-        // its own state, so resolve against a snapshot of the entry index.
-        let lookup = PostingIndex {
-            by_id: &self.by_id,
-            entries: &self.entries,
-        };
-        self.clearings.clear(clearing, &lookup)?;
-        Ok(())
-    }
-
-    /// Releases a clearing, reopening the items it had assigned.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ClearingError`] when the clearing is unknown or already reset.
-    pub fn reset_clearing(&mut self, id: ClearingId, on: Date) -> Result<(), JournalError> {
-        self.clearings.reset(id, on)?;
-        Ok(())
-    }
-
-    /// The clearing register.
-    #[must_use]
-    pub fn clearings(&self) -> &ClearingRegister<P> {
-        &self.clearings
-    }
-
-    /// Postings on `key` with something still outstanding.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ClearingError`] if a recorded clearing references a posting
-    /// this journal does not hold, which would be a bug in this crate.
-    pub fn open_items(&self, key: &BalanceKey) -> Result<Vec<OpenItem<P>>, JournalError> {
-        // Straight from `sites`, which is maintained in log order — so the
-        // candidates arrive oldest first and carry the position that says so.
-        let candidates: Vec<(PostingPosition, PostingRef)> = self
-            .sites
-            .get(key)
-            .into_iter()
-            .flatten()
-            .filter_map(|site| {
-                self.at(site.index).map(|entry| {
-                    (
-                        PostingPosition::new(site.index, site.posting),
-                        PostingRef::new(entry.id(), site.posting),
-                    )
-                })
-            })
-            .collect();
-        let lookup = PostingIndex {
-            by_id: &self.by_id,
-            entries: &self.entries,
-        };
-        Ok(self.clearings.open_items(candidates, &lookup)?)
-    }
-
-    // ── periods and seals ───────────────────────────────────────────────────
-
-    /// Smallest index range containing the period's entries, and how many there
-    /// are.
-    ///
-    /// Entries are appended in recording order, not booking-date order, so a
-    /// period's entries need not be contiguous — hence the separate count.
-    fn coverage(&self, start: Date, end: Date) -> PeriodCoverage {
-        let mut coverage = PeriodCoverage::EMPTY;
-        for (i, entry) in self.entries.iter().enumerate() {
-            let date = entry.booking_date();
-            if date >= start && date <= end {
-                let index = i as u64;
-                coverage.first_index.get_or_insert(index);
-                coverage.last_index = Some(index);
-                coverage.entry_count = coverage.entry_count.saturating_add(1);
-            }
-        }
-        coverage
-    }
-
-    /// Seals a closing period, committing to its entries and closing balances.
-    ///
-    /// The preconditions are [`PeriodCalendar::check_sealable`]'s: the period is
-    /// defined, it is in [`PeriodState::Closing`], and it is the next one due in
-    /// date order. The last of those is what makes the closing balance a stable
-    /// claim — it is cumulative through the period's last day, so an earlier
-    /// period still open could restate it afterwards with a perfectly ordinary
-    /// booking.
-    ///
-    /// The seal commits to three things: the log's tree head, the period's
-    /// closing trial balance, and the account registry those balances are keyed
-    /// on — see [`Seal::accounts`] for why the last one is not optional.
-    ///
-    /// On success the period advances to [`PeriodState::Sealed`] and the
-    /// calendar's watermark moves with it, freezing every date up to and
-    /// including the period's last. The seal is appended to the chain *first*,
-    /// so a seal the chain refuses cannot leave a period marked sealed with
-    /// nothing sealing it.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`JournalError::Period`] when the period cannot be sealed, and
-    /// [`JournalError::Seal`] when the seal does not chain onto the last one.
-    pub fn seal_period(&mut self, period: &PeriodId) -> Result<Seal, JournalError> {
-        let definition = self.calendar.check_sealable(period)?;
-        let (start, end) = (definition.start, definition.end);
-
-        let coverage = self.coverage(start, end);
-        let closing = self.trial_balance(BalanceQuery::through(end))?;
-        let seal = Seal::build(
-            self.ledger.clone(),
-            period.clone(),
-            coverage,
-            // The log itself, not just its head: the seal derives a consistency
-            // proof from the previous seal's tree, and a proof and a head that
-            // came from different trees is the one pairing that must not exist.
-            &self.log,
-            &closing,
-            // The registry as it stands now: the same one the trial balance's
-            // handles were resolved against.
-            self.accounts.commitment(),
-            self.seals.last(),
-        )?;
-
-        // Chain first: a refused seal must leave the period exactly as it was.
-        self.seals.push(seal.clone())?;
-        self.calendar.transition(period, PeriodState::Sealed)?;
-        Ok(seal)
-    }
-
-    /// The chain of seals recorded so far.
-    #[must_use]
-    pub fn seals(&self) -> &SealChain {
-        &self.seals
-    }
-
-    /// Verifies every seal, every link between them, **and that they describe
-    /// this journal's books** — its log *and* its chart of accounts.
-    ///
-    /// The last part is the one that needs stating. [`SealChain::verify`] takes
-    /// seals alone: it establishes that they are in order, unedited, and that
-    /// each period's tree extends the one before it — a complete chain can
-    /// nonetheless be built over a history nobody holds, and over a chart of
-    /// accounts nobody holds. The journal has both, so this checks each seal
-    /// against both:
-    ///
-    /// - **The log.** Each seal's tree head is recomputed from the entries.
-    /// - **The registry.** Each seal's account commitment is recomputed from the
-    ///   bindings, at the size the seal recorded. A trial-balance leaf names its
-    ///   account by *handle*, so re-registering the same paths in a different
-    ///   order repoints every sealed balance while every hash in the chain goes
-    ///   on matching.
-    ///
-    /// Passing means: these seals are evidence about *these* books, and the
-    /// handles their balances are keyed on still mean what they meant.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SealChainError`] naming the first seal that does not hold.
-    pub fn verify_seals(&self) -> Result<(), SealChainError> {
-        self.seals.verify_against_log(&self.log)?;
-        self.seals.verify_against_accounts(&self.accounts)
-    }
-
-    /// Proves what one account closed a sealed period at, and names it.
-    ///
-    /// The complete claim an auditor wants, from one call: the seal, an
-    /// `O(log n)` path to the balance row, and an `O(log n)` path binding that
-    /// row's handle to an account path — disclosing nothing else.
-    ///
-    /// Assembled by hand this is a five-step recipe of which exactly one step
-    /// matters, and it is the one nothing forces: comparing the rebuilt
-    /// commitment against the one the seal recorded. Skip it and the proof is
-    /// against a commitment you just computed yourself — internally consistent,
-    /// evidence of nothing. [`SealedBalance::assemble`] is where that check
-    /// lives, and every [`LedgerStore`](crate::LedgerStore) routes through the
-    /// same function, so the durable backends cannot drift from this one.
-    ///
-    /// Note which fold rebuilds the closing balance:
-    /// [`BalanceQuery::through`], by booking date, not
-    /// [`BalanceQuery::over_prefix`] over a log prefix. Sealing March in April is
-    /// the normal case, so at the moment the seal is taken the log already holds
-    /// April entries and the two differ.
-    ///
-    /// "Nothing to prove" comes back as a [`SealedBalanceOutcome`] variant
-    /// rather than an error, because it is an answer: see there for why the
-    /// distinction matters.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`JournalError::SealedBalance`] when the period is not sealed or
-    /// when the books no longer reproduce the seal's closing balance.
-    pub fn prove_sealed_balance(
-        &self,
-        period: &PeriodId,
-        key: BalanceKey,
-    ) -> Result<SealedBalanceOutcome<P>, JournalError> {
-        let Some(seal) = self.seals.get(period).cloned() else {
-            return Err(SealedBalanceError::NotSealed {
-                period: period.clone(),
-            }
-            .into());
-        };
-        let Some(definition) = self.calendar.get(&seal.period) else {
-            return Err(SealedBalanceError::UndefinedPeriod {
-                period: period.clone(),
-            }
-            .into());
-        };
-        let closing = self.trial_balance(BalanceQuery::through(definition.end))?;
-        Ok(SealedBalance::assemble(
-            seal,
-            &closing,
-            &self.accounts,
-            key,
-        )?)
-    }
-
-    // ── checkpoints and assertions ──────────────────────────────────────────
-
-    /// Takes a checkpoint of one balance over the whole log so far.
-    ///
-    /// Taking one on an empty journal is meaningful and stays valid: it records
-    /// that the account had not moved after zero entries, which no later append
-    /// can falsify.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`MoneyError::Overflow`] if reading the balance overflows.
-    pub fn checkpoint(&self, key: &BalanceKey) -> Result<Checkpoint<P>, MoneyError> {
-        Ok(Checkpoint::new(
-            *key,
-            self.balance(key, BalanceQuery::all())?,
-            self.head(),
-        ))
-    }
-
-    /// Re-derives a checkpoint from the journal and compares it.
-    ///
-    /// Checks the tree head as well as the balance: a checkpoint that matches
-    /// numerically but was taken against a different history is stale, and
-    /// silently trusting it would carry a stale balance forward. The head is
-    /// also what names the prefix, so the balance is re-folded over exactly the
-    /// entries the checkpoint claims to cover — never over whatever the journal
-    /// happens to hold now.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CheckpointError`] naming which of the three checks failed.
-    pub fn verify_checkpoint(&self, checkpoint: &Checkpoint<P>) -> Result<(), CheckpointError> {
-        let size = checkpoint.size();
-        if size > self.len() as u64 {
-            return Err(CheckpointError::SizeOutOfRange { size });
-        }
-        let head = self
-            .head_at(size)
-            .map_err(|_| CheckpointError::SizeOutOfRange { size })?;
-        if head != checkpoint.tree_head {
-            return Err(CheckpointError::HeadMismatch);
-        }
-
-        let actual = self.balance(&checkpoint.key, BalanceQuery::over_prefix(size))?;
-        if actual == checkpoint.balance {
-            Ok(())
-        } else {
-            Err(CheckpointError::BalanceMismatch)
-        }
-    }
-
-    /// Evaluates a balance assertion against the journal.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`MoneyError::Overflow`] if reading the balance overflows.
+    /// As [`balance`](Self::balance) — a position beyond the head included —
+    /// never for a difference.
     pub fn check_assertion(
         &self,
         assertion: &BalanceAssertion<P>,
-    ) -> Result<AssertionOutcome<P>, MoneyError> {
-        let actual = self.balance(&assertion.key, assertion.at.query())?;
-        assertion.check(&actual)
+    ) -> Result<AssertionOutcome<P>, Error> {
+        now(self.reads().check_assertion(assertion))
     }
 
-    /// Every account with its handle, for a backend to persist.
-    #[must_use]
-    pub fn account_records(&self) -> Vec<AccountRecord> {
-        self.accounts.records()
-    }
-
-    // ── auditing ────────────────────────────────────────────────────────────
-
-    /// Runs every self-check this journal can make, and reports what held.
-    ///
-    /// [`verify_log`](Self::verify_log), [`verify_balances`](Self::verify_balances),
-    /// [`verify_balanced`](Self::verify_balanced) and
-    /// [`verify_seals`](Self::verify_seals) are all public and all worth
-    /// calling; knowing to call *all four* is itself a thing to get wrong, and
-    /// getting it wrong is silent.
-    ///
-    /// They are independent, so all four run — the first failure is not
-    /// necessarily the most informative — and a failing report names which.
-    ///
-    /// `O(n)`. An audit-time operation: run it after a restore, after a
-    /// migration, on a schedule, and before handing anything to an auditor.
+    /// Checks every assertion: one outcome each, in their order.
     ///
     /// ```
-    /// # use doubleentry::{Journal, LedgerId};
-    /// # let journal = Journal::<2>::new(LedgerId::new("acme-gmbh")?);
-    /// let report = journal.audit();
-    /// assert!(report.passed(), "{report}");
+    /// use doubleentry::prelude::*;
+    /// use doubleentry::{report::{AssertAt, BalanceAssertion, DateBasis}};
+    ///
+    /// let mut books = Journal::new(LedgerId::new("example.com/acme")?);
+    /// books.declare_currency(EUR, 2, date!("2026-01-01"))?;
+    /// books.open("Assets:Bank", AccountKind::Asset, date!("2026-01-01"))?;
+    /// books.open("Income:Sales", AccountKind::Income, date!("2026-01-01"))?;
+    /// books.define_months(2026, 3..=3)?;
+    /// books.record(
+    ///     Entry::new("sale-1", date!("2026-03-15"))
+    ///         .debit("Assets:Bank", amount!("100.00"), EUR)
+    ///         .credit("Income:Sales", amount!("100.00"), EUR),
+    /// )?;
+    /// let day = |date| AssertAt::EndOfDay { date, basis: DateBasis::Booking };
+    /// let outcomes = books.check_assertions(&[
+    ///     BalanceAssertion::new("Assets:Bank", EUR, day(date!("2026-03-14")), amount!("0.00")),
+    ///     BalanceAssertion::new("Assets:Bank", EUR, day(date!("2026-03-15")), amount!("90.00")),
+    /// ])?;
+    /// assert_eq!(outcomes.iter().map(|outcome| outcome.is_held()).collect::<Vec<_>>(), [true, false]);
+    /// # Ok::<(), Error>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// The first error of [`check_assertion`](Self::check_assertion).
+    pub fn check_assertions(
+        &self,
+        assertions: &[BalanceAssertion<P>],
+    ) -> Result<Vec<AssertionOutcome<P>>, Error> {
+        now(self.reads().check_assertions(assertions))
+    }
+
+    /// The GoBD export view of `scope`, pinned to `head` (or to the head
+    /// now): every row, in log order. See [`export`](crate::export) for the
+    /// rows and how a recipient verifies them.
+    ///
+    /// ```
+    /// use doubleentry::export::{ExportRow, ExportScope};
+    /// use doubleentry::prelude::*;
+    ///
+    /// let mut books = Journal::new(LedgerId::new("example.com/acme")?);
+    /// books.declare_currency(JPY, 0, date!("2026-01-01"))?;
+    /// books.open("Assets:Bank", AccountKind::Asset, date!("2026-01-01"))?;
+    /// books.open("Income:Sales", AccountKind::Income, date!("2026-01-01"))?;
+    /// books.define_months(2026, 3..=3)?;
+    /// books.record(
+    ///     Entry::new("sale-1", date!("2026-03-15"))
+    ///         .debit("Assets:Bank", amount!("500.00"), JPY)
+    ///         .credit("Income:Sales", amount!("500.00"), JPY),
+    /// )?;
+    /// let postings: Vec<(i128, u8)> = books
+    ///     .export(ExportScope::All, None)?
+    ///     .filter_map(|row| match row {
+    ///         Ok(ExportRow::Posting(posting)) => Some((posting.minor_units, posting.exponent)),
+    ///         _ => None,
+    ///     })
+    ///     .collect();
+    /// assert_eq!(postings, [(500, 0), (500, 0)]); // yen have no minor unit
+    /// # Ok::<(), Error>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Query`] for a period id that is no label or names no period
+    /// in the prefix, or a head beyond the log; [`Error::Integrity`] for a
+    /// head this log does not have. A row is an error only for a record the
+    /// rule core would not have written.
+    pub fn export(
+        &self,
+        scope: ExportScope,
+        head: Option<TreeHead>,
+    ) -> Result<Export<'_, P>, Error> {
+        let bound = match head {
+            Some(head) => {
+                now(self.reads().pinned(head))?;
+                head.size
+            }
+            None => self.head().size,
+        };
+        let exporter = Exporter::new(scope)?;
+        if let Some(id) = exporter.period()
+            && !self
+                .state
+                .period(id)
+                .is_some_and(|view| view.position < bound)
+        {
+            return Err(QueryError::UnknownPeriod {
+                id: id.as_str().to_owned(),
+            }
+            .into());
+        }
+        Ok(Export::new(&self.state, exporter, bound))
+    }
+}
+
+// ── Transparency ────────────────────────────────────────────────────────────
+
+impl<const P: u8> Journal<P> {
+    /// The ledger's head as a C2SP checkpoint, signed by `key` (feature
+    /// `witness`).
+    ///
+    /// ```
+    /// use doubleentry::transparency::LogKey;
+    /// use doubleentry::{Journal, LedgerId};
+    ///
+    /// let ledger = LedgerId::new("example.com/ledgers/acme")?;
+    /// let books = Journal::new(ledger.clone());
+    /// let key = LogKey::from_seed(&ledger, [7; 32]);
+    /// let signed = books.checkpoint(&key)?;
+    /// assert_eq!(signed.checkpoint().head(), books.head());
+    /// signed.verify(&[key.vkey()])?;
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
-    #[must_use]
-    pub fn audit(&self) -> AuditReport {
-        let mut checks = Vec::new();
-
-        checks.push(AuditCheck::new(
-            "the Merkle log commits to these entries",
-            self.verify_log()
-                .then_some(())
-                .ok_or_else(|| "the log's nodes do not describe the entries it holds".to_owned()),
-        ));
-
-        checks.push(AuditCheck::new(
-            "the maintained balances match the entries",
-            match self.verify_balances() {
-                Ok(true) => Ok(()),
-                Ok(false) => {
-                    Err("the maintained trial balance has drifted from the entries".to_owned())
-                }
-                Err(e) => Err(format!("recomputing the balances failed: {e}")),
-            },
-        ));
-
-        checks.push(AuditCheck::new(
-            "debits equal credits per currency and layer",
-            match self.verify_balanced() {
-                Ok(true) => Ok(()),
-                Ok(false) => Err("the trial balance does not balance".to_owned()),
-                Err(e) => Err(format!("totalling the trial balance failed: {e}")),
-            },
-        ));
-
-        checks.push(AuditCheck::new(
-            "the seal chain holds and describes these books",
-            self.verify_seals().map_err(|e| e.to_string()),
-        ));
-
-        AuditReport { checks }
-    }
-}
-
-/// One named check from [`Journal::audit`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AuditCheck {
-    /// What was checked, as a sentence that reads as a claim.
-    pub name: &'static str,
-    /// Why it failed, or `None` when it held.
-    pub failure: Option<String>,
-}
-
-impl AuditCheck {
-    fn new(name: &'static str, outcome: Result<(), String>) -> Self {
-        Self {
-            name,
-            failure: outcome.err(),
-        }
-    }
-
-    /// True when the check held.
-    #[must_use]
-    pub fn passed(&self) -> bool {
-        self.failure.is_none()
-    }
-}
-
-/// What [`Journal::audit`] found.
-///
-/// Deliberately the same shape as a
-/// [conformance `Report`](crate::storage::conformance::Report): both answer "did
-/// this thing hold up", and a reader who has met one should not have to learn
-/// the other.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AuditReport {
-    /// One entry per check, in the order they ran.
-    pub checks: Vec<AuditCheck>,
-}
-
-impl AuditReport {
-    /// True when every check held.
-    #[must_use]
-    pub fn passed(&self) -> bool {
-        self.checks.iter().all(AuditCheck::passed)
-    }
-
-    /// The checks that did not.
-    #[must_use]
-    pub fn failures(&self) -> Vec<&AuditCheck> {
-        self.checks.iter().filter(|c| !c.passed()).collect()
-    }
-}
-
-impl std::fmt::Display for AuditReport {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let failures = self.failures();
-        if failures.is_empty() {
-            return write!(f, "all {} audit checks passed", self.checks.len());
-        }
-        writeln!(
-            f,
-            "{} of {} audit checks failed:",
-            failures.len(),
-            self.checks.len()
-        )?;
-        for check in failures {
-            writeln!(
-                f,
-                "  - {}: {}",
-                check.name,
-                check.failure.as_deref().unwrap_or("")
-            )?;
-        }
-        Ok(())
-    }
-}
-
-fn key_of<const P: u8>(posting: &Posting<P>) -> BalanceKey {
-    BalanceKey {
-        account: posting.account,
-        currency: posting.currency,
-        layer: posting.layer,
-    }
-}
-
-/// Resolves posting references against the journal's entries.
-struct PostingIndex<'a, const P: u8> {
-    by_id: &'a BTreeMap<EntryId, LogIndex>,
-    entries: &'a [Entry<Balanced, P>],
-}
-
-impl<const P: u8> PostingLookup<P> for PostingIndex<'_, P> {
-    fn posting(&self, reference: PostingRef) -> Option<&crate::posting::Posting<P>> {
-        let index = self.by_id.get(&reference.entry)?;
-        let entry = self
-            .entries
-            .get(usize::try_from(index.get()).unwrap_or(usize::MAX))?;
-        entry.postings().get(usize::from(reference.index))
-    }
-}
-
-/// True when `candidate` is exactly `original` with every side flipped.
-///
-/// A reversal that does not invert would leave the original marked as reversed
-/// while the amounts failed to net, which is worse than no reversal tracking at
-/// all — the ledger would assert a correction it did not make.
-fn is_inversion_of<const P: u8>(
-    original: &Entry<Balanced, P>,
-    candidate: &Entry<Balanced, P>,
-) -> bool {
-    let (a, b) = (original.postings(), candidate.postings());
-    a.len() == b.len()
-        && a.iter().zip(b.iter()).all(|(o, r)| {
-            r.account == o.account
-                && r.amount == o.amount
-                && r.currency == o.currency
-                && r.layer == o.layer
-                && r.dimensions == o.dimensions
-                && r.direction == o.direction.inverse()
-        })
-}
-
-#[cfg(test)]
-mod audit_tests {
-    //! Every check `audit` runs has to be able to *fail*, or it is decoration.
-
-    use super::*;
-    use crate::money::Amount;
-    use time::macros::date;
-
-    type Eur = Amount<2>;
-
-    fn books(n: u32) -> Journal<2> {
-        let mut journal = Journal::<2>::new(LedgerId::new("audited").expect("valid"));
-        let a = journal
-            .register_path("A:One", date!(2026 - 01 - 01))
-            .expect("registers");
-        let b = journal
-            .register_path("B:Two", date!(2026 - 01 - 01))
-            .expect("registers");
-        for i in 0..n {
-            journal
-                .record(
-                    Entry::new(
-                        EntryId::generate(),
-                        IdempotencyKey::new(format!("k{i}").into_bytes()).expect("valid"),
-                        date!(2026 - 03 - 15),
-                    )
-                    .debit(a, Eur::from_minor(100), Currency::EUR)
-                    .credit(b, Eur::from_minor(100), Currency::EUR),
-                )
-                .expect("records");
-        }
-        journal
-    }
-
-    #[test]
-    fn healthy_books_pass_every_check() {
-        let journal = books(8);
-        let report = journal.audit();
-        assert!(report.passed(), "{report}");
-        assert_eq!(report.checks.len(), 4);
-        assert_eq!(report.to_string(), "all 4 audit checks passed");
-    }
-
-    #[test]
-    fn an_empty_journal_passes() {
-        // Nothing to check is not the same as something failing to check.
-        let journal = Journal::<2>::new(LedgerId::new("empty").expect("valid"));
-        assert!(journal.audit().passed());
-    }
-
-    #[test]
-    fn a_drifted_balance_is_named_and_the_others_still_run() {
-        let mut journal = books(4);
-        // Reach past the API to corrupt derived state, which is what a bug in
-        // this crate would do.
-        let key = BalanceKey {
-            account: AccountId::from_index(0),
-            currency: Currency::EUR,
-            layer: Layer::Settled,
-        };
-        let mut wrong = journal.balances.get_or_zero(&key);
-        wrong.debits = Eur::from_minor(1);
-        journal.balances.set(key, wrong);
-
-        let report = journal.audit();
-        assert!(!report.passed());
-
-        // Two checks fail, and both are worth saying. The maintained totals no
-        // longer match the entries, *and* they no longer balance — the second
-        // reads the maintained totals, so a drift shows up there too. A report
-        // that stopped at the first would have hidden half the answer.
-        let named: Vec<&str> = report.failures().iter().map(|c| c.name).collect();
-        assert!(
-            named.iter().any(|n| n.contains("maintained balances")),
-            "{report}"
-        );
-        assert!(
-            named.iter().any(|n| n.contains("debits equal credits")),
-            "{report}"
-        );
-
-        // The log and the seals are independent of the balances, and still hold.
-        assert!(journal.verify_log());
-        assert!(journal.verify_seals().is_ok());
-    }
-
-    #[test]
-    fn a_renumbered_registry_is_named() {
-        // The renumbering `Seal::accounts` exists to expose. Every hash in the
-        // chain still matches — the seals were not touched — and the log is
-        // exactly as it was; only the handles the sealed balances are keyed on
-        // now mean different accounts. Nothing but the registry check sees it.
-        let mut journal = books(4);
-        let period = PeriodId::new("2026-03").expect("valid");
-        journal
-            .define_period(
-                Period::new(period.clone(), date!(2026 - 03 - 01), date!(2026 - 03 - 31))
-                    .expect("valid"),
-            )
-            .expect("defines");
-        journal
-            .transition_period(&period, PeriodState::Closing)
-            .expect("closes");
-        journal.seal_period(&period).expect("seals");
-        assert!(journal.audit().passed(), "sealed books are healthy");
-
-        // Same paths, opposite order — the one move that leaves every seal
-        // verifying while every balance in them refers to somebody else.
-        let mut renumbered = AccountRegistry::new();
-        for path in ["B:Two", "A:One"] {
-            renumbered
-                .register_path(path, date!(2026 - 01 - 01))
-                .expect("registers");
-        }
-        journal.accounts = renumbered;
-
-        let report = journal.audit();
-        assert!(!report.passed(), "{report}");
-        assert!(
-            report.failures().iter().any(|c| c.name.contains("seal")),
-            "{report}"
-        );
-        assert!(
-            matches!(
-                journal.verify_seals(),
-                Err(SealChainError::AccountsRebound { .. })
-            ),
-            "the failure must name the rebinding, not something vaguer"
-        );
-    }
-
-    #[test]
-    fn a_broken_log_is_named() {
-        let mut journal = books(4);
-        journal.log.append(Hash::from_bytes([9u8; 32]));
-
-        let report = journal.audit();
-        assert!(!report.passed());
-        assert!(
-            report
-                .failures()
-                .iter()
-                .any(|c| c.name.contains("Merkle log")),
-            "{report}"
-        );
-        // And the message says which check, not just that something failed.
-        assert!(report.to_string().contains("Merkle log"), "{report}");
-    }
-
-    #[test]
-    fn every_check_is_reported_even_when_several_fail() {
-        let mut journal = books(4);
-        journal.log.append(Hash::from_bytes([9u8; 32]));
-        let key = BalanceKey {
-            account: AccountId::from_index(0),
-            currency: Currency::EUR,
-            layer: Layer::Settled,
-        };
-        journal.balances.set(key, Balance::ZERO);
-
-        let report = journal.audit();
-        assert_eq!(report.checks.len(), 4);
-        assert!(
-            report.failures().len() >= 2,
-            "the first failure must not stop the rest: {report}"
-        );
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::account::{AccountId, BalanceLimit};
-    use crate::dimensions::{DimensionFilter, Dimensions};
-    use crate::entry::{Description, Draft};
-    use crate::money::{Amount, Currency};
-    use crate::posting::{Direction, Posting};
-    use time::macros::date;
-
-    type Eur = Amount<2>;
-
-    /// A journal with two accounts, ready to post to.
-    struct Books {
-        journal: Journal<2>,
-        cash: AccountId,
-        revenue: AccountId,
-    }
-
-    impl Books {
-        fn new() -> Self {
-            let mut journal = Journal::<2>::new(LedgerId::new("test-ledger").expect("valid"));
-            let cash = journal
-                .register_path("Assets:Cash", date!(2026 - 01 - 01))
-                .expect("registers");
-            let revenue = journal
-                .register_path("Income:Sales", date!(2026 - 01 - 01))
-                .expect("registers");
-            Self {
-                journal,
-                cash,
-                revenue,
-            }
-        }
-
-        fn draft(&self, key: &[u8], minor: i64) -> Entry<Draft, 2> {
-            self.draft_on(key, minor, date!(2026 - 03 - 15))
-        }
-
-        fn draft_on(&self, key: &[u8], minor: i64, on: Date) -> Entry<Draft, 2> {
-            Entry::new(
-                EntryId::generate(),
-                IdempotencyKey::new(key.to_vec()).expect("valid"),
-                on,
-            )
-            .debit(self.cash, Eur::from_minor(minor), Currency::EUR)
-            .credit(self.revenue, Eur::from_minor(minor), Currency::EUR)
-        }
-
-        fn sealed(&self, key: &[u8], minor: i64) -> Entry<Balanced, 2> {
-            self.draft(key, minor)
-                .seal(&self.journal.context())
-                .expect("balances")
-        }
-
-        fn record(&mut self, key: &[u8], minor: i64) -> Recorded {
-            let draft = self.draft(key, minor);
-            self.journal.record(draft).expect("records")
-        }
-
-        fn cash_key(&self) -> BalanceKey {
-            BalanceKey {
-                account: self.cash,
-                currency: Currency::EUR,
-                layer: Layer::Settled,
-            }
-        }
-
-        fn march(&mut self) -> PeriodId {
-            let id = PeriodId::new("2026-03").expect("valid");
-            self.journal
-                .define_period(
-                    Period::new(id.clone(), date!(2026 - 03 - 01), date!(2026 - 03 - 31))
-                        .expect("valid range"),
-                )
-                .expect("defines");
-            id
-        }
-    }
-
-    // ── recording ───────────────────────────────────────────────────────────
-
-    #[test]
-    fn records_entries_in_order() {
-        let mut b = Books::new();
-        let first = b.record(b"a", 100);
-        let second = b.record(b"b", 200);
-        assert_eq!(first.index.expect("sequenced inline").get(), 0);
-        assert_eq!(second.index.expect("sequenced inline").get(), 1);
-        assert_eq!(b.journal.len(), 2);
-        assert!(first.is_new && second.is_new);
-    }
-
-    #[test]
-    fn a_draft_is_validated_against_the_journals_own_accounts() {
-        let mut b = Books::new();
-        let ghost = AccountId::from_index(999);
-        let bad = Entry::<Draft, 2>::new(
-            EntryId::generate(),
-            IdempotencyKey::new(b"ghost".to_vec()).expect("valid"),
-            date!(2026 - 03 - 15),
-        )
-        .debit(ghost, Eur::from_minor(10), Currency::EUR)
-        .credit(b.revenue, Eur::from_minor(10), Currency::EUR);
-
-        assert!(matches!(
-            b.journal.record(bad),
-            Err(JournalError::Invalid(_))
-        ));
-        assert!(b.journal.is_empty());
-    }
-
-    #[test]
-    fn an_identical_resubmission_is_a_no_op() {
-        let mut b = Books::new();
-        let first = b.record(b"same-key", 100);
-
-        // A different entry identifier, but the same logical transaction.
-        let replay = b.record(b"same-key", 100);
-        assert!(!replay.is_new);
-        assert_eq!(replay.id, first.id);
-        assert_eq!(replay.index, first.index);
-        assert_eq!(b.journal.len(), 1, "a replay must not append");
-    }
-
-    #[test]
-    fn the_same_key_with_different_content_is_a_conflict() {
-        let mut b = Books::new();
-        b.record(b"key", 100);
-        let draft = b.draft(b"key", 999);
-        let err = b.journal.record(draft).expect_err("must not overwrite");
-        assert!(matches!(err, JournalError::IdempotencyConflict { .. }));
-        assert_eq!(b.journal.len(), 1, "a conflict must not append");
-    }
-
-    #[test]
-    fn duplicate_entry_ids_are_refused() {
-        let mut b = Books::new();
-        let entry = b.sealed(b"k1", 100);
-        let id = entry.id();
-        b.journal.record_validated(entry).expect("records");
-
-        let clash = Entry::<Draft, 2>::new(
-            id,
-            IdempotencyKey::new(b"k2".to_vec()).expect("valid"),
-            date!(2026 - 03 - 15),
-        )
-        .debit(b.cash, Eur::from_minor(1), Currency::EUR)
-        .credit(b.revenue, Eur::from_minor(1), Currency::EUR);
-
-        assert!(matches!(
-            b.journal.record(clash),
-            Err(JournalError::DuplicateId { .. })
-        ));
-    }
-
-    #[test]
-    fn a_policy_applies_to_what_is_recorded_next() {
-        let mut b = Books::new();
-        b.record(b"before", 100);
-
-        b.journal = std::mem::replace(
-            &mut b.journal,
-            Journal::<2>::new(LedgerId::new("scratch").expect("valid")),
-        )
-        .with_policy(LedgerPolicy::permissive().in_currency(Currency::USD));
-
-        // What was already recorded stays readable …
-        assert_eq!(b.journal.len(), 1);
-        // … and the new rule applies to the next booking.
-        let draft = b.draft(b"after", 100);
-        assert!(matches!(
-            b.journal.record(draft),
-            Err(JournalError::Invalid(_))
-        ));
-    }
-
-    // ── master data ─────────────────────────────────────────────────────────
-
-    #[test]
-    fn registering_a_child_under_a_posted_to_account_is_refused() {
-        // `Assets:Cash` is a leaf when it is posted to. Registering
-        // `Assets:Cash:Petty` afterwards would turn it into an aggregation node
-        // carrying postings, falsifying the rule every entry on it was accepted
-        // under — with no way back.
-        let mut b = Books::new();
-        b.record(b"a", 100);
-
-        let err = b
-            .journal
-            .register_path("Assets:Cash:Petty", date!(2026 - 01 - 01))
-            .expect_err("cash has been posted to");
-        assert!(matches!(err, JournalError::AncestorHasPostings { .. }));
-
-        // An untouched branch is unaffected: the rule is about postings, not
-        // about depth.
-        assert!(
-            b.journal
-                .register_path("Assets:Bank:Main", date!(2026 - 01 - 01))
-                .is_ok()
-        );
-    }
-
-    #[test]
-    fn a_child_may_be_registered_before_the_parent_is_posted_to() {
-        let mut b = Books::new();
-        let petty = b
-            .journal
-            .register_path("Assets:Cash:Petty", date!(2026 - 01 - 01))
-            .expect("cash is untouched");
-        // Cash is now an aggregation node, so it is no longer postable …
-        assert!(!b.journal.accounts().is_leaf(b.cash));
-        let draft = b.draft(b"nope", 100);
-        assert!(matches!(
-            b.journal.record(draft),
-            Err(JournalError::Invalid(_))
-        ));
-        // … and its child is.
-        assert!(b.journal.accounts().is_leaf(petty));
-    }
-
-    #[test]
-    fn a_reservation_draws_on_the_same_limit_as_a_settled_movement() {
-        // A hold and a settled draw are one question about the same funds:
-        // neither layer bounds the limit on its own.
-        let mut b = Books::new();
-        b.journal
-            .set_account_limit(b.cash, BalanceLimit::NoCreditBalance)
-            .expect("registered");
-
-        let (cash, revenue) = (b.cash, b.revenue);
-        let hold = |key: &[u8], minor: i64| {
-            Entry::<Draft, 2>::new(
-                EntryId::generate(),
-                IdempotencyKey::new(key.to_vec()).expect("valid"),
-                date!(2026 - 03 - 15),
-            )
-            .post(
-                Posting::credit(cash, Eur::from_minor(minor), Currency::EUR)
-                    .in_layer(Layer::Pending),
-            )
-            .post(
-                Posting::debit(revenue, Eur::from_minor(minor), Currency::EUR)
-                    .in_layer(Layer::Pending),
-            )
-        };
-
-        // Nothing funded, so nothing can be reserved.
-        assert!(matches!(
-            b.journal.record(hold(b"early", 100)),
-            Err(JournalError::LimitBreached { .. })
-        ));
-
-        b.record(b"funding", 1_000);
-
-        // Now it can, up to what is there.
-        b.journal.record(hold(b"h1", 900)).expect("within funds");
-        assert!(matches!(
-            b.journal.record(hold(b"h2", 101)),
-            Err(JournalError::LimitBreached { .. })
-        ));
-
-        // The settled layer is constrained by the same headroom: 900 is spoken
-        // for, so only 100 can actually be paid out.
-        let settle = |key: &[u8], minor: i64| {
-            Entry::<Draft, 2>::new(
-                EntryId::generate(),
-                IdempotencyKey::new(key.to_vec()).expect("valid"),
-                date!(2026 - 03 - 20),
-            )
-            .credit(cash, Eur::from_minor(minor), Currency::EUR)
-            .debit(revenue, Eur::from_minor(minor), Currency::EUR)
-        };
-        assert!(matches!(
-            b.journal.record(settle(b"pay-too-much", 101)),
-            Err(JournalError::LimitBreached { .. })
-        ));
-
-        // Discharging a hold nets its pending side back to zero, and the room
-        // it was holding returns.
-        let discharge = Entry::<Draft, 2>::new(
-            EntryId::generate(),
-            IdempotencyKey::new(b"discharge".to_vec()).expect("valid"),
-            date!(2026 - 03 - 20),
-        )
-        .post(Posting::debit(cash, Eur::from_minor(900), Currency::EUR).in_layer(Layer::Pending))
-        .post(
-            Posting::credit(revenue, Eur::from_minor(900), Currency::EUR).in_layer(Layer::Pending),
-        )
-        .credit(cash, Eur::from_minor(900), Currency::EUR)
-        .debit(revenue, Eur::from_minor(900), Currency::EUR);
-        b.journal
-            .record(discharge)
-            .expect("the hold was good for it");
-
-        // 1 000 funded, 900 paid, nothing outstanding: 100 left.
-        assert!(b.journal.record(settle(b"pay-rest", 100)).is_ok());
-        assert!(b.journal.verify_balanced().expect("ok"));
-        assert!(b.journal.verify_balances().expect("ok"));
-    }
-
-    #[test]
-    fn restoring_a_record_the_journal_already_holds_stays_a_no_op() {
-        // The backend replay path must not trip the leaf rule on rows it wrote
-        // itself, whatever order they come back in.
-        let mut b = Books::new();
-        b.record(b"a", 100);
-        for record in b.journal.account_records() {
-            b.journal.restore_account(record).expect("replays");
-        }
-        assert_eq!(b.journal.accounts().len(), 2);
-    }
-
-    // ── reporting ───────────────────────────────────────────────────────────
-
-    /// A journal with three postings on one account, sliced two ways.
-    fn sliced() -> Books {
-        let mut b = Books::new();
-        let axis = Label::new("segment").expect("valid");
-        let slice = |value: &str| {
-            Dimensions::none()
-                .with(axis.clone(), Label::new(value).expect("valid"))
-                .expect("fits")
-        };
-        let rows: [(&[u8], i64, Option<&str>, Date); 3] = [
-            (b"retail-mar", 100, Some("Retail"), date!(2026 - 03 - 10)),
-            (b"trade-mar", 200, Some("Trade"), date!(2026 - 03 - 20)),
-            // No segment at all: the bucket a set of slices silently omits.
-            (b"none-apr", 400, None, date!(2026 - 04 - 05)),
-        ];
-        for (key, minor, segment, on) in rows {
-            let mut debit = Posting::debit(b.cash, Eur::from_minor(minor), Currency::EUR);
-            let mut credit = Posting::credit(b.revenue, Eur::from_minor(minor), Currency::EUR);
-            if let Some(value) = segment {
-                debit = debit.with_dimensions(slice(value));
-                credit = credit.with_dimensions(slice(value));
-            }
-            let draft = Entry::<Draft, 2>::new(
-                EntryId::generate(),
-                IdempotencyKey::new(key.to_vec()).expect("valid"),
-                on,
-            )
-            .post(debit)
-            .post(credit);
-            b.journal.record(draft).expect("records");
-        }
-        b
-    }
-
-    fn segment(value: &str) -> DimensionFilter {
-        DimensionFilter::any().matching(
-            Label::new("segment").expect("valid"),
-            Label::new(value).expect("valid"),
-        )
-    }
-
-    #[test]
-    fn a_trial_balance_can_be_sliced_by_a_reporting_axis() {
-        let b = sliced();
-        let key = b.cash_key();
-
-        let retail = segment("Retail");
-        assert_eq!(
-            b.journal
-                .balance(&key, BalanceQuery::all().matching(&retail))
-                .expect("ok")
-                .debits,
-            Eur::from_minor(100)
-        );
-
-        // And the same slice narrows a trial balance, so every existing report
-        // works on the result unchanged.
-        let tb = b
-            .journal
-            .trial_balance(BalanceQuery::all().matching(&retail))
-            .expect("ok");
-        assert_eq!(tb.get_or_zero(&key).debits, Eur::from_minor(100));
-        assert!(
-            tb.totals(Currency::EUR, Layer::Settled)
-                .expect("ok")
-                .is_balanced(),
-            "a slice of a balanced ledger still balances"
-        );
-    }
-
-    #[test]
-    fn the_slices_of_an_axis_add_up_only_with_the_unattributed_bucket() {
-        // The reason `missing` exists. Slice by the values an axis takes and the
-        // totals come up short, because postings carrying no value land in none
-        // of them — silently.
-        let b = sliced();
-        let key = b.cash_key();
-        let whole = b.journal.balance(&key, BalanceQuery::all()).expect("ok");
-        assert_eq!(whole.debits, Eur::from_minor(700));
-
-        let values = b.journal.dimension_values("segment");
-        assert_eq!(
-            values.iter().map(Label::as_str).collect::<Vec<_>>(),
-            vec!["Retail", "Trade"],
-            "an absent value is not one of the axis's values"
-        );
-
-        let mut sliced_total = Eur::ZERO;
-        for value in &values {
-            let filter = segment(value.as_str());
-            sliced_total = sliced_total
-                .checked_add(
-                    b.journal
-                        .balance(&key, BalanceQuery::all().matching(&filter))
-                        .expect("ok")
-                        .debits,
-                )
-                .expect("no overflow");
-        }
-        assert_eq!(sliced_total, Eur::from_minor(300), "300 of 700 attributed");
-
-        let unattributed = DimensionFilter::any().missing(Label::new("segment").expect("valid"));
-        let rest = b
-            .journal
-            .balance(&key, BalanceQuery::all().matching(&unattributed))
-            .expect("ok");
-        assert_eq!(
-            sliced_total.checked_add(rest.debits).expect("no overflow"),
-            whole.debits,
-            "the slices plus the unattributed bucket are the whole"
-        );
-    }
-
-    #[test]
-    fn a_date_range_reports_activity_rather_than_position() {
-        // The distinction between an income statement and a balance sheet.
-        let b = sliced();
-        let key = b.cash_key();
-
-        let march = BalanceQuery::between(date!(2026 - 03 - 01), date!(2026 - 03 - 31));
-        assert_eq!(
-            b.journal.balance(&key, march).expect("ok").debits,
-            Eur::from_minor(300),
-            "March's activity"
-        );
-        assert_eq!(
-            b.journal
-                .balance(&key, BalanceQuery::through(date!(2026 - 04 - 30)))
-                .expect("ok")
-                .debits,
-            Eur::from_minor(700),
-            "the cumulative position through April"
-        );
-
-        // The two narrowings compose.
-        let retail = segment("Retail");
-        assert_eq!(
-            b.journal
-                .balance(&key, march.matching(&retail))
-                .expect("ok")
-                .debits,
-            Eur::from_minor(100)
-        );
-    }
-
-    #[test]
-    fn a_filter_naming_an_axis_twice_takes_the_last_word() {
-        // A posting carries at most one value per axis, so a conjunction of two
-        // different values could only match nothing.
-        let axis = Label::new("segment").expect("valid");
-        let filter = DimensionFilter::any()
-            .matching(axis.clone(), Label::new("Retail").expect("valid"))
-            .matching(axis, Label::new("Trade").expect("valid"));
-        assert_eq!(filter.len(), 1);
-
-        let b = sliced();
-        assert_eq!(
-            b.journal
-                .balance(&b.cash_key(), BalanceQuery::all().matching(&filter))
-                .expect("ok")
-                .debits,
-            Eur::from_minor(200),
-            "the Trade slice"
-        );
-    }
-
-    // ── proofs ──────────────────────────────────────────────────────────────
-
-    #[test]
-    fn every_recorded_entry_can_be_proven_included() {
-        let mut b = Books::new();
-        for i in 0..12i64 {
-            b.record(format!("k{i}").as_bytes(), 100 + i);
-        }
-        let head = b.journal.head();
-        for (i, entry) in b.journal.entries().iter().enumerate() {
-            let proof = b
-                .journal
-                .prove_inclusion(LogIndex(i as u64))
-                .expect("in range");
-            assert!(
-                proof.verify(&entry.content_hash(), &head),
-                "entry {i} must be provably included"
-            );
-            assert_eq!(proof.leaf_index, i as u64);
-        }
-    }
-
-    #[test]
-    fn growth_is_provably_append_only() {
-        let mut b = Books::new();
-        for i in 0..5i64 {
-            b.record(format!("a{i}").as_bytes(), 10 + i);
-        }
-        let early = b.journal.head();
-        for i in 0..7i64 {
-            b.record(format!("b{i}").as_bytes(), 20 + i);
-        }
-        let later = b.journal.head();
-
-        let proof = b.journal.prove_consistency(early.size).expect("in range");
-        assert!(proof.verify(&early, &later));
-    }
-
-    #[test]
-    fn a_historical_head_matches_the_log_as_it_stood() {
-        let mut b = Books::new();
-        b.record(b"a", 100);
-        let snapshot = b.journal.head();
-        b.record(b"b", 200);
-
-        let reconstructed = b.journal.head_at(snapshot.size).expect("in range");
-        assert_eq!(reconstructed, snapshot);
-        assert_ne!(b.journal.head(), snapshot);
-    }
-
-    // ── corrections ─────────────────────────────────────────────────────────
-
-    #[test]
-    fn a_reversal_requires_a_known_original() {
-        let b = Books::new();
-        let orphan = b.sealed(b"orphan", 100);
-        let reversal = orphan
-            .reverse(
-                EntryId::generate(),
-                IdempotencyKey::new(b"rev".to_vec()).expect("valid"),
-                date!(2026 - 04 - 01),
-            )
-            .seal(&b.journal.context())
-            .expect("balances");
-        let mut journal = b.journal;
-        assert!(matches!(
-            journal.record_validated(reversal),
-            Err(JournalError::UnknownOriginal { .. })
-        ));
-    }
-
-    #[test]
-    fn an_entry_can_only_be_reversed_once() {
-        let mut b = Books::new();
-        let original = b.sealed(b"orig", 100);
-        b.journal
-            .record_validated(original.clone())
-            .expect("records");
-
-        for (key, on) in [
-            (b"rev1".as_slice(), date!(2026 - 04 - 01)),
-            (b"rev2".as_slice(), date!(2026 - 04 - 02)),
-        ] {
-            let reversal = original.reverse(
-                EntryId::generate(),
-                IdempotencyKey::new(key.to_vec()).expect("valid"),
-                on,
-            );
-            let outcome = b.journal.record(reversal);
-            if key == b"rev1" {
-                outcome.expect("the first reversal is accepted");
-            } else {
-                assert!(matches!(outcome, Err(JournalError::AlreadyReversed { .. })));
-            }
-        }
-    }
-
-    #[test]
-    fn a_reversal_cannot_itself_be_reversed() {
-        let mut b = Books::new();
-        let original = b.sealed(b"orig", 100);
-        b.journal
-            .record_validated(original.clone())
-            .expect("records");
-
-        let reversal = original
-            .reverse(
-                EntryId::generate(),
-                IdempotencyKey::new(b"rev".to_vec()).expect("valid"),
-                date!(2026 - 04 - 01),
-            )
-            .seal(&b.journal.context())
-            .expect("balances");
-        let reversal_id = reversal.id();
-        b.journal
-            .record_validated(reversal.clone())
-            .expect("records");
-
-        let double = reversal.reverse(
-            EntryId::generate(),
-            IdempotencyKey::new(b"rev-rev".to_vec()).expect("valid"),
-            date!(2026 - 04 - 02),
-        );
-        assert!(matches!(
-            b.journal.record(double),
-            Err(JournalError::ReversalOfReversal { id }) if id == reversal_id
-        ));
-    }
-
-    #[test]
-    fn an_entry_claiming_a_reversal_it_does_not_perform_is_refused() {
-        let mut b = Books::new();
-        let original = b.sealed(b"orig", 1000);
-        let original_id = original.id();
-        b.journal.record_validated(original).expect("records");
-
-        // Names the original, but the postings do not invert it.
-        let forged = Entry::<Draft, 2>::new(
-            EntryId::generate(),
-            IdempotencyKey::new(b"forged".to_vec()).expect("valid"),
-            date!(2026 - 04 - 01),
-        )
-        .reversing(original_id, date!(2026 - 03 - 15))
-        .debit(b.revenue, Eur::from_minor(1), Currency::EUR)
-        .credit(b.cash, Eur::from_minor(1), Currency::EUR);
-
-        assert!(matches!(
-            b.journal.record(forged),
-            Err(JournalError::NotAnInversion { .. })
-        ));
-        assert_eq!(b.journal.reversal_of(original_id), None, "stays unreversed");
-        assert_eq!(b.journal.len(), 1);
-    }
-
-    #[test]
-    fn a_reversal_nets_the_original_out() {
-        let mut b = Books::new();
-        let original = b.sealed(b"orig", 4200);
-        b.journal
-            .record_validated(original.clone())
-            .expect("records");
-
-        let key = b.cash_key();
-        assert_eq!(
-            b.journal
-                .balance(&key, BalanceQuery::all())
-                .expect("no overflow")
-                .debits,
-            Eur::from_minor(4200)
-        );
-
-        let reversal = original.reverse(
-            EntryId::generate(),
-            IdempotencyKey::new(b"rev".to_vec()).expect("valid"),
-            date!(2026 - 04 - 01),
-        );
-        b.journal.record(reversal).expect("records");
-
-        // Net is zero, but both gross totals survive: the reversal is visible.
-        let after = b
-            .journal
-            .balance(&key, BalanceQuery::all())
-            .expect("no overflow");
-        assert_eq!(after.signed_net().expect("ok"), Eur::ZERO);
-        assert_eq!(after.debits, Eur::from_minor(4200));
-        assert_eq!(after.credits, Eur::from_minor(4200));
-    }
-
-    #[test]
-    fn a_reversal_of_a_sealed_period_books_into_an_open_one() {
-        let mut b = Books::new();
-        let original = b.sealed(b"orig", 100);
-        b.journal
-            .record_validated(original.clone())
-            .expect("records");
-
-        let march = b.march();
-        b.journal
-            .transition_period(&march, PeriodState::Closing)
-            .expect("ok");
-        b.journal.seal_period(&march).expect("seals");
-
-        // Back into March: refused, because March no longer accepts postings.
-        let refused = original.reverse(
-            EntryId::generate(),
-            IdempotencyKey::new(b"r1".to_vec()).expect("valid"),
-            date!(2026 - 03 - 20),
-        );
-        assert!(matches!(
-            b.journal.record(refused),
-            Err(JournalError::Invalid(_))
-        ));
-
-        // Into April: accepted, and it still says which period it belongs to.
-        let accepted = original.reverse(
-            EntryId::generate(),
-            IdempotencyKey::new(b"r2".to_vec()).expect("valid"),
-            date!(2026 - 04 - 01),
-        );
-        let recorded = b.journal.record(accepted).expect("books into April");
-        let stored = b.journal.get(recorded.id).expect("recorded");
-        assert_eq!(stored.original_booking_date(), Some(date!(2026 - 03 - 15)));
-    }
-
-    // ── balances ────────────────────────────────────────────────────────────
-
-    #[test]
-    fn the_journal_always_balances() {
-        let mut b = Books::new();
-        for i in 0..6i64 {
-            b.record(format!("k{i}").as_bytes(), 10 + i);
-        }
-        assert!(b.journal.verify_balanced().expect("no overflow"));
-        assert!(b.journal.verify_balances().expect("no overflow"));
-        assert!(b.journal.verify_log());
-    }
-
-    #[test]
-    fn maintained_balances_match_a_full_recomputation_at_every_size() {
-        // The incremental trial balance is derived state and has to be checked
-        // the same way the Merkle subtree stack is.
-        let mut b = Books::new();
-        for i in 0..40i64 {
-            b.record(format!("k{i}").as_bytes(), 1 + i);
-            assert!(
-                b.journal.verify_balances().expect("no overflow"),
-                "diverged after {i} entries"
-            );
-        }
-    }
-
-    #[test]
-    fn a_prefix_fold_reconstructs_an_earlier_state() {
-        let mut b = Books::new();
-        b.record(b"a", 100);
-        b.record(b"b", 200);
-        b.record(b"c", 300);
-
-        let key = b.cash_key();
-        // The prefix is a *count* of entries, so zero is the empty ledger.
-        for (size, expected) in [(0u64, 0i64), (1, 100), (2, 300), (3, 600)] {
-            assert_eq!(
-                b.journal
-                    .balance(&key, BalanceQuery::over_prefix(size))
-                    .expect("ok")
-                    .debits,
-                Eur::from_minor(expected),
-                "balance over the first {size} entries"
-            );
-        }
-        assert_eq!(
-            b.journal
-                .balance(&key, BalanceQuery::all())
-                .expect("ok")
-                .debits,
-            Eur::from_minor(600)
-        );
-
-        // A size past the end is the whole log rather than an error.
-        assert_eq!(
-            b.journal
-                .balance(&key, BalanceQuery::over_prefix(99))
-                .expect("ok")
-                .debits,
-            Eur::from_minor(600)
-        );
-
-        // And the whole trial balance agrees with the per-key answer.
-        let tb = b
-            .journal
-            .trial_balance(BalanceQuery::over_prefix(2))
-            .expect("ok");
-        assert_eq!(tb.get_or_zero(&key).debits, Eur::from_minor(300));
-        assert!(
-            b.journal
-                .trial_balance(BalanceQuery::over_prefix(0))
-                .expect("ok")
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn a_rejected_entry_leaves_the_balances_untouched() {
-        let mut b = Books::new();
-        b.record(b"a", 100);
-        let before = b.journal.trial_balance(BalanceQuery::all()).expect("ok");
-
-        let draft = b.draft(b"a", 999);
-        assert!(b.journal.record(draft).is_err());
-        assert_eq!(
-            before,
-            b.journal.trial_balance(BalanceQuery::all()).expect("ok")
-        );
-        assert!(b.journal.verify_balances().expect("ok"));
-    }
-
-    // ── statements ──────────────────────────────────────────────────────────
-
-    // ── balance limits ──────────────────────────────────────────────────────
-
-    #[test]
-    fn an_account_can_be_forbidden_from_going_negative() {
-        let mut b = Books::new();
-        b.journal
-            .set_account_limit(b.cash, BalanceLimit::NoCreditBalance)
-            .expect("registered");
-
-        // Funding it is fine.
-        b.record(b"funding", 1_000);
-
-        // Drawing more than it holds is not.
-        let overdraw = Entry::<Draft, 2>::new(
-            EntryId::generate(),
-            IdempotencyKey::new(b"overdraw".to_vec()).expect("valid"),
-            date!(2026 - 03 - 20),
-        )
-        .credit(b.cash, Eur::from_minor(1_001), Currency::EUR)
-        .debit(b.revenue, Eur::from_minor(1_001), Currency::EUR);
-
-        let err = b.journal.record(overdraw).expect_err("would overdraw");
-        assert!(matches!(
-            err,
-            JournalError::LimitBreached {
-                limit: BalanceLimit::NoCreditBalance,
-                headroom_minor: -1,
-                ..
-            }
-        ));
-
-        // Refused whole: nothing about the journal moved.
-        assert_eq!(b.journal.len(), 1);
-        assert_eq!(
-            b.journal
-                .balance(&b.cash_key(), BalanceQuery::all())
-                .expect("ok")
-                .debits,
-            Eur::from_minor(1_000)
-        );
-        assert!(b.journal.verify_balances().expect("ok"));
-        assert!(b.journal.verify_log());
-    }
-
-    #[test]
-    fn a_limit_permits_the_entry_that_lands_exactly_on_zero() {
-        let mut b = Books::new();
-        b.journal
-            .set_account_limit(b.cash, BalanceLimit::NoCreditBalance)
-            .expect("registered");
-        b.record(b"funding", 1_000);
-
-        let drain = Entry::<Draft, 2>::new(
-            EntryId::generate(),
-            IdempotencyKey::new(b"drain".to_vec()).expect("valid"),
-            date!(2026 - 03 - 20),
-        )
-        .credit(b.cash, Eur::from_minor(1_000), Currency::EUR)
-        .debit(b.revenue, Eur::from_minor(1_000), Currency::EUR);
-        b.journal.record(drain).expect("zero is on the right side");
-    }
-
-    #[test]
-    fn a_limit_is_judged_on_the_whole_entry_not_posting_by_posting() {
-        // An entry that dips the account below its limit and back within one
-        // booking is one movement. Judging it posting by posting would make the
-        // answer depend on the order the caller listed them in.
-        let mut b = Books::new();
-        b.journal
-            .set_account_limit(b.cash, BalanceLimit::NoCreditBalance)
-            .expect("registered");
-
-        let round_trip = Entry::<Draft, 2>::new(
-            EntryId::generate(),
-            IdempotencyKey::new(b"round-trip".to_vec()).expect("valid"),
-            date!(2026 - 03 - 20),
-        )
-        .credit(b.cash, Eur::from_minor(500), Currency::EUR)
-        .debit(b.revenue, Eur::from_minor(500), Currency::EUR)
-        .debit(b.cash, Eur::from_minor(500), Currency::EUR)
-        .credit(b.revenue, Eur::from_minor(500), Currency::EUR);
-        b.journal.record(round_trip).expect("nets to zero");
-    }
-
-    #[test]
-    fn a_limit_binds_each_currency_and_layer_on_its_own() {
-        let mut b = Books::new();
-        b.journal
-            .set_account_limit(b.cash, BalanceLimit::NoCreditBalance)
-            .expect("registered");
-        b.record(b"eur-funding", 1_000);
-
-        // A different currency is a different balance and starts at zero.
-        let usd = Entry::<Draft, 2>::new(
-            EntryId::generate(),
-            IdempotencyKey::new(b"usd".to_vec()).expect("valid"),
-            date!(2026 - 03 - 20),
-        )
-        .credit(b.cash, Eur::from_minor(1), Currency::USD)
-        .debit(b.revenue, Eur::from_minor(1), Currency::USD);
-        assert!(
-            matches!(
-                b.journal.record(usd),
-                Err(JournalError::LimitBreached {
-                    currency: Currency::USD,
-                    ..
-                })
-            ),
-            "the EUR funding must not cover a USD draw"
-        );
-
-        // A reservation is *not* a separate allowance, though. It draws on the
-        // same funds, so it is checked against them — which is what a limit on
-        // a cash box has to mean, or the layer would be a way around it.
-        let reserve = |key: &[u8], minor: i64| {
-            Entry::<Draft, 2>::new(
-                EntryId::generate(),
-                IdempotencyKey::new(key.to_vec()).expect("valid"),
-                date!(2026 - 03 - 20),
-            )
-            .post(
-                Posting::credit(b.cash, Eur::from_minor(minor), Currency::EUR)
-                    .in_layer(Layer::Pending),
-            )
-            .post(
-                Posting::debit(b.revenue, Eur::from_minor(minor), Currency::EUR)
-                    .in_layer(Layer::Pending),
-            )
-        };
-
-        // Within the funded 1 000: accepted.
-        b.journal
-            .record(reserve(b"hold", 600))
-            .expect("within funds");
-        // Past it, counting the hold already outstanding: refused.
-        assert!(matches!(
-            b.journal.record(reserve(b"hold-2", 401)),
-            Err(JournalError::LimitBreached {
-                limit: BalanceLimit::NoCreditBalance,
-                headroom_minor: -1,
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn a_liability_can_be_forbidden_from_going_into_debit() {
-        let mut b = Books::new();
-        b.journal
-            .set_account_limit(b.revenue, BalanceLimit::NoDebitBalance)
-            .expect("registered");
-        // The fixture credits revenue, so this stays within the limit.
-        b.record(b"sale", 1_000);
-
-        let clawback = Entry::<Draft, 2>::new(
-            EntryId::generate(),
-            IdempotencyKey::new(b"too-much".to_vec()).expect("valid"),
-            date!(2026 - 03 - 20),
-        )
-        .debit(b.revenue, Eur::from_minor(1_001), Currency::EUR)
-        .credit(b.cash, Eur::from_minor(1_001), Currency::EUR);
-        assert!(matches!(
-            b.journal.record(clawback),
-            Err(JournalError::LimitBreached {
-                limit: BalanceLimit::NoDebitBalance,
-                headroom_minor: -1,
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn tightening_a_limit_does_not_invalidate_what_is_already_booked() {
-        // Master data governs the next booking, never the last one. An account
-        // already past a newly imposed limit keeps its balance and simply
-        // refuses to move further the wrong way.
-        let mut b = Books::new();
-        let overdrawn = Entry::<Draft, 2>::new(
-            EntryId::generate(),
-            IdempotencyKey::new(b"draw".to_vec()).expect("valid"),
-            date!(2026 - 03 - 15),
-        )
-        .credit(b.cash, Eur::from_minor(500), Currency::EUR)
-        .debit(b.revenue, Eur::from_minor(500), Currency::EUR);
-        b.journal.record(overdrawn).expect("records");
-
-        b.journal
-            .set_account_limit(b.cash, BalanceLimit::NoCreditBalance)
-            .expect("registered");
-
-        // What is recorded stays recorded and stays readable.
-        assert_eq!(b.journal.len(), 1);
-        assert_eq!(
-            b.journal
-                .balance(&b.cash_key(), BalanceQuery::all())
-                .expect("ok")
-                .signed_net()
-                .expect("ok"),
-            Eur::from_minor(-500)
-        );
-
-        // Moving further the wrong way is refused …
-        let worse = Entry::<Draft, 2>::new(
-            EntryId::generate(),
-            IdempotencyKey::new(b"worse".to_vec()).expect("valid"),
-            date!(2026 - 03 - 16),
-        )
-        .credit(b.cash, Eur::from_minor(1), Currency::EUR)
-        .debit(b.revenue, Eur::from_minor(1), Currency::EUR);
-        assert!(matches!(
-            b.journal.record(worse),
-            Err(JournalError::LimitBreached { .. })
-        ));
-
-        // … while repairing it is not.
-        b.record(b"repair", 500);
-    }
-
-    #[test]
-    fn a_limit_can_refuse_a_reversal() {
-        // The one place a limit collides with the correction rules: reversing a
-        // funding entry withdraws money the account may since have committed. A
-        // limit constrains the *resulting balance*, so it cannot make an
-        // exception for a correction. Reverse whatever consumed the funding
-        // first, or lift the limit deliberately.
-        let mut b = Books::new();
-        let funding = b.sealed(b"funding", 1_000);
-        b.journal
-            .record_validated(funding.clone())
-            .expect("records");
-
-        let spend = Entry::<Draft, 2>::new(
-            EntryId::generate(),
-            IdempotencyKey::new(b"spend".to_vec()).expect("valid"),
-            date!(2026 - 03 - 16),
-        )
-        .credit(b.cash, Eur::from_minor(1_000), Currency::EUR)
-        .debit(b.revenue, Eur::from_minor(1_000), Currency::EUR);
-        b.journal.record(spend).expect("records");
-
-        b.journal
-            .set_account_limit(b.cash, BalanceLimit::NoCreditBalance)
-            .expect("registered");
-
-        let undo = funding.reverse(
-            EntryId::generate(),
-            IdempotencyKey::new(b"undo".to_vec()).expect("valid"),
-            date!(2026 - 03 - 17),
-        );
-        assert!(matches!(
-            b.journal.record(undo),
-            Err(JournalError::LimitBreached { .. })
-        ));
-        assert_eq!(
-            b.journal.reversal_of(funding.id()),
-            None,
-            "a refused reversal must not mark the original as corrected"
-        );
-    }
-
-    #[test]
-    fn a_batch_that_breaches_a_limit_lands_in_full_or_not_at_all() {
-        let mut b = Books::new();
-        b.journal
-            .set_account_limit(b.cash, BalanceLimit::NoCreditBalance)
-            .expect("registered");
-        let before = b.journal.head();
-
-        let fund = b.sealed(b"fund", 1_000);
-        let draw = Entry::<Draft, 2>::new(
-            EntryId::generate(),
-            IdempotencyKey::new(b"draw".to_vec()).expect("valid"),
-            date!(2026 - 03 - 15),
-        )
-        .credit(b.cash, Eur::from_minor(1_500), Currency::EUR)
-        .debit(b.revenue, Eur::from_minor(1_500), Currency::EUR)
-        .seal(&b.journal.context())
-        .expect("balances");
-
-        assert!(matches!(
-            b.journal.record_batch(vec![fund, draw]),
-            Err(JournalError::LimitBreached { .. })
-        ));
-        assert!(b.journal.is_empty(), "the funding entry must unwind too");
-        assert_eq!(b.journal.head(), before);
-        assert!(b.journal.verify_balances().expect("ok"));
-        assert!(b.journal.verify_log());
-    }
-
-    #[test]
-    fn a_statement_shows_movements_and_the_running_balance() {
-        let mut b = Books::new();
-        b.record(b"a", 100);
-        b.record(b"b", 250);
-
-        let lines = b
-            .journal
-            .statement(&b.cash_key(), BalanceQuery::all())
-            .expect("no overflow");
-        assert_eq!(lines.len(), 2);
-
-        let first = lines.first().expect("present");
-        assert_eq!(first.amount, Eur::from_minor(100));
-        assert_eq!(first.direction, Direction::Debit);
-        assert_eq!(first.running.debits, Eur::from_minor(100));
-
-        let second = lines.get(1).expect("present");
-        assert_eq!(second.running.debits, Eur::from_minor(350));
-        assert_eq!(second.booking_date, date!(2026 - 03 - 15));
-    }
-
-    /// The reservation lifecycle, end to end, with nothing in the engine that
-    /// exists only for it — see [`Layer`].
-    #[test]
-    fn a_reservation_is_settled_by_an_ordinary_entry() {
-        let mut b = Books::new();
-        let reserve = |key: &[u8], on: Date| {
-            Entry::<Draft, 2>::new(
-                EntryId::generate(),
-                IdempotencyKey::new(key.to_vec()).expect("valid"),
-                on,
-            )
-        };
-
-        // Hold 900.
-        b.journal
-            .record(
-                reserve(b"hold", date!(2026 - 03 - 01))
-                    .post(
-                        Posting::debit(b.cash, Eur::from_minor(900), Currency::EUR)
-                            .in_layer(Layer::Pending),
-                    )
-                    .post(
-                        Posting::credit(b.revenue, Eur::from_minor(900), Currency::EUR)
-                            .in_layer(Layer::Pending),
-                    ),
-            )
-            .expect("records");
-
-        // Settle 900: the hold's inverse in the pending layer, the movement in
-        // the settled one. Each layer balances on its own, so one entry does
-        // both.
-        b.journal
-            .record(
-                reserve(b"settle", date!(2026 - 03 - 02))
-                    .post(
-                        Posting::credit(b.cash, Eur::from_minor(900), Currency::EUR)
-                            .in_layer(Layer::Pending),
-                    )
-                    .post(
-                        Posting::debit(b.revenue, Eur::from_minor(900), Currency::EUR)
-                            .in_layer(Layer::Pending),
-                    )
-                    .debit(b.cash, Eur::from_minor(900), Currency::EUR)
-                    .credit(b.revenue, Eur::from_minor(900), Currency::EUR),
-            )
-            .expect("records");
-
-        let settled = b.cash_key();
-        let reserved = BalanceKey {
-            layer: Layer::Pending,
-            ..settled
-        };
-        assert_eq!(
-            b.journal
-                .balance(&reserved, BalanceQuery::all())
-                .expect("ok")
-                .signed_net()
-                .expect("ok"),
-            Eur::ZERO,
-            "the hold is discharged"
-        );
-        assert_eq!(
-            b.journal
-                .balance(&settled, BalanceQuery::all())
-                .expect("ok")
-                .debits,
-            Eur::from_minor(900),
-            "and the money has moved"
-        );
-    }
-
-    /// A doubled release is refused by the account's balance limit and by
-    /// nothing else, which is exactly what [`Layer`] says.
-    #[test]
-    fn a_limited_account_refuses_a_reservation_released_twice() {
-        let mut b = Books::new();
-        b.journal
-            .set_account_limit(b.cash, BalanceLimit::NoCreditBalance)
-            .expect("registered");
-
-        let leg = |minor: i64| {
-            (
-                Posting::debit(b.cash, Eur::from_minor(minor), Currency::EUR)
-                    .in_layer(Layer::Pending),
-                Posting::credit(b.revenue, Eur::from_minor(minor), Currency::EUR)
-                    .in_layer(Layer::Pending),
-            )
-        };
-        let entry = |key: &[u8], on: Date, postings: [Posting<2>; 2]| {
-            let mut draft = Entry::<Draft, 2>::new(
-                EntryId::generate(),
-                IdempotencyKey::new(key.to_vec()).expect("valid"),
-                on,
-            );
-            for posting in postings {
-                draft = draft.post(posting);
-            }
-            draft
-        };
-
-        let (debit, credit) = leg(100);
-        b.journal
-            .record(entry(b"hold", date!(2026 - 03 - 01), [debit, credit]))
-            .expect("the hold is within the limit");
-
-        let (debit, credit) = leg(100);
-        b.journal
-            .record(entry(
-                b"release",
-                date!(2026 - 03 - 02),
-                [credit.inverted(), debit.inverted()],
-            ))
-            .expect("releasing it brings the hold back to nothing");
-
-        let (debit, credit) = leg(100);
-        assert!(
-            matches!(
-                b.journal.record(entry(
-                    b"release-again",
-                    date!(2026 - 03 - 03),
-                    [credit.inverted(), debit.inverted()],
-                )),
-                Err(JournalError::LimitBreached { .. })
-            ),
-            "a second release would put the fold of both layers below zero"
-        );
-    }
-
-    #[test]
-    fn a_query_can_fold_by_value_date_instead() {
-        let mut b = Books::new();
-        // Booked in March, settling in April: in March's books, in April's cash.
-        let straddling = b
-            .draft_on(b"straddle", 400, date!(2026 - 03 - 28))
-            .with_value_date(date!(2026 - 04 - 02));
-        b.journal.record(straddling).expect("records");
-        let plain = b.draft_on(b"plain", 100, date!(2026 - 03 - 10));
-        b.journal.record(plain).expect("records");
-
-        let key = b.cash_key();
-        let march = BalanceQuery::between(date!(2026 - 03 - 01), date!(2026 - 03 - 31));
-
-        assert_eq!(
-            b.journal.balance(&key, march).expect("ok").debits,
-            Eur::from_minor(500),
-            "March's books hold both"
-        );
-        assert_eq!(
-            b.journal
-                .balance(&key, march.by_value_date())
-                .expect("ok")
-                .debits,
-            Eur::from_minor(100),
-            "March's cash holds only what settled in March"
-        );
-
-        // And the difference is exactly the straddling entry, which shows up in
-        // April on a value-date basis and nowhere on a booking-date one.
-        let april = BalanceQuery::between(date!(2026 - 04 - 01), date!(2026 - 04 - 30));
-        assert_eq!(
-            b.journal
-                .balance(&key, april.by_value_date())
-                .expect("ok")
-                .debits,
-            Eur::from_minor(400)
-        );
-        assert_eq!(b.journal.balance(&key, april).expect("ok"), Balance::ZERO);
-    }
-
-    #[test]
-    fn a_value_dated_statement_opens_at_a_value_dated_figure() {
-        let mut b = Books::new();
-        for (key, minor, booked, valued) in [
-            (&b"a"[..], 700, date!(2026 - 02 - 25), date!(2026 - 02 - 27)),
-            // Booked in February, settling in March: February's books, March's cash.
-            (&b"b"[..], 300, date!(2026 - 02 - 28), date!(2026 - 03 - 02)),
-        ] {
-            let draft = b.draft_on(key, minor, booked).with_value_date(valued);
-            b.journal.record(draft).expect("records");
-        }
-
-        let key = b.cash_key();
-        let march =
-            BalanceQuery::between(date!(2026 - 03 - 01), date!(2026 - 03 - 31)).by_value_date();
-        let lines = b.journal.statement(&key, march).expect("ok");
-        let opening = b.journal.statement_opening(&key, march, None).expect("ok");
-
-        assert_eq!(lines.len(), 1);
-        assert_eq!(opening.debits, Eur::from_minor(700));
-        assert_eq!(
-            lines.last().expect("one line").running.debits,
-            Eur::from_minor(1000)
-        );
-        assert_eq!(
-            lines.last().expect("one line").booking_date,
-            date!(2026 - 02 - 28),
-            "a value-dated line still says which period it was booked in"
-        );
-    }
-
-    #[test]
-    fn a_scoped_statement_opens_at_what_came_before_it() {
-        let mut b = Books::new();
-        // Recorded in an order that shares nothing with the booking dates.
-        for (key, minor, on) in [
-            (&b"after"[..], 900, date!(2026 - 04 - 10)),
-            (&b"before"[..], 700, date!(2026 - 02 - 10)),
-            (&b"inside"[..], 300, date!(2026 - 03 - 10)),
-        ] {
-            let draft = b.draft_on(key, minor, on);
-            b.journal.record(draft).expect("records");
-        }
-
-        let key = b.cash_key();
-        let march = BalanceQuery::between(date!(2026 - 03 - 01), date!(2026 - 03 - 31));
-        let lines = b.journal.statement(&key, march).expect("no overflow");
-        let opening = b
-            .journal
-            .statement_opening(&key, march, None)
-            .expect("no overflow");
-
-        assert_eq!(lines.len(), 1, "only March moved inside the window");
-        assert_eq!(
-            opening.debits,
-            Eur::from_minor(700),
-            "March opens at February's closing figure, not at April's"
-        );
-        let last = lines.last().expect("one line");
-        assert_eq!(
-            last.running.debits,
-            Eur::from_minor(1000),
-            "opening plus the movement, with April left out of both"
-        );
-    }
-
-    #[test]
-    fn paging_a_statement_carries_the_pages_before_it() {
-        let mut b = Books::new();
-        for (i, on) in [
-            date!(2026 - 03 - 20),
-            date!(2026 - 03 - 05),
-            date!(2026 - 03 - 12),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let draft = b.draft_on(&[b'k', i as u8], 100, on);
-            b.journal.record(draft).expect("records");
-        }
-
-        let key = b.cash_key();
-        let march = BalanceQuery::between(date!(2026 - 03 - 01), date!(2026 - 03 - 31));
-        let lines = b.journal.statement(&key, march).expect("no overflow");
-        assert_eq!(lines.len(), 3);
-
-        // Resuming after each line reproduces exactly that line's running total,
-        // which is what makes a page's opening balance the previous page's close.
-        for line in &lines {
-            let opening = b
-                .journal
-                .statement_opening(&key, march, Some(line.position()))
-                .expect("no overflow");
-            assert_eq!(opening, line.running);
-        }
-    }
-
-    #[test]
-    fn a_statement_ignores_other_accounts_and_layers() {
-        let mut b = Books::new();
-        b.record(b"a", 100);
-
-        let pending = Entry::<Draft, 2>::new(
-            EntryId::generate(),
-            IdempotencyKey::new(b"p".to_vec()).expect("valid"),
-            date!(2026 - 03 - 16),
-        )
-        .post(Posting::debit(b.cash, Eur::from_minor(500), Currency::EUR).in_layer(Layer::Pending))
-        .post(
-            Posting::credit(b.revenue, Eur::from_minor(500), Currency::EUR)
-                .in_layer(Layer::Pending),
-        );
-        b.journal.record(pending).expect("records");
-
-        let settled = b.cash_key();
-        assert_eq!(
-            b.journal
-                .statement(&settled, BalanceQuery::all())
-                .expect("ok")
-                .len(),
-            1
-        );
-
-        let reserved = BalanceKey {
-            layer: Layer::Pending,
-            ..settled
-        };
-        assert_eq!(
-            b.journal
-                .statement(&reserved, BalanceQuery::all())
-                .expect("ok")
-                .len(),
-            1
-        );
-        assert_eq!(
-            b.journal
-                .balance(&reserved, BalanceQuery::all())
-                .expect("ok")
-                .debits,
-            Eur::from_minor(500)
-        );
-    }
-
-    #[test]
-    fn description_does_not_affect_ordering_or_balance() {
-        let mut b = Books::new();
-        let entry = b
-            .draft(b"k", 500)
-            .with_description(Description::new("annotated").expect("valid"));
-        b.journal.record(entry).expect("records");
-        assert!(b.journal.verify_balanced().expect("ok"));
-    }
-
-    // ── clearing ────────────────────────────────────────────────────────────
-
-    #[test]
-    fn open_items_track_invoices_against_payments() {
-        let mut b = Books::new();
-
-        // An invoice raises a receivable; a payment settles part of it.
-        let invoice = b.record(b"invoice", 1000);
-
-        let payment = Entry::<Draft, 2>::new(
-            EntryId::generate(),
-            IdempotencyKey::new(b"payment".to_vec()).expect("valid"),
-            date!(2026 - 03 - 20),
-        )
-        .credit(b.cash, Eur::from_minor(400), Currency::EUR)
-        .debit(b.revenue, Eur::from_minor(400), Currency::EUR);
-        let payment = b.journal.record(payment).expect("records");
-
-        let key = b.cash_key();
-
-        // Before clearing, both postings are open.
-        assert_eq!(b.journal.open_items(&key).expect("ok").len(), 2);
-
-        b.journal
-            .clear(
-                Clearing::new(ClearingId::generate(), key, date!(2026 - 03 - 20))
-                    .apply(PostingRef::new(invoice.id, 0), Eur::from_minor(400))
-                    .apply(PostingRef::new(payment.id, 0), Eur::from_minor(400)),
-            )
-            .expect("clears");
-
-        // The payment is fully applied; the invoice keeps its remainder open.
-        let open = b.journal.open_items(&key).expect("ok");
-        assert_eq!(open.len(), 1);
-        assert_eq!(
-            open.first().expect("present").residual,
-            Eur::from_minor(600)
-        );
-        assert_eq!(b.journal.clearings().len(), 1);
-    }
-
-    #[test]
-    fn clearing_does_not_change_any_balance() {
-        let mut b = Books::new();
-        let invoice = b.record(b"invoice", 1000);
-        let payment = Entry::<Draft, 2>::new(
-            EntryId::generate(),
-            IdempotencyKey::new(b"payment".to_vec()).expect("valid"),
-            date!(2026 - 03 - 20),
-        )
-        .credit(b.cash, Eur::from_minor(1000), Currency::EUR)
-        .debit(b.revenue, Eur::from_minor(1000), Currency::EUR);
-        let payment = b.journal.record(payment).expect("records");
-
-        let before = b.journal.trial_balance(BalanceQuery::all()).expect("ok");
-        b.journal
-            .clear(
-                Clearing::new(ClearingId::generate(), b.cash_key(), date!(2026 - 03 - 20))
-                    .apply(PostingRef::new(invoice.id, 0), Eur::from_minor(1000))
-                    .apply(PostingRef::new(payment.id, 0), Eur::from_minor(1000)),
-            )
-            .expect("clears");
-
-        // Clearing is an assignment, not a movement.
-        assert_eq!(
-            before,
-            b.journal.trial_balance(BalanceQuery::all()).expect("ok")
-        );
-        assert!(b.journal.verify_log());
-    }
-
-    #[test]
-    fn a_clearing_cannot_cross_layers() {
-        let mut b = Books::new();
-        let settled = b.record(b"settled", 500);
-        let reserved = Entry::<Draft, 2>::new(
-            EntryId::generate(),
-            IdempotencyKey::new(b"reserved".to_vec()).expect("valid"),
-            date!(2026 - 03 - 16),
-        )
-        .post(Posting::credit(b.cash, Eur::from_minor(500), Currency::EUR).in_layer(Layer::Pending))
-        .post(
-            Posting::debit(b.revenue, Eur::from_minor(500), Currency::EUR).in_layer(Layer::Pending),
-        );
-        let reserved = b.journal.record(reserved).expect("records");
-
-        let attempt = Clearing::new(ClearingId::generate(), b.cash_key(), date!(2026 - 03 - 20))
-            .apply(PostingRef::new(settled.id, 0), Eur::from_minor(500))
-            .apply(PostingRef::new(reserved.id, 0), Eur::from_minor(500));
-        assert!(matches!(
-            b.journal.clear(attempt),
-            Err(JournalError::Clearing(ClearingError::WrongLayer { .. }))
-        ));
-    }
-
-    // ── periods and seals ───────────────────────────────────────────────────
-
-    #[test]
-    fn sealing_requires_a_closing_period() {
-        let mut b = Books::new();
-        let id = b.march();
-        b.record(b"a", 100);
-
-        // Open is not enough: postings must be stopped before verification runs.
-        assert!(matches!(
-            b.journal.seal_period(&id),
-            Err(JournalError::Period(PeriodError::NotClosing {
-                state: PeriodState::Open,
-                ..
-            }))
-        ));
-
-        b.journal
-            .transition_period(&id, PeriodState::Closing)
-            .expect("ok");
-        let seal = b.journal.seal_period(&id).expect("seals");
-        assert!(seal.is_self_consistent());
-        assert_eq!(seal.entry_count, 1);
-        assert_eq!(
-            b.journal.calendar().state_on(date!(2026 - 03 - 15)),
-            PeriodState::Sealed
-        );
-    }
-
-    #[test]
-    fn a_sealed_closing_balance_cannot_be_restated_afterwards() {
-        // A seal's closing balance is *cumulative* through the period's last
-        // day, so the claim holds only while nothing can be booked at or before
-        // that day afterwards. Two individually legal writes would otherwise.
-        let mut b = Books::new();
-        let feb = PeriodId::new("2026-02").expect("valid");
-        b.journal
-            .define_period(
-                Period::new(feb.clone(), date!(2026 - 02 - 01), date!(2026 - 02 - 28))
-                    .expect("valid range"),
-            )
-            .expect("defines");
-        let march = b.march();
-        b.record(b"m1", 100);
-
-        // 1. March cannot be sealed while February is still open, because a
-        //    later February booking would restate March's closing balance.
-        b.journal
-            .transition_period(&march, PeriodState::Closing)
-            .expect("ok");
-        assert!(matches!(
-            b.journal.seal_period(&march),
-            Err(JournalError::Period(PeriodError::UnsealedPredecessor {
-                ref predecessor,
-                ..
-            })) if *predecessor == feb
-        ));
-
-        // Seal them in order instead. March is already closing.
-        b.journal
-            .transition_period(&feb, PeriodState::Closing)
-            .expect("ok");
-        b.journal.seal_period(&feb).expect("February seals first");
-        b.journal.seal_period(&march).expect("then March");
-        let sealed = b
-            .journal
-            .seals()
-            .get(&march)
-            .expect("March is sealed")
-            .clone();
-
-        // 2. Nothing may be booked at or before the watermark any more — not
-        //    into February, and not into a gap the calendar never defined.
-        assert_eq!(
-            b.journal.calendar().sealed_through(),
-            Some(date!(2026 - 03 - 31))
-        );
-        for (key, on) in [
-            (b"f1".as_slice(), date!(2026 - 02 - 10)),
-            (b"gap".as_slice(), date!(2025 - 11 - 30)),
-            (b"last".as_slice(), date!(2026 - 03 - 31)),
-        ] {
-            let draft = b.draft_on(key, 500, on);
-            let err = b
-                .journal
-                .record(draft)
-                .expect_err("the books are sealed through 2026-03-31");
-            assert!(matches!(err, JournalError::Invalid(ref e)
-            if e.any(|v| matches!(v, crate::entry::ValidationError::ClosedPeriod {
-                state: PeriodState::Sealed, ..
-            }))));
-        }
-
-        // So the sealed closing balance still describes the books exactly.
-        let recomputed = b
-            .journal
-            .trial_balance(BalanceQuery::through(date!(2026 - 03 - 31)))
-            .expect("no overflow");
-        assert_eq!(
-            crate::seal::trial_balance_head(&recomputed),
-            sealed.trial_balance
-        );
-
-        // And the next day forward is still perfectly open.
-        let draft = b.draft_on(b"apr", 700, date!(2026 - 04 - 01));
-        b.journal.record(draft).expect("April is open");
-    }
-
-    #[test]
-    fn sealing_an_unknown_period_is_an_error() {
-        let mut b = Books::new();
-        let ghost = PeriodId::new("nope").expect("valid");
-        assert!(matches!(
-            b.journal.seal_period(&ghost),
-            Err(JournalError::Period(PeriodError::Unknown { .. }))
-        ));
-    }
-
-    #[test]
-    fn a_sealed_period_cannot_be_sealed_twice() {
-        let mut b = Books::new();
-        let id = b.march();
-        b.record(b"a", 100);
-        b.journal
-            .transition_period(&id, PeriodState::Closing)
-            .expect("ok");
-        b.journal.seal_period(&id).expect("seals");
-        assert!(matches!(
-            b.journal.seal_period(&id),
-            Err(JournalError::Period(PeriodError::NotClosing {
-                state: PeriodState::Sealed,
-                ..
-            }))
-        ));
-        assert_eq!(b.journal.seals().len(), 1);
-    }
-
-    #[test]
-    fn consecutive_seals_chain_and_verify() {
-        let mut b = Books::new();
-        let march_id = b.march();
-        b.record(b"a", 100);
-        b.journal
-            .transition_period(&march_id, PeriodState::Closing)
-            .expect("ok");
-        let first = b.journal.seal_period(&march_id).expect("seals");
-
-        let april_id = PeriodId::new("2026-04").expect("valid");
-        b.journal
-            .define_period(
-                Period::new(
-                    april_id.clone(),
-                    date!(2026 - 04 - 01),
-                    date!(2026 - 04 - 30),
-                )
-                .expect("valid range"),
-            )
-            .expect("defines");
-        b.journal
-            .transition_period(&april_id, PeriodState::Closing)
-            .expect("ok");
-        let second = b.journal.seal_period(&april_id).expect("seals");
-
-        assert_eq!(first.prev_seal, None);
-        assert_eq!(second.prev_seal, Some(first.seal_hash));
-        assert_eq!(b.journal.seals().len(), 2);
-        assert!(b.journal.verify_seals().is_ok());
-    }
-
-    #[test]
-    fn a_seal_excludes_entries_booked_into_later_periods() {
-        // Sealing March in April is the normal case; April must not leak into
-        // March's closing balance.
-        let mut b = Books::new();
-        let id = b.march();
-        b.record(b"march", 100);
-
-        let april = b.draft_on(b"april", 900, date!(2026 - 04 - 10));
-        b.journal.record(april).expect("records");
-
-        b.journal
-            .transition_period(&id, PeriodState::Closing)
-            .expect("ok");
-        let seal = b.journal.seal_period(&id).expect("seals");
-
-        assert_eq!(seal.entry_count, 1, "only the March entry belongs to March");
-
-        let march_only = b
-            .journal
-            .trial_balance(BalanceQuery::through(date!(2026 - 03 - 31)))
-            .expect("ok");
-        assert_eq!(
-            seal.trial_balance,
-            crate::seal::trial_balance_head(&march_only)
-        );
-        assert_ne!(
-            seal.trial_balance,
-            crate::seal::trial_balance_head(
-                &b.journal.trial_balance(BalanceQuery::all()).expect("ok")
-            ),
-            "the whole-journal balance must not be what was sealed"
-        );
-    }
-
-    #[test]
-    fn a_seal_commits_to_the_balances_at_that_moment() {
-        let mut b = Books::new();
-        let id = b.march();
-        b.record(b"a", 100);
-        b.journal
-            .transition_period(&id, PeriodState::Closing)
-            .expect("ok");
-        let seal = b.journal.seal_period(&id).expect("seals");
-
-        // A later entry cannot retroactively change what the seal committed to.
-        let later = b.draft_on(b"later", 200, date!(2026 - 04 - 05));
-        b.journal.record(later).expect("records");
-
-        let recomputed = crate::seal::trial_balance_head(
-            &b.journal.trial_balance(BalanceQuery::all()).expect("ok"),
-        );
-        assert_ne!(recomputed, seal.trial_balance);
-        assert!(seal.is_self_consistent());
-    }
-
-    #[test]
-    fn one_call_proves_and_names_a_sealed_balance() {
-        // The whole audit answer, assembled where it cannot be assembled wrong.
-        // The engine and every durable backend route through the same
-        // `SealedBalance::assemble`, so they cannot drift.
-        let mut b = Books::new();
-        let id = b.march();
-        b.record(b"m", 119_000);
-        // Sealing March in April is the normal case, so the log holds a later
-        // entry when the seal is taken — which is why the closing balance is a
-        // fold by booking date rather than a prefix of the log.
-        let later = b.draft_on(b"apr", 7_777, date!(2026 - 04 - 05));
-        b.journal.record(later).expect("April is open");
-        b.journal
-            .transition_period(&id, PeriodState::Closing)
-            .expect("ok");
-        let seal = b.journal.seal_period(&id).expect("seals");
-
-        // The books move on in every way that bears on the binding proof.
-        b.journal
-            .register_path("Assets:Bank", date!(2026 - 05 - 01))
-            .expect("registers");
-        b.journal
-            .close_account(b.cash, date!(2026 - 05 - 31))
-            .expect("registered");
-        b.journal
-            .set_account_limit(b.revenue, BalanceLimit::NoDebitBalance)
-            .expect("registered");
-
-        let proven = b
-            .journal
-            .prove_sealed_balance(&id, b.cash_key())
-            .expect("the books still reproduce the seal")
-            .into_proven()
-            .expect("cash has a row");
-        assert!(proven.verify());
-        assert_eq!(proven.path().to_string(), "Assets:Cash");
-        assert_eq!(proven.seal.seal_hash, seal.seal_hash);
-        // April must not have leaked into March's closing balance.
-        assert_eq!(proven.balance.balance.debits, Eur::from_minor(119_000));
-
-        // A registered account with no row is `None`, not a fabricated zero.
-        let no_row = BalanceKey {
-            currency: Currency::USD,
-            ..b.cash_key()
-        };
-        assert_eq!(
-            b.journal
-                .prove_sealed_balance(&id, no_row)
-                .expect("no error"),
-            SealedBalanceOutcome::NoRow,
-        );
-
-        // An account onboarded after the seal is a different answer again.
-        let later_account = BalanceKey {
-            account: AccountId::from_index(2),
-            ..b.cash_key()
-        };
-        // An account onboarded after the seal is an *answer*, not an error: the
-        // books are intact and the seal simply cannot name it.
-        assert_eq!(
-            b.journal
-                .prove_sealed_balance(&id, later_account)
-                .expect("nothing is wrong with the books"),
-            SealedBalanceOutcome::NotYetRegistered,
-        );
-        assert!(
-            b.journal
-                .prove_sealed_balance(&id, later_account)
-                .expect("no error")
-                .is_absent()
-        );
-
-        // And an unsealed period has nothing to prove.
-        let ghost = PeriodId::new("2026-09").expect("valid");
-        assert!(matches!(
-            b.journal.prove_sealed_balance(&ghost, b.cash_key()),
-            Err(JournalError::SealedBalance(
-                SealedBalanceError::NotSealed { .. }
-            ))
-        ));
-    }
-
-    #[cfg(feature = "serde")]
-    #[test]
-    fn a_sealed_balance_survives_the_trip_to_whoever_needs_it() {
-        // The artifact exists to leave the process that built it. A claim an
-        // auditor cannot be handed is not a claim.
-        let mut b = Books::new();
-        let id = b.march();
-        b.record(b"m", 119_000);
-        b.journal
-            .transition_period(&id, PeriodState::Closing)
-            .expect("ok");
-        b.journal.seal_period(&id).expect("seals");
-
-        let proven = b
-            .journal
-            .prove_sealed_balance(&id, b.cash_key())
-            .expect("provable")
-            .into_proven()
-            .expect("cash has a row");
-
-        let json = serde_json::to_string(&proven).expect("serialises");
-        let received: SealedBalance<2> = serde_json::from_str(&json).expect("deserialises");
-        assert_eq!(received, proven);
-        // The receiver checks it themselves, holding nothing but this.
-        assert!(received.verify());
-        assert_eq!(received.path().to_string(), "Assets:Cash");
-
-        // A seal edited on the wire does not even deserialise, so a recipient
-        // who never thinks to call `verify` still cannot be fooled.
-        let forged = json.replace("\"entry_count\":1", "\"entry_count\":99");
-        assert_ne!(forged, json, "the test must actually alter the payload");
-        assert!(serde_json::from_str::<SealedBalance<2>>(&forged).is_err());
-    }
-
-    #[test]
-    fn a_sealed_balance_can_be_proven_from_the_seal_alone() {
-        let mut b = Books::new();
-        let id = b.march();
-        b.record(b"a", 119_000);
-        b.journal
-            .transition_period(&id, PeriodState::Closing)
-            .expect("ok");
-        let seal = b.journal.seal_period(&id).expect("seals");
-
-        let closing = b
-            .journal
-            .trial_balance(BalanceQuery::through(date!(2026 - 03 - 31)))
-            .expect("ok");
-        let proof = crate::seal::TrialBalanceCommitment::of(&closing)
-            .prove(&b.cash_key())
-            .expect("cash was posted to");
-        assert!(proof.verify_against(&seal));
-        assert_eq!(proof.balance.debits, Eur::from_minor(119_000));
-    }
-
-    // ── checkpoints and assertions ──────────────────────────────────────────
-
-    #[test]
-    fn a_checkpoint_round_trips_against_the_journal() {
-        let mut b = Books::new();
-        b.record(b"a", 100);
-        b.record(b"b", 250);
-
-        let cp = b.journal.checkpoint(&b.cash_key()).expect("no overflow");
-        assert_eq!(cp.balance.debits, Eur::from_minor(350));
-        assert!(b.journal.verify_checkpoint(&cp).is_ok());
-    }
-
-    #[test]
-    fn a_prefix_checkpoint_stays_valid_as_the_log_grows() {
-        let mut b = Books::new();
-        b.record(b"a", 100);
-        let stale = b.journal.checkpoint(&b.cash_key()).expect("ok");
-
-        // The log grows. The checkpoint still describes a real prefix, and its
-        // pinned head lets it be re-derived exactly, so it remains valid.
-        b.record(b"b", 250);
-        assert!(b.journal.verify_checkpoint(&stale).is_ok());
-
-        // A restated balance is caught.
-        let mut restated = stale;
-        restated.balance.debits = Eur::from_minor(9_999);
-        assert!(matches!(
-            b.journal.verify_checkpoint(&restated),
-            Err(CheckpointError::BalanceMismatch)
-        ));
-
-        // So is a checkpoint claiming a history the log never had.
-        let mut forged = stale;
-        forged.tree_head.root = crate::Hash::from_bytes([0xabu8; 32]);
-        assert!(matches!(
-            b.journal.verify_checkpoint(&forged),
-            Err(CheckpointError::HeadMismatch)
-        ));
-    }
-
-    #[test]
-    fn a_checkpoint_beyond_the_log_is_rejected() {
-        let mut b = Books::new();
-        b.record(b"a", 100);
-        let mut cp = b.journal.checkpoint(&b.cash_key()).expect("ok");
-        cp.tree_head.size = 99;
-        assert!(matches!(
-            b.journal.verify_checkpoint(&cp),
-            Err(CheckpointError::SizeOutOfRange { size: 99 })
-        ));
-    }
-
-    #[test]
-    fn a_checkpoint_over_an_empty_log_stays_valid_forever() {
-        // The prefix is the tree head's size, so an empty-prefix checkpoint says
-        // "nothing had moved after zero entries" — which no later append can
-        // falsify. A separate `Option` position could not say that: `None` would
-        // mean "empty" here and "current" to the balance reader.
-        let mut b = Books::new();
-        let key = b.cash_key();
-        let cp = b.journal.checkpoint(&key).expect("ok");
-        assert_eq!(cp.size(), 0);
-        assert!(b.journal.verify_checkpoint(&cp).is_ok());
-
-        b.record(b"a", 100);
-        b.record(b"b", 250);
-        assert!(
-            b.journal.verify_checkpoint(&cp).is_ok(),
-            "an empty-prefix checkpoint must survive the log growing"
-        );
-    }
-
-    #[test]
-    fn balance_assertions_catch_divergence() {
-        let mut b = Books::new();
-        b.record(b"a", 100);
-        b.record(b"b", 250);
-        let key = b.cash_key();
-
-        let holds = BalanceAssertion::net(key, Eur::from_minor(350));
-        assert!(b.journal.check_assertion(&holds).expect("ok").held());
-
-        let wrong = BalanceAssertion::net(key, Eur::from_minor(300));
-        let outcome = b.journal.check_assertion(&wrong).expect("ok");
-        assert!(!outcome.held());
-        assert!(matches!(
-            outcome,
-            AssertionOutcome::Failed { difference, .. } if difference == Eur::from_minor(50)
-        ));
-    }
-
-    #[test]
-    fn an_assertion_can_target_an_earlier_log_position() {
-        let mut b = Books::new();
-        b.record(b"a", 100);
-        b.record(b"b", 250);
-        let key = b.cash_key();
-        let earlier = BalanceAssertion::net(key, Eur::from_minor(100)).over_prefix(1);
-        assert!(b.journal.check_assertion(&earlier).expect("ok").held());
-        // The empty prefix is a legal target and asserts an untouched ledger.
-        let nothing = BalanceAssertion::net(key, Eur::ZERO).over_prefix(0);
-        assert!(b.journal.check_assertion(&nothing).expect("ok").held());
-    }
-
-    #[test]
-    fn an_assertion_can_target_a_date_the_way_a_statement_does() {
-        // What reconciliation actually needs: an external statement is dated,
-        // not positioned, and a backdated entry has to land in the period it
-        // economically belongs to rather than where it happened to be recorded.
-        let mut b = Books::new();
-        let march = b.draft_on(b"march", 100, date!(2026 - 03 - 15));
-        b.journal.record(march).expect("records");
-        let april = b.draft_on(b"april", 250, date!(2026 - 04 - 02));
-        b.journal.record(april).expect("records");
-        // Recorded last, booked first.
-        let backdated = b.draft_on(b"backdated", 40, date!(2026 - 03 - 01));
-        b.journal.record(backdated).expect("records");
-
-        let key = b.cash_key();
-        let closing =
-            BalanceAssertion::net(key, Eur::from_minor(140)).on_date(date!(2026 - 03 - 31));
-        assert!(
-            b.journal.check_assertion(&closing).expect("ok").held(),
-            "March closes at 1.40, backdated entry included"
-        );
-        assert_eq!(
-            b.journal
-                .balance(&key, BalanceQuery::through(date!(2026 - 04 - 30)))
-                .expect("ok")
-                .debits,
-            Eur::from_minor(390)
-        );
-    }
-
-    #[test]
-    fn open_items_are_oldest_first_whatever_identifiers_the_caller_brings() {
-        // Open items exist to be cleared, and FIFO — apply this payment to the
-        // oldest open invoice — is the workflow. "Oldest" is log order, which is
-        // the crate's answer to ordering everywhere else, and deliberately not
-        // entry-*identifier* order: identity is caller-supplied, so sorting by
-        // it is chronological only when the caller happens to use this crate's
-        // own time-ordered generator. These identifiers descend, so the two
-        // orders are exact opposites.
-        let mut b = Books::new();
-        let ids = [
-            EntryId::from_uuid(uuid::Uuid::from_u128(0xcccc << 112)),
-            EntryId::from_uuid(uuid::Uuid::from_u128(0xbbbb << 112)),
-            EntryId::from_uuid(uuid::Uuid::from_u128(0xaaaa << 112)),
-        ];
-        for (n, id) in ids.iter().enumerate() {
-            let draft = Entry::<Draft, 2>::new(
-                *id,
-                IdempotencyKey::new(format!("inv-{n}").into_bytes()).expect("valid"),
-                date!(2026 - 03 - 15),
-            )
-            .debit(b.cash, Eur::from_minor(100), Currency::EUR)
-            .credit(b.revenue, Eur::from_minor(100), Currency::EUR);
-            b.journal.record(draft).expect("records");
-        }
-
-        let key = b.cash_key();
-        let log_order = b.journal.postings_on(&key);
-        let items: Vec<_> = b
-            .journal
-            .open_items(&key)
-            .expect("no overflow")
-            .iter()
-            .map(|i| i.posting)
-            .collect();
-
-        assert_eq!(items, log_order, "open items must be oldest-first");
-        // And that is genuinely the opposite of sorting by identifier, so the
-        // assertion above is not satisfied by both orders at once.
-        let mut by_identifier = log_order.clone();
-        by_identifier.sort();
-        assert_ne!(
-            by_identifier, log_order,
-            "the fixture must actually distinguish the two orders"
-        );
-    }
-
-    #[test]
-    fn a_clearing_may_not_be_recorded_twice_under_one_identifier() {
-        let mut b = Books::new();
-        let invoice = b.record(b"invoice", 1000);
-        let payment = Entry::<Draft, 2>::new(
-            EntryId::generate(),
-            IdempotencyKey::new(b"payment".to_vec()).expect("valid"),
-            date!(2026 - 03 - 20),
-        )
-        .credit(b.cash, Eur::from_minor(1000), Currency::EUR)
-        .debit(b.revenue, Eur::from_minor(1000), Currency::EUR);
-        let payment = b.journal.record(payment).expect("records");
-
-        let id = ClearingId::generate();
-        let key = b.cash_key();
-        let build = || {
-            Clearing::new(id, key, date!(2026 - 03 - 20))
-                .apply(PostingRef::new(invoice.id, 0), Eur::from_minor(400))
-                .apply(PostingRef::new(payment.id, 0), Eur::from_minor(400))
-        };
-        b.journal.clear(build()).expect("clears");
-        assert!(matches!(
-            b.journal.clear(build()),
-            Err(JournalError::Clearing(ClearingError::DuplicateId { .. }))
-        ));
-    }
-
-    // ── batches ─────────────────────────────────────────────────────────────
-
-    #[test]
-    fn a_batch_lands_in_full_or_not_at_all() {
-        let mut b = Books::new();
-        b.record(b"existing", 100);
-        let before = b.journal.clone();
-
-        // The third entry reuses the second's key with different content.
-        let batch = vec![
-            b.sealed(b"batch-a", 100),
-            b.sealed(b"batch-b", 200),
-            b.sealed(b"batch-b", 300),
-        ];
-        assert!(matches!(
-            b.journal.record_batch(batch),
-            Err(JournalError::IdempotencyConflict { .. })
-        ));
-
-        // Byte-identical to how it started: index, keys, balances, tree head.
-        assert_eq!(b.journal.len(), before.len());
-        assert_eq!(b.journal.head(), before.head());
-        assert_eq!(
-            b.journal.trial_balance(BalanceQuery::all()).expect("ok"),
-            before.trial_balance(BalanceQuery::all()).expect("ok")
-        );
-        assert!(b.journal.verify_log());
-        assert!(b.journal.verify_balances().expect("ok"));
-        assert!(
-            b.journal
-                .statement(&b.cash_key(), BalanceQuery::all())
-                .expect("ok")
-                .len()
-                == 1
-        );
-    }
-
-    #[test]
-    fn rolling_back_a_batch_releases_its_keys_and_identifiers() {
-        let mut b = Books::new();
-        let good = b.sealed(b"reusable", 100);
-        let poison = b.sealed(b"poison", 200);
-        let clash = b.sealed(b"poison", 300);
-
-        assert!(
-            b.journal
-                .record_batch(vec![good.clone(), poison, clash])
-                .is_err()
-        );
-
-        // The rolled-back key and identifier are free again, so a corrected
-        // batch can reuse them.
-        b.journal
-            .record_batch(vec![good])
-            .expect("the key was released");
-        assert_eq!(b.journal.len(), 1);
-        assert!(b.journal.verify_log());
-    }
-
-    #[test]
-    fn rolling_back_a_batch_releases_a_reversal_link() {
-        let mut b = Books::new();
-        let original = b.sealed(b"orig", 100);
-        let original_id = original.id();
-        b.journal.record_validated(original.clone()).expect("ok");
-
-        let reversal = original
-            .reverse(
-                EntryId::generate(),
-                IdempotencyKey::new(b"rev".to_vec()).expect("valid"),
-                date!(2026 - 04 - 01),
-            )
-            .seal(&b.journal.context())
-            .expect("balances");
-        let poison = b.sealed(b"orig", 999);
-
-        assert!(b.journal.record_batch(vec![reversal, poison]).is_err());
-        assert_eq!(
-            b.journal.reversal_of(original_id),
-            None,
-            "an undone reversal must not leave the original marked corrected"
-        );
-        assert_eq!(b.journal.len(), 1);
-    }
-
-    #[test]
-    fn a_replay_inside_a_batch_is_not_a_failure() {
-        let mut b = Books::new();
-        let first = b.record(b"a", 100);
-        let outcomes = b
-            .journal
-            .record_batch(vec![b.sealed(b"a", 100), b.sealed(b"c", 300)])
-            .expect("a replay is not a conflict");
-        assert_eq!(outcomes.len(), 2);
-        assert!(!outcomes[0].is_new);
-        assert_eq!(outcomes[0].id, first.id);
-        assert!(outcomes[1].is_new);
-        assert_eq!(b.journal.len(), 2);
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Transparency`] with
+    /// [`KeyNameMismatch`](crate::transparency::Error::KeyNameMismatch) when
+    /// the key is not this ledger's.
+    #[cfg(feature = "witness")]
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "checkpoint", target = "doubleentry", level = "info", skip_all, fields(ledger = %self.id(), size = tracing::field::Empty))
+    )]
+    pub fn checkpoint(&self, key: &LogKey) -> Result<SignedCheckpoint, Error> {
+        let head = self.head();
+        #[cfg(feature = "tracing")]
+        crate::trace::proved(head.size);
+        Ok(key.sign(&Checkpoint::new(KeyName::from(self.id()), head))?)
+    }
+
+    /// The proof of `account`'s balance in (`currency`, `layer`) as sealed
+    /// for `period`, against [`head`](Self::head): the seal's inclusion,
+    /// the registration that names the handle, and the balance leaf at the
+    /// handle in the seal's tree (or no path when the seal has no tree for
+    /// (currency, layer): the balance is zero). It reads the account's leaf
+    /// and the `O(log² accounts)` stored nodes of its path, never every
+    /// leaf of the period, and is verified before it is handed out.
+    ///
+    /// ```
+    /// use doubleentry::prelude::*;
+    ///
+    /// let mut books = Journal::new(LedgerId::new("example.com/acme")?);
+    /// books.declare_currency(EUR, 2, date!("2026-01-01"))?;
+    /// books.open("Assets:Cash", AccountKind::Asset, date!("2026-01-01"))?;
+    /// books.open("Income:Sales", AccountKind::Income, date!("2026-01-01"))?;
+    /// books.define_months(2026, 3..=3)?;
+    /// books.record(
+    ///     Entry::new("sale-1", date!("2026-03-15"))
+    ///         .debit("Assets:Cash", amount!("10.00"), EUR)
+    ///         .credit("Income:Sales", amount!("10.00"), EUR),
+    /// )?;
+    /// books.seal_period("2026-03")?;
+    /// let proof = books.prove_balance("Assets:Cash", EUR, Layer::Settled, "2026-03")?;
+    /// let verified = proof.verify(&books.head())?;
+    /// assert_eq!(verified.account.to_string(), "Assets:Cash");
+    /// assert_eq!(verified.balance.net(), amount!("10.00"));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Query`]: an invalid or unknown period
+    /// ([`QueryError::NotSealed`] before its seal), or an account unknown or
+    /// registered after the seal ([`QueryError::UnknownAccount`]).
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "prove", target = "doubleentry", level = "debug", skip_all, fields(ledger = %self.id(), kind = "balance", size = tracing::field::Empty))
+    )]
+    pub fn prove_balance<A>(
+        &self,
+        account: A,
+        currency: Currency,
+        layer: Layer,
+        period: impl AsRef<str>,
+    ) -> Result<SealedBalanceProof<P>, Error>
+    where
+        A: TryInto<AccountRef> + fmt::Display,
+        A::Error: Into<ValueError>,
+    {
+        let account = AccountName::new(account);
+        now(self
+            .reads()
+            .prove_balance(&account, currency, layer, period.as_ref()))
+    }
+
+    /// A `tlog-proof` bundle of the record at `position`, at `checkpoint`'s
+    /// size (which may be below the head).
+    ///
+    /// ```
+    /// # #[cfg(feature = "witness")]
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use doubleentry::transparency::{LogKey, Proven};
+    /// use doubleentry::{Journal, LedgerId, record::Record};
+    ///
+    /// let ledger = LedgerId::new("example.com/ledgers/acme")?;
+    /// let books = Journal::new(ledger.clone());
+    /// let signed = books.checkpoint(&LogKey::from_seed(&ledger, [7; 32]))?;
+    /// let bundle = books.bundle_record(0, &signed)?;
+    /// let Proven::Record(genesis) = bundle.verify_inclusion()? else { panic!() };
+    /// assert!(matches!(genesis.record, Record::Genesis(_)));
+    /// # Ok(())
+    /// # }
+    /// # #[cfg(not(feature = "witness"))]
+    /// # fn main() {}
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Transparency`] with `ForeignCheckpoint` for another log's
+    /// checkpoint, `CheckpointMismatch` for a size this ledger has not
+    /// reached or another root at that size; [`Error::Query`] for a
+    /// position not below the checkpoint's size.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "prove", target = "doubleentry", level = "debug", skip_all, fields(ledger = %self.id(), kind = "record", size = tracing::field::Empty))
+    )]
+    pub fn bundle_record(
+        &self,
+        position: u64,
+        checkpoint: &SignedCheckpoint,
+    ) -> Result<ProofBundle<P>, Error> {
+        now(self.reads().bundle_record(position, checkpoint))
+    }
+
+    /// A `tlog-proof` bundle of entry `id`, at `checkpoint`'s size. Its
+    /// verification names the entry and recomputes its id.
+    ///
+    /// # Errors
+    ///
+    /// As [`bundle_record`](Self::bundle_record), and
+    /// [`QueryError::UnknownEntry`] when no entry had the id at that size.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "prove", target = "doubleentry", level = "debug", skip_all, fields(ledger = %self.id(), kind = "entry", size = tracing::field::Empty))
+    )]
+    pub fn bundle_entry(
+        &self,
+        id: EntryId,
+        checkpoint: &SignedCheckpoint,
+    ) -> Result<ProofBundle<P>, Error> {
+        now(self.reads().bundle_entry(id, checkpoint))
+    }
+
+    /// A `tlog-proof` bundle of `account`'s sealed balance in (`currency`,
+    /// `layer`) for `period`, at `checkpoint`'s size: one file that names
+    /// the account and proves its balance and nothing about any other
+    /// account (layout: [`transparency`](crate::transparency::ProofBundle)).
+    ///
+    /// # Errors
+    ///
+    /// As [`bundle_record`](Self::bundle_record) and
+    /// [`prove_balance`](Self::prove_balance), at the checkpoint's size.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "prove", target = "doubleentry", level = "debug", skip_all, fields(ledger = %self.id(), kind = "balance", size = tracing::field::Empty))
+    )]
+    pub fn bundle_balance<A>(
+        &self,
+        account: A,
+        currency: Currency,
+        layer: Layer,
+        period: impl AsRef<str>,
+        checkpoint: &SignedCheckpoint,
+    ) -> Result<ProofBundle<P>, Error>
+    where
+        A: TryInto<AccountRef> + fmt::Display,
+        A::Error: Into<ValueError>,
+    {
+        let account = AccountName::new(account);
+        now(self
+            .reads()
+            .bundle_balance(&account, currency, layer, period.as_ref(), checkpoint))
+    }
+
+    /// The bytes of hash tile `id` (`tlog-tiles`): its 32-byte hashes, read
+    /// from stored nodes. Hashes only — nothing about any record but its
+    /// leaf hash.
+    ///
+    /// ```
+    /// use doubleentry::transparency::TileId;
+    /// use doubleentry::{Journal, LedgerId};
+    ///
+    /// let books = Journal::new(LedgerId::new("example.com/acme")?);
+    /// for tile in TileId::changed(0, books.head().size) {
+    ///     assert_eq!(books.tile(tile)?.len(), 32 * usize::from(tile.width()));
+    /// }
+    /// # Ok::<(), doubleentry::Error>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Query`] for a tile beyond the head; [`Error::Transparency`]
+    /// with `WrongTileKind` for an entry bundle.
+    pub fn tile(&self, id: TileId) -> Result<Vec<u8>, Error> {
+        now(self.reads().tile(id))
+    }
+
+    /// The bytes of entry bundle `id` (`tlog-tiles`): the leaf bytes of its
+    /// records, each prefixed by its big-endian 16-bit length.
+    ///
+    /// **This discloses every record in the range** — postings, accounts,
+    /// amounts, documents — in full; only memo text stays out (a leaf
+    /// commits to it by a salted hash). Publish entry bundles only where
+    /// the books may be read.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Query`] for a bundle beyond the head;
+    /// [`Error::Transparency`] with `WrongTileKind` for a hash tile.
+    pub fn tile_entries(&self, id: TileId) -> Result<Vec<u8>, Error> {
+        now(self.reads().entry_bundle(id))
     }
 }

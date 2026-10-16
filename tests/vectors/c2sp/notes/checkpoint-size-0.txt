@@ -1,0 +1,10 @@
+# a checkpoint signed by note.Sign with the 0x01 log key from seed [7; 32]
+# input
+seed: 07
+origin: example.com/ledgers/acme
+size: 0
+root: 47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=
+# expect
+note_b64: ZXhhbXBsZS5jb20vbGVkZ2Vycy9hY21lCjAKNDdERVFwajhIQlNhKy9USW1XKzVKQ2V1UWVSa201Tk1wSldaRzNoU3VGVT0KCuKAlCBleGFtcGxlLmNvbS9sZWRnZXJzL2FjbWUgdzdiWmxMNXAxY0pwUFNmbXkvYmwrZ2lBUmVmMjNZRkpUWm9lckUxcGZqTWVWb2taejdCRENNck0wMHBsWXBjR2pRUjliM3lQTVBMMWNrN1BzdEZtN1NQNmtRST0K
+vkey: example.com/ledgers/acme+c3b6d994+AepKbGPinFIKvvVQexMuxfmVR3auvr57kkIe6mkURtIs
+go: accept

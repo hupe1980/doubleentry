@@ -1,0 +1,15 @@
+error[E0080]: evaluation panicked: date!("2026-02-30"): expected an existing date written YYYY-MM-DD
+ --> tests/ui/date_impossible_day.rs:2:13
+  |
+2 |     let _ = doubleentry::date!("2026-02-30");
+  |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `main::{constant#0}` failed here
+  |
+  = note: this error originates in the macro `$crate::panic::panic_2021` which comes from the expansion of the macro `doubleentry::date` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+note: erroneous constant encountered
+ --> tests/ui/date_impossible_day.rs:2:13
+  |
+2 |     let _ = doubleentry::date!("2026-02-30");
+  |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this note originates in the macro `doubleentry::date` (in Nightly builds, run with -Z macro-backtrace for more info)

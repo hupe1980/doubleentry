@@ -1,0 +1,11 @@
+error: no rules expected `-`
+ --> tests/ui/date_not_a_string.rs:2:36
+  |
+2 |     let _ = doubleentry::date!(2026-03-01);
+  |                                    ^ no rules expected this token in macro call
+  |
+note: while trying to match meta-variable `$literal:literal`
+ --> src/lib.rs
+  |
+  |     ($literal:literal) => {
+  |      ^^^^^^^^^^^^^^^^

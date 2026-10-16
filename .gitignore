@@ -25,5 +25,38 @@ site/public/
 site/static/processed_images/
 
 # Custom
-CONCEPT.md
 .DS_Store
+
+# `just site-verify` generates one test per site code block and deletes the
+# file again on success (scripts/site-verify.py).
+tests/site_examples*.rs
+
+# cargo-fuzz: build output, crash/timeout inputs, and generated corpus entries.
+# Only the hand-named seeds under fuzz/corpus/<target>/ are committed; `just
+# fuzz` writes new inputs to target/fuzz-corpus/ instead.
+fuzz/target/
+fuzz/artifacts/
+fuzz/coverage/
+
+# The lock file the downstream-crate check (tests/macros.rs) resolves offline
+tests/no_time_dep/Cargo.lock
+
+# ── Internal notes and feature specifications ─────────────────────────────────
+
+# Architecture notes (see concepts/README.md): the D/R-numbered decisions and
+# risks, and ROADMAP.md, the spec of specs — every open item names its feature
+# specification. Working documents, not claims this crate makes to its users:
+# `site/` is the public narrative, `CHANGELOG.md` the history and the rustdoc
+# the API contract. Nothing in the build reads them, and the `include`
+# allowlist in Cargo.toml keeps them out of the package regardless.
+/concepts/
+
+# This project's own feature specifications, and the Spec Kit machinery that
+# produces them: one `specs/NNN-slug/` per ROADMAP item (spec, plan, research,
+# tasks), `.specify/memory/constitution.md`, and the `/speckit-*` skills. Same
+# rule as `concepts/` — internal, and the published tree may not cite a path its
+# reader does not have; `just concepts-check` fails on one that does. Matches
+# billing, sepa, en16931 and agentplane.
+/specs/
+/.specify/
+/.claude/

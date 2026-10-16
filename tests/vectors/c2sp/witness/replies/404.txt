@@ -1,0 +1,9 @@
+# a reply of the stock witness to an add-checkpoint request
+# input
+request_b64: b2xkIDAKCnVua25vd24uZXhhbXBsZS9sb2cKMTMKcU85SVJNamgxYnBKeUJITnVHNlZlUjlkTXNwOWx3bXYyaWo5OWw2VW1sTT0KCuKAlCB1bmtub3duLmV4YW1wbGUvbG9nIGlhOUtBM3ZNSTV0WmhZaHBIamZpYk9tUU1Ud0kwTGk4M3BLRStHMzV6Z0JEVisvU2NoOVhHbkk3TjFPS3RCQUFLRDYvejRsK1FEZm1qa0VPbnc3OGVtVFVLd289Cg==
+witness: witness.example/w1+24b5d9fe+BP0XJDhaoMdbZPt4zWAvodmR/ev3axPFjtcC6sg16fYY
+status: 404
+content_type: 
+body_b64: 
+# expect
+crate: UnknownLog

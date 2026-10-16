@@ -1,0 +1,8 @@
+# a checkpoint with two extension lines, signed by note.Sign; kept verbatim
+# input
+note_b64: ZXhhbXBsZS5jb20vbGVkZ2Vycy9hY21lCjEzCnFPOUlSTWpoMWJwSnlCSE51RzZWZVI5ZE1zcDlsd212MmlqOTlsNlVtbE09CmV4dCBvbmUKZXh0IHR3bwoK4oCUIGV4YW1wbGUuY29tL2xlZGdlcnMvYWNtZSB3N2JabFBSZ0JmemJIKzJhM0dLRzNMajdLQ04zMmdaQnRGVzIzLzF6SWt1eEVnSjdBNFdvRlIyUzZnZEh3ZjVYUDBiQUpDSklZZVBiZWhqK3JPVERRMm5XSEE4PQo=
+vkey: example.com/ledgers/acme+c3b6d994+AepKbGPinFIKvvVQexMuxfmVR3auvr57kkIe6mkURtIs
+# expect
+go: accept
+size: 13
+extensions: 2

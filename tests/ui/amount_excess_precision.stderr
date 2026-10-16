@@ -1,0 +1,15 @@
+error[E0080]: evaluation panicked: amount!("1.234"): more decimal places than the scale P allows
+ --> tests/ui/amount_excess_precision.rs:2:34
+  |
+2 |     let _: doubleentry::Amount = doubleentry::amount!("1.234");
+  |                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `main::{constant#0}` failed here
+  |
+  = note: this error originates in the macro `$crate::panic::panic_2021` which comes from the expansion of the macro `doubleentry::amount` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+note: erroneous constant encountered
+ --> tests/ui/amount_excess_precision.rs:2:34
+  |
+2 |     let _: doubleentry::Amount = doubleentry::amount!("1.234");
+  |                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this note originates in the macro `doubleentry::amount` (in Nightly builds, run with -Z macro-backtrace for more info)

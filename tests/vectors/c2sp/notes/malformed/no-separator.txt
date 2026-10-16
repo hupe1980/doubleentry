@@ -1,0 +1,7 @@
+# a checkpoint note that breaks one rule: no-separator
+# input
+note_b64: ZXhhbXBsZS5jb20vbGVkZ2Vycy9hY21lCjEzCnFPOUlSTWpoMWJwSnlCSE51RzZWZVI5ZE1zcDlsd212MmlqOTlsNlVtbE09CuKAlCBleGFtcGxlLmNvbS9sZWRnZXJzL2FjbWUgdzdiWmxDNW1mQTA2RHBUaTYybVAwcU11RDFGSlc5bU1DS2ZZVlZwdi9PbEpMVzltVWhrdDJaUmRUZ21HYnlacURQZ2xrTHNOckFQcUtqaXlCK3crOEpraDFnQT0K
+vkey: example.com/ledgers/acme+c3b6d994+AepKbGPinFIKvvVQexMuxfmVR3auvr57kkIe6mkURtIs
+# expect
+go: reject
+crate: Malformed:MissingSeparator

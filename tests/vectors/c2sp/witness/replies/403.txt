@@ -1,0 +1,9 @@
+# a reply of the stock witness to an add-checkpoint request
+# input
+request_b64: b2xkIDAKCmV4YW1wbGUuY29tL2xlZGdlcnMvYWNtZQoxMwpxTzlJUk1qaDFicEp5QkhOdUc2VmVSOWRNc3A5bHdtdjJpajk5bDZVbWxNPQoK4oCUIGV4YW1wbGUuY29tL2xlZGdlcnMvYWNtZSA4bXc2MDlabUU4Um5hOUh5SzdwWStkeGtJTDJSU0lFaHVmcmtFYjEwVkxCVVk4YzFtR1hhNnVGaGp0czgxUTFLei96UjJ3RTlRdFBlcldSUWZNSkE4QzRlSGdFPQo=
+witness: witness.example/w1+24b5d9fe+BP0XJDhaoMdbZPt4zWAvodmR/ev3axPFjtcC6sg16fYY
+status: 403
+content_type: 
+body_b64: 
+# expect
+crate: Forbidden

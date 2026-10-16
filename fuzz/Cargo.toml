@@ -1,0 +1,73 @@
+# Fuzz targets for `doubleentry` (cargo-fuzz, nightly): `just fuzz-build`,
+# `just fuzz record 120`. Seeds: corpus/<target>/ (named, committed).
+# Its own unpublished workspace: not built by the root `cargo build`/`cargo test`,
+# and outside the crate's `include` allowlist.
+[package]
+name = "doubleentry-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+arbitrary = { version = "1", features = ["derive"] }
+doubleentry = { path = "..", features = ["serde", "witness"] }
+libfuzzer-sys = "0.4"
+serde = "1"
+serde_json = "1"
+unicode-normalization = { version = "0.1.25", default-features = false }
+
+# Keep this package out of any workspace above it.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "record"
+path = "fuzz_targets/record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "note"
+path = "fuzz_targets/note.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "witness_response"
+path = "fuzz_targets/witness_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "policy"
+path = "fuzz_targets/policy.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bundle"
+path = "fuzz_targets/bundle.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "serde"
+path = "fuzz_targets/serde.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "values"
+path = "fuzz_targets/values.rs"
+test = false
+doc = false
+bench = false

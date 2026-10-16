@@ -1,0 +1,7 @@
+# a checkpoint note that breaks one rule: empty-extension-line
+# input
+note_b64: ZXhhbXBsZS5jb20vbGVkZ2Vycy9hY21lCjEzCnFPOUlSTWpoMWJwSnlCSE51RzZWZVI5ZE1zcDlsd212MmlqOTlsNlVtbE09CgpleHQKCuKAlCBleGFtcGxlLmNvbS9sZWRnZXJzL2FjbWUgdzdiWmxBc0NKQzdrVTF3UlZuc3hTYjcrVk1jd0x3RWNJbGNIcmttWGZINmRuTU1MSElSNmhndnJZWmxQSFU2K0dlVW9kZFBGVkxMYmtJOGMxTHlnMXFUWHpBTT0K
+vkey: example.com/ledgers/acme+c3b6d994+AepKbGPinFIKvvVQexMuxfmVR3auvr57kkIe6mkURtIs
+# expect
+go: accept
+crate: Malformed:EmptyLine

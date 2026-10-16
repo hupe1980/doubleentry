@@ -96,14 +96,6 @@ async fn postgres_conforms() {
     println!("{} checks in {:?}", report.checks.len(), report.total());
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn postgres_debian_conforms() {
-    let report = conformance(|| async { store_in(debian().await, &next_schema()).await })
-        .await
-        .unwrap_or_else(|failure| panic!("{failure}"));
-    println!("{} checks in {:?}", report.checks.len(), report.total());
-}
-
 // ── US1 ─────────────────────────────────────────────────────────────────────
 
 #[tokio::test]

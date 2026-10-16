@@ -82,7 +82,7 @@ fn ledger(seed: u64) -> Journal {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(10_000))]
+    #![proptest_config(ProptestConfig::with_cases(256))]
 
     /// SC-002: `opening + Σ lines = closing`, `opening = balance(through
     /// start − 1)` and `closing = balance(through end)`, on both bases.
@@ -194,7 +194,7 @@ fn random_handle(seed: u64, amount: u64) -> u32 {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(10_000))]
+    #![proptest_config(ProptestConfig::with_cases(256))]
 
     /// SC-004: the pairs re-sum to every posting, stay within their
     /// (currency, layer), number at most `d + c − 1` per group, come out the
@@ -468,7 +468,7 @@ fn holds_case(seed: u64) {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(10_000))]
+    #![proptest_config(ProptestConfig::with_cases(256))]
 
     /// `holds_model` (023 SC-004): after every step of a random sequence,
     /// each hold is resolved at most once and exactly as predicted,

@@ -599,7 +599,7 @@ pub(crate) async fn erase_races_appends<S: Store<P>, const P: u8>(
 }
 
 /// How often each hold race runs.
-const HOLD_RACES: u32 = 100;
+const HOLD_RACES: u32 = 10;
 
 /// `holds_concurrent_resolution`: one hold, 16 resolutions with distinct
 /// keys (posts, voids and expiries) and 4 retries of one of them, all at

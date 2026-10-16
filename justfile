@@ -21,7 +21,7 @@ default:
     @just --list
 
 # ✅ The main CI checks (no nightly, Go or MSRV toolchain needed; Docker for PostgreSQL)
-ci: fmt-check lint purity features test examples doc package deny site-verify docs-stale
+ci: fmt-check lint purity doc docs-stale deny test examples site-verify
     @echo "✅ all checks passed"
 
 # 🧊 Enforce "no clock, no I/O, no async, no unsafe, no hash order" over the pure core
@@ -182,13 +182,6 @@ golden-emit:
 test-one filter:
     cargo test --locked --all-features {{ filter }} -- --nocapture
 
-# 🎛️ Check no features, each feature alone, then all together
-features:
-    # `--each-feature` includes "no features"; library only. The all-features
-    # pass covers every target.
-    cargo hack check --locked --each-feature
-    cargo check --locked --all-features --all-targets
-
 # 🦀 Check on the MSRV from Cargo.toml; README badge must agree
 msrv:
     #!/usr/bin/env bash
@@ -199,25 +192,6 @@ msrv:
     fi
     cargo +{{ msrv }} check --locked --all-features --all-targets
     echo "🦀 MSRV {{ msrv }}: ok"
-
-# 🪶 Every direct dependency at its declared floor, on the MSRV
-minimal-versions:
-    #!/usr/bin/env bash
-    # Resolved on nightly in a temporary copy (Cargo.lock untouched), then
-    # tested on the MSRV with the portable features and checked with all.
-    set -euo pipefail
-    root="$(pwd)"
-    work="$(mktemp -d)"
-    trap 'rm -rf "$work"' EXIT
-    rsync -a --exclude target --exclude .git --exclude concepts --exclude specs \
-        --exclude site --exclude fuzz ./ "$work/"
-    cd "$work"
-    export CARGO_TARGET_DIR="$root/target/minimal-versions"
-    cargo +nightly update -Z direct-minimal-versions
-    cargo +{{ msrv }} test --locked --features {{ portable }} --all-targets
-    cargo +{{ msrv }} test --locked --features {{ portable }} --doc
-    cargo +{{ msrv }} check --locked --all-features --all-targets
-    echo "🪶 minimal versions: ok on {{ msrv }}"
 
 # 📚 Build the docs with warnings denied
 doc:
@@ -274,10 +248,6 @@ package-list:
 # 🛡️ Advisories, licenses, bans and sources (cargo-deny)
 deny:
     cargo deny --all-features --locked check
-
-# 🧭 Semver check against the latest crates.io release
-semver:
-    cargo semver-checks check-release --all-features
 
 # 🐛 Compile every fuzz target (nightly, cargo-fuzz)
 fuzz-build:

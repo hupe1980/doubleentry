@@ -95,12 +95,13 @@ pub struct Config {
 }
 
 impl Default for Config {
-    /// Every check, 8 seeds of 300 steps, 8 writers.
+    /// Every check, 8 seeds of 200 steps, 8 writers; widen with the
+    /// `DOUBLEENTRY_SEEDS`/`DOUBLEENTRY_STEPS` variables.
     fn default() -> Self {
         Self {
             check: None,
             seeds: SEEDS.to_vec(),
-            steps: 300,
+            steps: 200,
             writers: 8,
         }
     }

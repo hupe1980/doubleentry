@@ -30,7 +30,7 @@ from your factory:
   in-memory `Journal` answers, field for field;
 - **simulation**: seeded workloads of valid and mutated operations with retries
   of used keys, reads compared with an independent model, store invariants and
-  an `audit()` at the end; by default 8 seeds of 300 steps;
+  an `audit()` at the end; by default 8 seeds of 200 steps;
 - **concurrency**: real tasks racing appends, batches, retries, draws on
   limited accounts, a seal against an append into its period, memo erasures and
   hold resolutions;

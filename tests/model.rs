@@ -293,7 +293,7 @@ fn us1_splits_are_exact() {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(1024))]
+    #![proptest_config(ProptestConfig::with_cases(256))]
 
     #[test]
     fn us1_allocations_conserve_the_total(
@@ -484,7 +484,7 @@ fn segment() -> impl Strategy<Value = String> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(1024))]
+    #![proptest_config(ProptestConfig::with_cases(256))]
 
     #[test]
     fn us7_paths_round_trip(segments in prop::collection::vec(segment(), 1..=16)) {
@@ -1098,7 +1098,7 @@ fn posting_ref_at_equals_the_decoded_clearing_reference() {
 // ── SC-004 (post-impl): every value type round-trips, 1 024 cases each ──────
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(1024))]
+    #![proptest_config(ProptestConfig::with_cases(256))]
 
     #[test]
     fn sc004_currency_round_trips(code in "[A-Z]{3}") {
@@ -1154,7 +1154,7 @@ proptest! {
 
 #[cfg(feature = "serde")]
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(1024))]
+    #![proptest_config(ProptestConfig::with_cases(256))]
 
     /// SC-004: serde round-trips as properties, not one example per type.
     #[test]

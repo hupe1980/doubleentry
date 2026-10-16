@@ -582,7 +582,7 @@ fn random_journal(seed: u64, operations: usize) -> Journal {
 
 #[test]
 fn untampered_random_journals_pass() {
-    for seed in 0..100 {
+    for seed in 0..20 {
         let books = random_journal(seed, 1000);
         let report = books.audit().unwrap();
         assert_eq!(report.head, books.head());

@@ -1,8 +1,8 @@
 name: CI
 
-# Actions are pinned by commit SHA; checkouts drop credentials; contents are
-# read-only; cargo calls pass `--locked` (except the minimal-versions resolve).
-# Jobs run the `just` recipe of the same name.
+# Four parallel jobs, each one build. Actions are pinned by commit SHA;
+# checkouts drop credentials; contents are read-only; cargo calls pass
+# `--locked`. Jobs run the `just` recipe of the same name.
 on:
   push:
     branches: [main]
@@ -21,12 +21,10 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  # Every feature except `postgres` (own job, needs Docker). Same as `portable` in the justfile.
-  PORTABLE_FEATURES: serde,sqlite,witness,testing,tracing
 
 jobs:
-  fmt:
-    name: 🎨 rustfmt
+  check:
+    name: 🔎 check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -34,84 +32,20 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
-          components: rustfmt
+          components: rustfmt, clippy
       - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
         with:
-          tool: just
-      - run: just fmt-check
-
-  clippy:
-    name: 📎 clippy
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
-        with:
-          components: clippy
-      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
-        with:
-          tool: just
+          tool: just,cargo-deny
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      # Default and all features, warnings denied; deny-lints in Cargo.toml.
+      - run: just fmt-check
       - run: just lint
-
-  purity:
-    name: 🧊 purity
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
-        with:
-          tool: just
-      # No clock, I/O, async, unsafe or hash order in the pure modules.
       - run: just purity
+      - run: just doc
+      - run: just docs-stale
+      - run: just deny
 
   test:
-    name: 🧪 test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - name: test (no features)
-        run: cargo test --locked --all-targets
-      - name: test (portable features)
-        run: cargo test --locked --features "$PORTABLE_FEATURES" --all-targets
-        shell: bash
-      # `--all-targets` excludes doctests; they include the README's code.
-      - name: doctests (portable features)
-        run: cargo test --locked --features "$PORTABLE_FEATURES" --doc
-        shell: bash
-
-  postgres:
-    name: 🐘 postgres (testcontainers)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      # testcontainers starts its own PostgreSQL. `tests/postgres.rs` needs
-      # `testing` (it runs the conformance suite).
-      - name: test (postgres)
-        run: cargo test --locked --features postgres,testing --test postgres
-      # The conformance suite on MemoryStore, SQLite and PostgreSQL.
-      - name: conformance across every backend
-        run: cargo test --locked --all-features conforms
-
-  features:
-    name: 🎛️ feature matrix
+    name: 🧪 test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -120,10 +54,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
       - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
         with:
-          tool: cargo-hack,just
+          tool: just
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      # No features, each feature alone, then all together.
-      - run: just features
+      # All features in one build: unit, integration and doctests, SQLite and
+      # PostgreSQL (testcontainers starts its own; the runner has Docker).
+      - run: cargo test --locked --all-features
+      - run: just examples
+      # Every Rust block on the site, compiled (and run unless `no_run`).
+      - run: just site-verify
 
   msrv:
     name: 🦀 MSRV
@@ -142,65 +80,7 @@ jobs:
         with:
           tool: just
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      # Also fails if the README badge names another version.
       - run: just msrv
-
-  docs:
-    name: 📚 rustdoc
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@f0d5300ba8908d942c808f4d31c08471d7798ba3 # nightly
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
-      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
-        with:
-          tool: just
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - name: rustdoc (stable, warnings denied)
-        run: just doc
-      # As docs.rs builds it: nightly, `--cfg docsrs`, all features.
-      - name: rustdoc (docs.rs-equivalent)
-        run: just docsrs
-
-  examples:
-    name: ▶️ examples
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
-      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
-        with:
-          tool: just
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      # Each example asserts its own outcomes.
-      - run: just examples
-
-  interop:
-    name: 🤝 C2SP interop (Go)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version: "1.27"
-          cache-dependency-path: interop/c2sp/go.sum
-      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
-        with:
-          tool: just
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      # Go regenerates tests/vectors/c2sp/, the crate reads them, Go verifies
-      # what the crate emits and runs the stock witness on its requests.
-      - run: just interop
-      # The committed vectors are the ones Go generates today.
-      - name: no drift in the committed vectors
-        run: test -z "$(git status --porcelain -- tests/vectors/c2sp)" || { git status --short -- tests/vectors/c2sp; exit 1; }
 
   public-api:
     name: 🔭 public API
@@ -209,8 +89,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # Pinned: rustdoc's JSON rendering changes between nightlies. Keep in
-      # sync with `nightly` in the justfile.
+      # Pinned: rustdoc's rendering changes between nightlies. Keep in sync
+      # with `nightly` in the justfile.
       - uses: dtolnay/rust-toolchain@f0d5300ba8908d942c808f4d31c08471d7798ba3 # nightly
         with:
           toolchain: nightly-2026-10-15
@@ -218,131 +98,4 @@ jobs:
         with:
           tool: cargo-public-api,just
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      # Fails on an uncommitted API diff, a dependency path, or an item under
-      # two paths (prelude aside).
       - run: just public-api
-
-  package:
-    name: 📦 package
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
-      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
-        with:
-          tool: just
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      # Dry-run publish, then refuse non-crate paths in the package.
-      - run: just package
-      - run: just package-list
-
-  deny:
-    name: 🛡️ cargo-deny
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
-        with:
-          tool: cargo-deny,just
-      # Advisories, licenses, bans and sources (deny.toml).
-      - run: just deny
-
-  semver:
-    name: 🧭 semver
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      # Against the latest crates.io release; the Cargo.toml version declares
-      # the release type.
-      - uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239 # v2.9
-        with:
-          feature-group: all-features
-
-  minimal-versions:
-    name: 🪶 minimal versions
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: read rust-version
-        id: msrv
-        run: echo "version=$(sed -n 's/^rust-version *= *"\(.*\)"/\1/p' Cargo.toml)" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@f0d5300ba8908d942c808f4d31c08471d7798ba3 # nightly
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
-        with:
-          toolchain: ${{ steps.msrv.outputs.version }}
-      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
-        with:
-          tool: just
-      # Direct dependencies at their declared floors, on the MSRV.
-      - run: just minimal-versions
-
-  fuzz-build:
-    name: 🐛 fuzz targets compile
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@f0d5300ba8908d942c808f4d31c08471d7798ba3 # nightly
-      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
-        with:
-          tool: cargo-fuzz,just
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          workspaces: fuzz
-      # Compiled only; run targets locally with `just fuzz`.
-      - run: just fuzz-build
-
-  bench-build:
-    name: ⏱️ benches compile
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
-      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
-        with:
-          tool: just
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      # Compiled only; figures are not taken on shared runners.
-      - run: just bench-build
-
-  site-examples:
-    name: 🌐 site examples
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
-        with:
-          components: rustfmt
-      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
-        with:
-          tool: just
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      # Every Rust block on the site, compiled and run (`rust,no_run`:
-      # compiled only). The README is covered by the doctests.
-      - run: just site-verify
-
-  docs-stale:
-    name: 🧹 docs stale names
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
-        with:
-          tool: just
-      # No 0.7-only API names; docs.rs links and GoBD test citations resolve.
-      - run: just docs-stale

@@ -1,0 +1,4 @@
+# Test vectors and fuzz seeds are compared byte for byte (hashes, signatures,
+# manifests): Git must never convert their line endings on checkout.
+tests/vectors/** -text
+fuzz/corpus/** -text

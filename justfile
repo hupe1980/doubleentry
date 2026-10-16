@@ -9,6 +9,10 @@ set shell := ["bash", "-uc"]
 # The MSRV, read from `rust-version` in Cargo.toml — its single source.
 msrv := `sed -n 's/^rust-version *= *"\(.*\)"/\1/p' Cargo.toml`
 
+# The nightly the public-API listing is rendered with — pinned, because rustdoc
+# output changes between nightlies. Keep in sync with the `public-api` CI job.
+nightly := "nightly-2026-10-15"
+
 # Every feature except `postgres` (needs Docker). Same as PORTABLE_FEATURES in ci.yml.
 portable := "serde,sqlite,witness,testing,tracing"
 
@@ -107,7 +111,7 @@ public-api:
     # No dependency path but `time::Date`, and no item under two paths except
     # through `prelude`.
     set -euo pipefail
-    listing="$(cargo +nightly public-api --all-features --simplified)"
+    listing="$(cargo +{{ nightly }} public-api --all-features --simplified)"
     if ! diff -u tests/public-api.txt <(echo "$listing"); then
         echo "❌ the public API changed: review the diff, then 'just public-api-bless'" >&2
         exit 1
@@ -147,7 +151,7 @@ public-api:
 
 # 🔭 Re-snapshot tests/public-api.txt after a reviewed surface change
 public-api-bless:
-    cargo +nightly public-api --all-features --simplified > tests/public-api.txt
+    cargo +{{ nightly }} public-api --all-features --simplified > tests/public-api.txt
 
 # 🔒 Golden vectors (record encoding and hashes, roots, proofs) and the committed C2SP vectors
 golden:

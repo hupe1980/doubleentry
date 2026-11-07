@@ -126,16 +126,18 @@ Text columns are `COLLATE "C"`, so paths and dimension values compare by bytes o
 every locale. Amounts are 16-byte big-endian integers (`BYTEA`); SQL never
 computes with money.
 
+## Connections
+
+The URL carries your settings: `application_name` (or `PGAPPNAME`) for
+`pg_stat_activity`, and `sslmode`, `sslrootcert`, `sslcert`, `sslkey` for TLS.
+The store owns its pool — `SqlOptions::max_connections`, shared by every
+`with_schema` store — and joins no external transaction; to post together with
+your own write, use an
+[outbox](@/docs/concepts/idempotency.md#together-with-your-own-database-the-outbox).
+
 ## TLS
 
-The `postgres` feature enables no TLS stack. Add one to your application and
-Cargo's feature unification enables it for the crate's connections:
-
-```toml
-sqlx = { version = "0.9", features = ["tls-rustls-aws-lc-rs"] } # or tls-rustls-ring-webpki, tls-native-tls
-```
-
-Then ask for it in the URL:
+Enable `postgres-tls` (rustls on aws-lc-rs) and ask for TLS in the URL:
 `postgres://app:secret@db/books?sslmode=verify-full&sslrootcert=/etc/ssl/db-ca.pem`.
 
 ## Limits

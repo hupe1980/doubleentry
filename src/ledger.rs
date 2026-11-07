@@ -478,6 +478,11 @@ impl<S: Store<P>, const P: u8> Ledger<S, P> {
     /// Records an entry; a retry of a recorded draft returns the original
     /// receipt with `replayed == true` and writes nothing.
     ///
+    /// Record after your own business transaction commits, never before: the
+    /// log is append-only. An
+    /// [outbox](https://hupe1980.github.io/doubleentry/docs/concepts/idempotency/#together-with-your-own-database-the-outbox)
+    /// makes the pair exactly-once.
+    ///
     /// # Errors
     ///
     /// As [`Journal::record`](crate::Journal::record), and

@@ -115,19 +115,21 @@ All off by default.
 | Feature | Enables |
 |---|---|
 | `serde` | `Serialize` / `Deserialize` on public types (transport only; hashing never uses serde) |
-| `sqlite` | `SqlStore<Sqlite>` (sqlx, bundled SQLite) |
-| `postgres` | `SqlStore<Postgres>` (sqlx, no TLS stack) |
+| `sqlite` | `SqlStore<Sqlite>` (SQLite bundled) |
+| `postgres` | `SqlStore<Postgres>` (no TLS stack) |
+| `postgres-tls` | `postgres` + TLS (rustls on aws-lc-rs, Mozilla roots) |
 | `witness` | Ed25519 signing and verification for `transparency` |
 | `testing` | The store conformance suite and, with `witness`, `TestWitness` |
 | `tracing` | `tracing` spans; never an amount, memo or account path |
 
-For PostgreSQL over TLS, enable a TLS feature on your own `sqlx` dependency, e.g.
-`sqlx = { version = "0.9", features = ["tls-rustls-aws-lc-rs"] }`.
+The driver (sqlx) is an implementation detail: it is not in the API and not in your manifest,
+and its upgrades ship without an API change. TLS is `postgres-tls` plus `sslmode=verify-full`
+in the URL.
 
 ## 🦀 MSRV
 
-Rust **1.94** (required by sqlx 0.9), declared as `rust-version` and checked in CI. It is never
-raised in a patch release, and only to a stable release at least six months old.
+Rust **1.94**, declared as `rust-version` and checked in CI. It is never raised in a patch
+release, and only to a stable release at least six months old.
 
 ## 📄 License
 

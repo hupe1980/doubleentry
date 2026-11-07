@@ -38,12 +38,14 @@ pub struct Postgres;
 
 impl<const P: u8> SqlStore<Postgres, P> {
     /// Connects to the PostgreSQL database at `url` with the default
-    /// [`SqlOptions`] (schema `doubleentry`).
+    /// [`SqlOptions`] (schema `doubleentry`). The URL carries every connection
+    /// setting: see [`postgres_with`](Self::postgres_with), "Connection settings".
     ///
     /// # Errors
     ///
-    /// `Backend` for an invalid URL; `Unavailable` when the server cannot be
-    /// reached.
+    /// `Backend` for an invalid URL, or for a URL that requires TLS on a
+    /// build without `postgres-tls` (the message names the feature);
+    /// `Unavailable` when the server cannot be reached.
     pub async fn postgres(url: &str) -> Result<Self, StoreError> {
         Self::postgres_with(url, SqlOptions::default()).await
     }
@@ -51,6 +53,35 @@ impl<const P: u8> SqlStore<Postgres, P> {
     /// Connects to the PostgreSQL database at `url` with `options`; the
     /// schema name is quoted as an identifier everywhere and never put in
     /// the connection's settings.
+    ///
+    /// # Connection settings
+    ///
+    /// The URL — and the standard `PG…` environment variables such as
+    /// `PGAPPNAME` and `PGSSLMODE` — carries everything the host owns:
+    /// identity (`application_name`), TLS (`sslmode`, `sslrootcert`,
+    /// `sslcert`, `sslkey`) and server `options`.
+    ///
+    /// ```no_run
+    /// use doubleentry::store::{Postgres, SqlOptions, SqlStore};
+    ///
+    /// # async fn run() -> Result<(), doubleentry::store::StoreError> {
+    /// let url = "postgres://app@db/books?sslmode=verify-full\
+    ///            &sslrootcert=/etc/ssl/db-ca.pem&application_name=accountingd";
+    /// let options = SqlOptions { max_connections: 4, ..SqlOptions::default() };
+    /// let store = SqlStore::<Postgres>::postgres_with(url, options).await?;
+    /// # drop(store); Ok(()) }
+    /// ```
+    ///
+    /// - Only `sslmode=require`, `verify-ca` and `verify-full` guarantee
+    ///   encryption, and they need the `postgres-tls` feature; prefer
+    ///   `verify-full`. `prefer`, the default, falls back to plain text.
+    /// - [`SqlOptions::max_connections`] is the store's whole connection
+    ///   budget, shared by every store made with
+    ///   [`with_schema`](SqlStore::with_schema).
+    /// - The store owns its pool: it takes no external pool or connection and
+    ///   joins no external transaction. To post together with a write to
+    ///   your own database, use an
+    ///   [outbox](https://hupe1980.github.io/doubleentry/docs/concepts/idempotency/#together-with-your-own-database-the-outbox).
     ///
     /// # Errors
     ///
@@ -313,6 +344,48 @@ mod tests {
                 "{refused:?}"
             );
         }
+    }
+
+    /// Connects to a listener that accepts and hangs up, with `sslmode=require`:
+    /// the driver decides about TLS before it writes a byte.
+    fn connect_requiring_tls() -> Result<SqlStore<Postgres>, StoreError> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .map_err(|e| StoreError::backend("test", e))?;
+        let port = listener
+            .local_addr()
+            .map_err(|e| StoreError::backend("test", e))?
+            .port();
+        let server = std::thread::spawn(move || drop(listener.accept()));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| StoreError::backend("test", e))?;
+        let url = format!("postgres://u@127.0.0.1:{port}/d?sslmode=require");
+        let outcome = runtime.block_on(SqlStore::<Postgres>::postgres(&url));
+        drop(server.join());
+        outcome
+    }
+
+    #[cfg(not(feature = "postgres-tls"))]
+    #[test]
+    fn tls_without_the_feature_names_it() {
+        use std::error::Error as _;
+        let Err(error) = connect_requiring_tls() else {
+            panic!("connected without TLS support")
+        };
+        assert_eq!(error.kind(), &crate::store::StoreErrorKind::Backend);
+        assert!(!error.is_transient() && !error.may_have_applied());
+        assert!(error.to_string().contains("`postgres-tls`"), "{error}");
+        assert!(error.source().is_some());
+    }
+
+    #[cfg(feature = "postgres-tls")]
+    #[test]
+    fn tls_with_the_feature_does_not_hint() {
+        let Err(error) = connect_requiring_tls() else {
+            panic!("connected to a server that hung up")
+        };
+        assert!(!error.to_string().contains("postgres-tls"), "{error}");
     }
 
     #[test]

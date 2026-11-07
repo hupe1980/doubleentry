@@ -1,6 +1,6 @@
 [package]
 name        = "doubleentry"
-version     = "0.8.0"
+version     = "0.8.1"
 edition     = "2024"
 # MSRV, the single source: `just msrv` (and CI) checks it and the README badge.
 # 1.94 is required by sqlx 0.9. Never raised in a patch release, and only to a
@@ -47,11 +47,13 @@ default = []
 ## independent of it and is never routed through serde.
 serde = ["dep:serde", "time/serde"]
 
-## `SqlStore<Postgres>`, on sqlx. Enables no TLS stack: for TLS, add
-## `sqlx = { version = "0.9", features = ["tls-rustls-aws-lc-rs"] }` (or
-## `tls-rustls-ring-webpki`, `tls-native-tls`) to your application.
+## `SqlStore<Postgres>`, on sqlx. Enables no TLS stack: use `postgres-tls`.
 ## One schema, `doubleentry/1`; no migrations.
 postgres = ["dep:sqlx", "sqlx/postgres"]
+
+## `postgres` with TLS: rustls on aws-lc-rs, Mozilla's root set. Ask for it in
+## the URL (`sslmode=verify-full`; `sslrootcert=` for a private CA).
+postgres-tls = ["postgres", "sqlx/tls-rustls-aws-lc-rs"]
 
 ## `SqlStore<Sqlite>`, on sqlx, with SQLite bundled. One schema,
 ## `doubleentry/1`; no migrations.
@@ -152,6 +154,10 @@ name = "reporting"
 
 [[example]]
 name              = "sqlite_service"
+required-features = ["sqlite"]
+
+[[example]]
+name              = "outbox"
 required-features = ["sqlite"]
 
 [[example]]

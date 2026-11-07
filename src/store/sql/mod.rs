@@ -65,7 +65,8 @@ pub struct SqlOptions {
     /// before anything connects; always quoted, so its case is kept; never
     /// put in the `search_path`. Ignored by SQLite: one ledger per file.
     pub schema: String,
-    /// The size of the connection pool.
+    /// The size of the connection pool: the store's whole connection budget.
+    /// Every store made with `with_schema` shares this pool.
     pub max_connections: u32,
     /// How long a SQLite writer waits for the file lock before the write
     /// fails as unavailable (transient). Ignored by PostgreSQL.
@@ -184,6 +185,9 @@ impl<D: Dialect, const P: u8> fmt::Debug for SqlStore<D, P> {
             .finish_non_exhaustive()
     }
 }
+
+/// Why a TLS connection failed on a build without TLS support.
+const NO_TLS: &str = "TLS failed and doubleentry was built without its `postgres-tls` feature";
 
 /// The first 8 bytes of `SHA-256(tag ‖ name)`, as a lock key.
 fn lock_key(tag: &str, name: &str) -> i64 {
@@ -321,6 +325,11 @@ fn failure<D: Dialect>(
     error: &sqlx::Error,
     at_commit: bool,
 ) -> StoreError {
+    // A hint, not a pre-check: a build whose sqlx gets TLS from another
+    // dependency still connects. SQLite never fails with `Tls`.
+    if matches!(error, sqlx::Error::Tls(_)) && !cfg!(feature = "postgres-tls") {
+        return StoreError::backend_message(operation, NO_TLS);
+    }
     let (failure, unknown) = match Class::of(error, D::classify) {
         Class::Busy => (StoreError::unavailable(operation), false),
         Class::Lost => (StoreError::unavailable(operation), true),

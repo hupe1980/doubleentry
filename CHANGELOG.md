@@ -7,6 +7,22 @@ published on crates.io. ⚠️ marks a change to a hash, an encoding or the sche
 
 ## [Unreleased]
 
+## [0.8.1] — 2026-11-07
+
+### Added
+
+- `postgres-tls`: PostgreSQL over TLS (rustls on aws-lc-rs, Mozilla roots).
+  Without it, a URL that requires TLS fails with an error naming the feature.
+- `examples/outbox.rs` and an outbox section in the idempotency guide: one entry
+  per committed business change.
+- The PostgreSQL constructors document the connection URL and the pool budget.
+
+### Changed
+
+- TLS no longer comes from your own `sqlx` dependency. **Migration:** drop
+  `sqlx` if you added it only for TLS, and enable `postgres-tls`. sqlx is an
+  implementation detail; its upgrades ship without an API change.
+
 ## [0.8.0] — 2026-10-16
 
 ### ⚠️ Breaking
@@ -132,7 +148,8 @@ published on crates.io. ⚠️ marks a change to a hash, an encoding or the sche
 
 - Initial release.
 
-[Unreleased]: https://github.com/hupe1980/doubleentry/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/hupe1980/doubleentry/compare/v0.8.1...HEAD
+[0.8.1]: https://github.com/hupe1980/doubleentry/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/hupe1980/doubleentry/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/hupe1980/doubleentry/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/hupe1980/doubleentry/compare/v0.5.0...v0.6.0

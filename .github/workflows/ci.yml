@@ -59,6 +59,8 @@ jobs:
       # All features in one build: unit, integration and doctests, SQLite and
       # PostgreSQL (testcontainers starts its own; the runner has Docker).
       - run: cargo test --locked --all-features
+      # The connect error without `postgres-tls` (`--all-features` enables it).
+      - run: cargo test --locked --features postgres --lib tls
       - run: just examples
       # Every Rust block on the site, compiled (and run unless `no_run`).
       - run: just site-verify

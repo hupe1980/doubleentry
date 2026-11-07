@@ -17,6 +17,7 @@ same list is rendered under "Feature flags" on the
 | `serde` | `Serialize` / `Deserialize` on all public types; the hashed encoding never goes through serde | `serde` |
 | `sqlite` | `SqlStore<Sqlite>`, SQLite bundled | `sqlx` (tokio runtime) |
 | `postgres` | `SqlStore<Postgres>`, no TLS stack | `sqlx` (tokio runtime) |
+| `postgres-tls` | `postgres` with TLS: rustls on aws-lc-rs, Mozilla's root set | `rustls`, `aws-lc-rs`, `webpki-roots` |
 | `witness` | Ed25519: `LogKey` signs checkpoints; cosignatures and policies verify; `WitnessSession`, `Verifier` | `ed25519-dalek` |
 | `testing` | `doubleentry::testing`: the conformance suite for stores (with `witness`, also `TestWitness`) | `tokio` |
 | `tracing` | a span per façade operation and per SQL store write — never an amount, memo or account path | `tracing` |
@@ -31,17 +32,23 @@ Ed25519. The crate has no HTTP client and no witness: it builds
 
 ## TLS for PostgreSQL
 
-`sqlx` is compiled without a TLS stack; the application picks one with one line,
-and Cargo's feature unification switches it on for the crate's connections:
-
 ```toml
 [dependencies]
-doubleentry = { version = "0.8", features = ["postgres"] }
-sqlx = { version = "0.9", features = ["tls-rustls-aws-lc-rs"] }   # or tls-rustls-ring-webpki, tls-native-tls
+doubleentry = { version = "0.8", features = ["postgres-tls"] }
 ```
 
-The connection URL then asks for it, for example `?sslmode=require`. SQLite
-never needs TLS.
+Then ask for it in the URL:
+`postgres://app@db/books?sslmode=verify-full&sslrootcert=/etc/ssl/db-ca.pem`.
+Only `require`, `verify-ca` and `verify-full` guarantee encryption; `prefer`,
+the default, may fall back to plain text. Without the feature, a URL that
+requires TLS fails with an error naming it. The provider is aws-lc-rs, which
+offers the post-quantum key exchange `X25519MLKEM768`.
+
+## The driver
+
+sqlx is an implementation detail: no sqlx type is in the API (CI checks it),
+you never add it for doubleentry, and its upgrades ship without an API change.
+The driver's error behind `source()` is for logging, not covered by semver.
 
 ## Runtime
 
@@ -53,8 +60,7 @@ the program builds
 
 ## MSRV
 
-Rust **1.94**, edition 2024, set by `rust-version` in `Cargo.toml` and required
-by sqlx 0.9. CI builds every feature and target with exactly that toolchain and
+Rust **1.94**, edition 2024, set by `rust-version` in `Cargo.toml`. CI builds every feature and target with exactly that toolchain and
 `--locked`. The MSRV is a stable release at least six months old when adopted,
 and rises only in a non-patch release, with a CHANGELOG line naming the reason.
 

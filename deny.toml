@@ -11,7 +11,11 @@ all-features = false
 # RustSec. An ignore entry needs a reason and a re-check date.
 [advisories]
 version = 2
-ignore = []
+ignore = [
+    # Unmaintained (2026-11-03), no upgrade; reached only through the
+    # `testcontainers` dev-dependency, never shipped. Re-check 2027-02-01.
+    { id = "RUSTSEC-2026-0440", reason = "dev-only via testcontainers; no maintained release yet" },
+]
 
 # ── Licenses ─────────────────────────────────────────────────────────────────
 # Permissive licenses only; an unused entry is removed.
@@ -28,6 +32,8 @@ allow = [
     "BSL-1.0",
     "Unlicense",
     "MIT-0",
+    "ISC",                 # aws-lc-rs, rustls-webpki (feature `postgres-tls`)
+    "CDLA-Permissive-2.0", # webpki-roots (feature `postgres-tls`)
 ]
 confidence-threshold = 0.8
 

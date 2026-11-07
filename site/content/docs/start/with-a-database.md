@@ -130,7 +130,7 @@ assert_eq!(runtime.block_on(books.exponent(EUR))?, Some(2));
 
 `SqlStore<Postgres>` (feature `postgres`) keeps one ledger per PostgreSQL
 schema — `doubleentry` by default, another through `SqlOptions` or
-`with_schema`. The crate enables no TLS stack; see
+`with_schema`. TLS is the `postgres-tls` feature; see
 [Features and MSRV](@/docs/start/features.md#tls-for-postgresql). Roles and
 privileges are on [PostgreSQL](@/docs/operating/postgresql.md).
 

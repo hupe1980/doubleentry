@@ -16,7 +16,8 @@ pub struct Sqlite;
 
 impl<const P: u8> SqlStore<Sqlite, P> {
     /// Connects to the SQLite database at `url` (`sqlite://path/to/books.db`,
-    /// created if missing) with the default [`SqlOptions`].
+    /// created if missing) with the default [`SqlOptions`]. The URL names a
+    /// file (or `sqlite::memory:`); there are no network or TLS settings.
     ///
     /// ```
     /// use doubleentry::store::{SqlStore, Sqlite};

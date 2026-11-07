@@ -133,6 +133,25 @@ assert_eq!(books.head(), head); // no hash changed
 assert_eq!(books.record(draft).unwrap_err().code(), Some(200));
 ```
 
+## Together with your own database: the outbox
+
+The store joins none of your transactions. To change your own rows and the
+ledger exactly once, use an outbox:
+
+1. In one transaction of your database, write the business change and an
+   outbox row holding the key and the whole draft.
+2. A worker records each pending row. `Ok` — replayed or not — marks it done;
+   a crash before marking replays next time.
+3. `is_transient()` or `may_have_applied()`: retry with the same key.
+   `Error::Rejected(r)`: park the row with `r.code()` for a person.
+
+Never record before the business commit: the log is append-only, so an entry
+for a change that rolled back needs a reversal. Keep the draft's content in the
+row; one recomputed from changed state is `KeyConflict` (200). Concurrent
+workers are safe: the key serialises them.
+[`examples/outbox.rs`](https://github.com/hupe1980/doubleentry/blob/main/examples/outbox.rs)
+runs every case.
+
 ## Limits
 
 - A key is unique per ledger: the same key in two ledgers gives two ids.

@@ -114,7 +114,7 @@ Facts to copy into the technical system documentation:
 |---|---|
 | Engine | `doubleentry`, the version resolved in your `Cargo.lock` |
 | Log format | format tag `doubleentry/1`, committed in every ledger's genesis record (position 0) |
-| Database schema | schema identifier `doubleentry/1` in the `meta` table; a database of another schema is refused, never migrated |
+| Database schema | schema identifier `doubleentry/2` in the `meta` table (independent of the log format tag); a database of another schema is refused, never migrated |
 | Hash and tree | SHA-256; RFC 6962 Merkle tree (leaf `0x00`, node `0x01` prefixes); canonical, length-prefixed encoding, never serde; leaves ≤ 65 535 bytes |
 | Transparency formats | C2SP `signed-note`, `tlog-checkpoint`, `tlog-cosignature` (Ed25519), `tlog-witness`, `tlog-policy`, `tlog-proof`, `tlog-tiles` |
 | Stores | in memory (no persistence); SQLite (one file, one writer at a time, triggers; detection of tampering, not prevention); PostgreSQL (one writer per ledger by advisory lock, triggers, least-privilege roles) |

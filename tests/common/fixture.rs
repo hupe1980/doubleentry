@@ -192,11 +192,13 @@ pub async fn fixture<S: Store<2>>(store: S) -> (Ledger<S>, Fixture) {
             date!("2026-04-01"),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .position;
     let reset = books
         .reset_clearing("reset-1", clearing, date!("2026-04-10"))
         .await
-        .unwrap();
+        .unwrap()
+        .position;
     let travel_july = record(
         Entry::new("travel-jul", date!("2026-07-10"))
             .debit("Expenses:Travel", eur("60.00"), EUR)

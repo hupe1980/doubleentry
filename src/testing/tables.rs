@@ -8,7 +8,7 @@
 use time::Date;
 
 use super::model::Check;
-use crate::core::{ChangeInput, Done, Op};
+use crate::core::{BatchItem, ChangeInput, Clearing, Done, Op};
 use crate::error::{Error, Rejection};
 use crate::log::leaf_hash;
 use crate::model::{
@@ -199,7 +199,12 @@ fn hold(key: &str, date: Date, expires: Option<Date>, amount: &str) -> Entry<2> 
 
 /// An atomic batch of `drafts`.
 fn batch(drafts: impl IntoIterator<Item = Entry<2>>) -> Op<2> {
-    Op::Batch(drafts.into_iter().collect())
+    mixed(drafts.into_iter().map(BatchItem::Record))
+}
+
+/// An atomic batch of entries, clearings and resets.
+fn mixed(items: impl IntoIterator<Item = BatchItem<2>>) -> Op<2> {
+    Op::Batch(items.into_iter().collect())
 }
 
 /// A draw of `amount` from the limited wallet into cash.
@@ -1185,6 +1190,144 @@ pub(crate) fn rows(ledger: &LedgerId) -> Vec<Row> {
             ]),
             Expect::Batch(2, 442),
         ),
+        // ── Mixed batches: entries, clearings and resets ───────────────────
+        row(
+            "batch_records_a_payment_and_clears_it",
+            vec![receivables().remove(0)],
+            mixed([
+                BatchItem::Record(
+                    Entry::new("pay-2", on(3, 12))
+                        .debit("Assets:Cash", eur("600.00"), EUR)
+                        .credit("Assets:Receivables", eur("600.00"), EUR),
+                ),
+                BatchItem::Clear(Clearing::new(
+                    "pay-2/inv-1",
+                    invoice,
+                    PostingRef::at(id("pay-2"), 1),
+                    eur("600.00"),
+                    on(3, 12),
+                )),
+            ]),
+            Expect::Done,
+        ),
+        row(
+            "batch_clearings_share_the_open_amount",
+            receivables(),
+            mixed([
+                BatchItem::Clear(Clearing::new(
+                    "c-1",
+                    invoice,
+                    payment,
+                    eur("300.00"),
+                    on(3, 20),
+                )),
+                BatchItem::Clear(Clearing::new(
+                    "c-2",
+                    invoice,
+                    payment,
+                    eur("300.00"),
+                    on(3, 20),
+                )),
+            ]),
+            Expect::Batch(1, 414),
+        ),
+        row(
+            "batch_clearing_before_its_entry",
+            vec![receivables().remove(0)],
+            mixed([
+                BatchItem::Clear(Clearing::new(
+                    "early",
+                    invoice,
+                    PostingRef::at(id("pay-3"), 1),
+                    eur("1.00"),
+                    on(3, 12),
+                )),
+                BatchItem::Record(
+                    Entry::new("pay-3", on(3, 12))
+                        .debit("Assets:Cash", eur("1.00"), EUR)
+                        .credit("Assets:Receivables", eur("1.00"), EUR),
+                ),
+            ]),
+            Expect::Batch(0, 410),
+        ),
+        row(
+            "batch_resets_its_own_clearing_and_reclears",
+            receivables(),
+            mixed([
+                BatchItem::Clear(Clearing::new(
+                    "c-1",
+                    invoice,
+                    payment,
+                    eur("500.00"),
+                    on(3, 20),
+                )),
+                BatchItem::reset("undo", at(2), on(3, 21)),
+                BatchItem::Clear(Clearing::new(
+                    "c-2",
+                    invoice,
+                    payment,
+                    eur("500.00"),
+                    on(3, 21),
+                )),
+            ]),
+            Expect::Done,
+        ),
+        row(
+            "batch_reset_twice_within",
+            {
+                let mut setup = receivables();
+                setup.push(clear("clr", invoice, payment, "100.00", on(3, 20)));
+                setup
+            },
+            mixed([
+                BatchItem::reset("undo-1", at(2), on(3, 21)),
+                BatchItem::reset("undo-2", at(2), on(3, 21)),
+            ]),
+            Expect::Batch(1, 417),
+        ),
+        row(
+            "batch_clearing_replay_within",
+            receivables(),
+            mixed([
+                BatchItem::Clear(Clearing::new(
+                    "same",
+                    invoice,
+                    payment,
+                    eur("100.00"),
+                    on(3, 20),
+                )),
+                BatchItem::Clear(Clearing::new(
+                    "same",
+                    invoice,
+                    payment,
+                    eur("100.00"),
+                    on(3, 20),
+                )),
+            ]),
+            Expect::Done,
+        ),
+        // Entry ordinals count entries only, not the clearings between them.
+        row(
+            "batch_entry_after_a_clearing",
+            receivables(),
+            mixed([
+                BatchItem::Clear(Clearing::new(
+                    "c-1",
+                    invoice,
+                    payment,
+                    eur("100.00"),
+                    on(3, 20),
+                )),
+                BatchItem::Record(sale("after-clearing", on(3, 20), "1.00")),
+            ]),
+            Expect::Done,
+        ),
+        row(
+            "124_batch_too_large",
+            vec![],
+            batch((0..=Op::<2>::MAX_BATCH).map(|n| sale(&format!("big-{n}"), on(3, 3), "1.00"))),
+            Expect::Code(124),
+        ),
     ]
 }
 
@@ -1245,6 +1388,11 @@ pub(crate) async fn run<S: Store<2>>(store: S, row: &Row, ledger: &LedgerId) -> 
     if expected.is_err() && after != before {
         return Err(String::from("a refused operation changed the store"));
     }
+    // Every table the row left must be the replay of its log.
+    books
+        .audit()
+        .await
+        .map_err(|error| format!("the audit after the row: {error}"))?;
     Ok(())
 }
 

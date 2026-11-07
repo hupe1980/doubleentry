@@ -53,9 +53,9 @@ pub use projection::{
 };
 pub(crate) use projection::{cells, each_row, head_at, page_of};
 pub use read::{
-    AccountRow, BalanceRead, BalanceScope, EntryRef, Erasure, HoldRead, HoldRow, Leaf, LeafRead,
-    LedgerInfo, Memo, Position, PostingCursor, PostingLine, PostingOrder, PostingRead, SealRow,
-    StoredEntry,
+    AccountRow, BalanceRead, BalanceScope, EntryRef, Erasure, HoldRead, HoldRow, KindFilter, Leaf,
+    LeafRead, LedgerInfo, Memo, Position, PostingCursor, PostingLine, PostingOrder, PostingRead,
+    SealRow, StoredEntry,
 };
 pub(crate) use read::{bound, checked_limit, paged};
 #[cfg(feature = "postgres")]
@@ -90,7 +90,7 @@ use crate::{HoldCursor, Page, PageRead};
 
 /// The identifier of the schema this crate writes, recorded in every store
 /// it creates; any other identifier is refused.
-pub const SCHEMA_ID: &str = "doubleentry/1";
+pub const SCHEMA_ID: &str = "doubleentry/2";
 
 /// The error of a write whose read plan did not converge — a bug guard,
 /// never a silent "absent".

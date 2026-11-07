@@ -6,7 +6,7 @@ use std::sync::{Arc, OnceLock};
 
 use super::dialect::{Batch, Kind, Statement};
 use crate::store::projection::{Column, Ty};
-use crate::store::{PostingOrder, PostingRead, ProjectionPart};
+use crate::store::{KindFilter, PostingOrder, PostingRead, ProjectionPart};
 
 impl Statement {
     /// `template` with `{{s}}` replaced by `qualifier`.
@@ -103,8 +103,9 @@ catalogue! {
     insert_leaf: [] = "INSERT INTO {{s}}leaves (position, kind, bytes) VALUES ($1, $2, $3)";
     /// `IndexRow::EntryKey` (+ `Reversal`).
     insert_entry: [] =
-        "INSERT INTO {{s}}entries (position, ordinal, entry_id, idem_key, fingerprint, reverses) \
-         VALUES ($1, $2, $3, $4, $5, $6)";
+        "INSERT INTO {{s}}entries \
+         (position, ordinal, entry_id, idem_key, fingerprint, reverses, kind) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7)";
     /// `IndexRow::Account`.
     insert_account: [] =
         "INSERT INTO {{s}}accounts (handle, path, kind, position) VALUES ($1, $2, $3, $4)";
@@ -427,7 +428,7 @@ keyed! {
 
 /// The postings page's select list and joins.
 const POSTINGS_PAGE: &str = "SELECT p.position, p.idx, e.entry_id, p.side, p.amount, p.booking, \
-     p.value_date, p.dimensions, p.debit_after, p.credit_after, p.count_after, c.applied \
+     p.value_date, p.dimensions, p.debit_after, p.credit_after, p.count_after, c.applied, e.kind \
      FROM {{s}}postings p JOIN {{s}}entries e ON e.position = p.position \
      LEFT JOIN {{s}}cleared c ON c.position = p.position AND c.idx = p.idx \
      WHERE p.handle = $1 AND p.currency = $2 AND p.layer = $3 AND p.position < $4";
@@ -446,6 +447,7 @@ pub(crate) const POSTINGS_COLUMNS: &[Kind] = &[
     Kind::Bytes,
     Kind::Int,
     Kind::Bytes,
+    Kind::Text,
 ];
 
 /// The bulk inserts (`INSERT … {{rows}}`).
@@ -764,6 +766,16 @@ impl Catalogue {
                 param(),
                 param()
             ));
+        }
+        match &read.kinds {
+            KindFilter::Any => {}
+            // No kind at all matches nothing.
+            KindFilter::OneOf(kinds) if kinds.is_empty() => sql.push_str(" AND 1 = 0"),
+            KindFilter::OneOf(kinds) => {
+                let list: Vec<String> = kinds.iter().map(|_| param()).collect();
+                sql.push_str(&format!(" AND e.kind IN ({})", list.join(", ")));
+            }
+            KindFilter::Without => sql.push_str(" AND e.kind IS NULL"),
         }
         for _ in &read.dimensions {
             let (axis, value) = (param(), param());

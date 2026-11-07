@@ -309,8 +309,9 @@ impl From<AuditFailure> for IntegrityError {
 
 impl From<StoreError> for Error {
     /// `Integrity` is stored data the ledger cannot trust
-    /// ([`Error::Integrity`]); `SchemaMismatch` and `LedgerMismatch` are a
-    /// store configured for something else ([`Error::Config`]); everything
+    /// ([`Error::Integrity`]); `SchemaMismatch`, `LedgerMismatch`,
+    /// `ForeignSchema` and the invalid schema and role names are a store
+    /// configured for something else ([`Error::Config`]); everything
     /// else is a [`BackendError`] keeping both flags, with the store error as
     /// its source.
     fn from(error: StoreError) -> Self {
@@ -325,6 +326,18 @@ impl From<StoreError> for Error {
                 expected: None,
                 found: None,
             }),
+            StoreErrorKind::ForeignSchema { schema, tables } => {
+                Self::Config(ConfigError::ForeignSchema {
+                    schema: schema.clone(),
+                    tables: tables.clone(),
+                })
+            }
+            StoreErrorKind::InvalidSchemaName { name } => {
+                Self::Config(ConfigError::InvalidSchemaName { name: name.clone() })
+            }
+            StoreErrorKind::InvalidRoleName { name } => {
+                Self::Config(ConfigError::InvalidRoleName { name: name.clone() })
+            }
             _ => {
                 let applied = error.may_have_applied();
                 let backend = if error.is_transient() {
@@ -438,6 +451,60 @@ pub enum ConfigError {
         /// The schema identifier found.
         found: String,
     },
+    /// The schema (PostgreSQL) or database file (SQLite) holds tables but no
+    /// doubleentry ledger; nothing was created or changed there. Use an
+    /// empty schema (or file) for the ledger.
+    #[error("{}", foreign_schema(schema, tables))]
+    ForeignSchema {
+        /// The schema (`main` for a SQLite file).
+        schema: String,
+        /// The tables found, sorted.
+        tables: Vec<String>,
+    },
+    /// The configured schema name is not `[A-Za-z_][A-Za-z0-9_]{0,62}`;
+    /// nothing was connected.
+    #[error("the schema name {name:?} is not [A-Za-z_][A-Za-z0-9_]{{0,62}}")]
+    InvalidSchemaName {
+        /// The name refused.
+        name: String,
+    },
+    /// A role name is not `[A-Za-z_][A-Za-z0-9_]{0,62}`; nothing was run.
+    #[error("the role name {name:?} is not [A-Za-z_][A-Za-z0-9_]{{0,62}}")]
+    InvalidRoleName {
+        /// The name refused.
+        name: String,
+    },
+}
+
+/// The tables shown in a [`ConfigError::ForeignSchema`] message.
+const SHOWN_TABLES: usize = 8;
+
+/// `the schema "s" holds tables that are not a doubleentry ledger: a, b (and
+/// N more)`, naming a doubleentry 0.7 ledger when its `ledger_meta` is there.
+pub(crate) fn foreign_schema(schema: &str, tables: &[String]) -> String {
+    let shown: Vec<&str> = tables
+        .iter()
+        .take(SHOWN_TABLES)
+        .map(String::as_str)
+        .collect();
+    let mut text = format!(
+        "the schema {schema:?} holds tables that are not a doubleentry ledger: {}",
+        shown.join(", ")
+    );
+    if let Some(more) = tables
+        .len()
+        .checked_sub(SHOWN_TABLES)
+        .filter(|more| *more > 0)
+    {
+        text.push_str(&format!(" (and {more} more)"));
+    }
+    if tables.iter().any(|table| table == "ledger_meta") {
+        text.push_str(
+            "; it is a doubleentry 0.7 ledger, which this release cannot read: \
+             keep it with 0.7 and create this ledger in another schema",
+        );
+    }
+    text
 }
 
 impl ConfigError {
@@ -542,8 +609,50 @@ mod tests {
         });
         assert_eq!(
             format!("{config:?}"),
-            "configuration: the database holds the schema \"other/1\", not \"doubleentry/1\""
+            "configuration: the database holds the schema \"other/1\", not \"doubleentry/2\""
         );
         assert_eq!(config.code(), None);
+    }
+
+    #[test]
+    fn a_foreign_schema_names_its_tables_and_a_0_7_ledger() {
+        let tables = |names: &[&str]| names.iter().map(|name| (*name).to_owned()).collect();
+        let one = ConfigError::ForeignSchema {
+            schema: String::from("ledger"),
+            tables: tables(&["invoices"]),
+        };
+        assert_eq!(
+            one.to_string(),
+            "the schema \"ledger\" holds tables that are not a doubleentry ledger: invoices"
+        );
+        let many = ConfigError::ForeignSchema {
+            schema: String::from("main"),
+            tables: tables(&["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"]),
+        };
+        assert!(
+            many.to_string()
+                .ends_with(": a, b, c, d, e, f, g, h (and 2 more)"),
+            "{many}"
+        );
+        let old = ConfigError::ForeignSchema {
+            schema: String::from("doubleentry"),
+            tables: tables(&["accounts", "ledger_meta"]),
+        };
+        assert_eq!(
+            old.to_string(),
+            "the schema \"doubleentry\" holds tables that are not a doubleentry ledger: \
+             accounts, ledger_meta; it is a doubleentry 0.7 ledger, which this release cannot \
+             read: keep it with 0.7 and create this ledger in another schema"
+        );
+        let error = Error::from(crate::store::StoreError::foreign_schema(
+            "open",
+            String::from("main"),
+            tables(&["x"]),
+        ));
+        assert!(matches!(
+            error,
+            Error::Config(ConfigError::ForeignSchema { .. })
+        ));
+        assert!(!error.is_transient() && !error.may_have_applied());
     }
 }

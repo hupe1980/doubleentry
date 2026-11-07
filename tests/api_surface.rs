@@ -65,7 +65,7 @@ fn every_payload_folds_into_its_variant() {
                     reason: ValueError::Empty,
                 },
             },
-            "rejected: draft 3 of the batch: [100] ",
+            "rejected: item 3 of the batch: [100] ",
         ),
     ];
     for (error, prefix) in &cases {

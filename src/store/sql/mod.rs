@@ -13,6 +13,8 @@ mod codec;
 mod dialect;
 mod facts;
 #[cfg(feature = "postgres")]
+mod grants;
+#[cfg(feature = "postgres")]
 mod postgres;
 mod reads;
 mod schema;

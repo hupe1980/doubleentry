@@ -172,6 +172,10 @@ impl<const P: u8> MemState<P> {
                             parts
                                 .reverses
                                 .map_or(Cell::Null, |target| bytes(target.as_bytes())),
+                            parts
+                                .kind
+                                .as_ref()
+                                .map_or(Cell::Null, |kind| text(kind.as_str())),
                         ])
                     },
                 ))

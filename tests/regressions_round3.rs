@@ -86,7 +86,9 @@ fn a3_c3_every_closing_draft_fits_and_records() {
                 .posting(credit),
         );
     }
-    books.record_batch(drafts).unwrap();
+    for chunk in drafts.chunks(Journal::<2>::MAX_BATCH) {
+        books.record_batch(chunk.to_vec()).unwrap();
+    }
     let closing = books
         .close_year("close-2026", date!("2026-12-31"), "Equity:Retained")
         .unwrap();

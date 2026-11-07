@@ -72,7 +72,8 @@ CREATE TABLE {{s}}entries (
     entry_id    {{bytes}} NOT NULL UNIQUE CHECK ({{len}}(entry_id) = 16),
     idem_key    {{bytes}} NOT NULL UNIQUE CHECK ({{len}}(idem_key) BETWEEN 1 AND 128),
     fingerprint {{bytes}} CHECK (fingerprint IS NULL OR {{len}}(fingerprint) = 32),
-    reverses    {{bytes}} UNIQUE REFERENCES {{s}}entries (entry_id)
+    reverses    {{bytes}} UNIQUE REFERENCES {{s}}entries (entry_id),
+    kind        {{text}}  CHECK (kind IS NULL OR {{len}}(kind) BETWEEN 1 AND 256)
 ){{strict}};
 
 CREATE TABLE {{s}}postings (

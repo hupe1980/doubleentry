@@ -14,25 +14,29 @@ use crate::store::StoreError;
 /// PostgreSQL (feature `postgres`): one ledger per schema.
 ///
 /// `create` needs a role that may create the schema and its tables; the
-/// application can then run with a role that only reads and appends. These
-/// grants (schema `ledger`, application role `app`) are exactly what a store
-/// needs after `create`:
+/// application can then run with a role that only reads and appends.
+/// [`runtime_grants`](SqlStore::runtime_grants) lists exactly the
+/// statements that role needs after `create` — generated from the schema's
+/// own table catalogue, so a release that adds a table also adds its grant —
+/// and [`grant_runtime`](SqlStore::grant_runtime) applies them as the owner.
+/// For schema `ledger` and role `app`:
 ///
-/// ```sql
-/// GRANT USAGE ON SCHEMA ledger TO app;
-/// GRANT SELECT, INSERT ON ALL TABLES IN SCHEMA ledger TO app;
-/// GRANT UPDATE ON ledger.balances, ledger.cleared, ledger.outstanding, ledger.slices TO app;
-/// GRANT UPDATE (resolved_by, how) ON ledger.holds TO app;
-/// GRANT UPDATE (salt, text) ON ledger.memos TO app;
-/// GRANT UPDATE (fingerprint) ON ledger.entries TO app;
+/// ```
+/// use doubleentry::store::Postgres;
+///
+/// let grants = Postgres::runtime_grants("ledger", "app")?;
+/// assert_eq!(grants[2], r#"GRANT USAGE ON SCHEMA "ledger" TO "app""#);
+/// assert!(grants.contains(&r#"GRANT UPDATE (fingerprint) ON "ledger".entries TO "app""#.to_owned()));
+/// # Ok::<(), doubleentry::store::StoreError>(())
 /// ```
 ///
 /// No `DELETE`, `TRUNCATE` or DDL: triggers refuse every change to the log
 /// beyond these (their messages start `doubleentry:`; a fingerprint is
 /// nulled only together with its entry's memo erasure), and the role cannot
-/// drop them. A row the role inserts beyond what the write path writes is
-/// not refused by a trigger, but `audit` finds it: every table is compared
-/// with the replay of the log.
+/// drop them. The runtime role must not own the schema or its tables (an
+/// owner bypasses grants and may drop triggers). A row the role inserts
+/// beyond what the write path writes is not refused by a trigger, but
+/// `audit` finds it: every table is compared with the replay of the log.
 #[derive(Debug, Clone, Copy)]
 pub struct Postgres;
 
@@ -153,6 +157,8 @@ impl Driver for Postgres {
     const META_PROBE: &str =
         "SELECT CAST(CASE WHEN to_regclass($1) IS NULL THEN 0 ELSE 1 END AS BIGINT)";
     const PRELUDE: &str = "CREATE SCHEMA IF NOT EXISTS {{q}};\n";
+    const TABLES_PROBE: &str = "SELECT CAST(table_name AS TEXT) FROM information_schema.tables \
+        WHERE table_schema = $1 AND table_type = 'BASE TABLE'";
 
     fn rows_source(kinds: &[Kind], _rows: usize) -> String {
         let arrays: Vec<String> = (1..)
@@ -171,12 +177,7 @@ impl Driver for Postgres {
     };
 
     fn qualifier(schema: &str) -> Result<String, StoreError> {
-        // `[A-Za-z_][A-Za-z0-9_]{0,62}`: no character a statement template
-        // gives a meaning (`$n`, `{{…}}`) and nothing that needs escaping —
-        // and still quoted, so its case is kept.
-        let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
-        let leading_digit = schema.starts_with(|c: char| c.is_ascii_digit());
-        if schema.is_empty() || leading_digit || !schema.chars().all(word) || schema.len() > 63 {
+        if !super::grants::identifier(schema) {
             return Err(StoreError::invalid_schema_name(schema));
         }
         Ok(format!("\"{schema}\"."))

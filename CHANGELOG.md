@@ -7,6 +7,36 @@ published on crates.io. ⚠️ marks a change to a hash, an encoding or the sche
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-11-07
+
+### ⚠️ Breaking
+
+- ⚠️ Schema `doubleentry/2` (`entries` stores the entry kind). A 0.8 database
+  is refused with `ConfigError::SchemaMismatch`; create the ledger anew. The
+  log format, hashes and leaves are unchanged.
+- `clear` and `reset_clearing` return `Cleared { position, replayed }`.
+  **Migration:** read `.position`.
+- A batch holds at most `MAX_BATCH` (1 000) items; more is rejection 124.
+  Record a larger year-end close in chunks.
+- `Op::Batch` holds `BatchItem`s, `Done::Batch` `BatchReceipt`s,
+  `Done::Cleared` a `Cleared`; `PostingLine` has `kind`, `PostingRead` takes
+  a `KindFilter`.
+- An invalid schema name is `Error::Config`, not `Error::Backend`.
+
+### Added
+
+- `batch(items)`: entries, clearings and resets in one transaction, all or
+  none, one receipt per item; `clear_batch` for clearings alone.
+- `entry_id(key)`: an entry's id before it is recorded.
+- `periods()`, `seals()`, `watermark()` and their `_at(head)` variants;
+  `SealReceipt::{start, end, through}`.
+- `BalanceQuery::of_kind` and `without_kind`.
+- `ConfigError::ForeignSchema`: a schema or file holding other tables (or a
+  0.7 ledger) is refused by name before any DDL.
+- `Postgres::runtime_grants`, `SqlStore::<Postgres>::runtime_grants` and
+  `grant_runtime`: least-privilege grants generated from the schema.
+- `BatchItem` and `Clearing` in the prelude; `examples/payment_run.rs`.
+
 ## [0.8.1] — 2026-11-07
 
 ### Added
@@ -150,6 +180,7 @@ published on crates.io. ⚠️ marks a change to a hash, an encoding or the sche
 
 [Unreleased]: https://github.com/hupe1980/doubleentry/compare/v0.8.1...HEAD
 [0.8.1]: https://github.com/hupe1980/doubleentry/compare/v0.8.0...v0.8.1
+[0.9.0]: https://github.com/hupe1980/doubleentry/compare/v0.8.1...v0.9.0
 [0.8.0]: https://github.com/hupe1980/doubleentry/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/hupe1980/doubleentry/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/hupe1980/doubleentry/compare/v0.5.0...v0.6.0

@@ -136,6 +136,16 @@ fn the_facades_have_the_same_methods_and_parameters() {
         "bundle_balance",
         "tile",
         "tile_entries",
+        // 028: the host surface.
+        "entry_id",
+        "batch",
+        "clear_batch",
+        "periods",
+        "periods_at",
+        "seals",
+        "seals_at",
+        "watermark",
+        "watermark_at",
     ] {
         assert!(
             journal.contains_key(name) && ledger.contains_key(name),

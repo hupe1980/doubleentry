@@ -414,6 +414,7 @@ impl ProjectionPart {
                 col!("entries", "entry_id", B),
                 col!("entries", "idem_key", B),
                 col!("entries", "reverses", B),
+                col!("entries", "kind", T),
             ],
             Self::Memos => &[
                 col!("entries", "position", I),

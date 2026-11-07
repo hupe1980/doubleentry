@@ -31,45 +31,83 @@ use doubleentry::store::{Postgres, SqlOptions, SqlStore, Store};
 use doubleentry::LedgerId;
 
 // The privileged job, once per ledger (a repeat with the same genesis is a no-op).
-let options = SqlOptions { schema: "ledger_acme".into(), ..SqlOptions::default() };
+let options = SqlOptions { schema: "ledger".into(), ..SqlOptions::default() };
 let admin = SqlStore::<Postgres>::postgres_with("postgres://owner:secret@db/books", options).await?;
 let info = admin.create(&Genesis { ledger: LedgerId::new("example.com/acme")? }).await?;
 assert_eq!(info.size, 1);
+admin.grant_runtime("app").await?; // the role must exist; one transaction
 admin.close().await;
-// ... then run the GRANTs below for the application role.
 ```
 
 `create` serialises concurrent creators on an advisory lock. On a schema that
 already holds this genesis it writes nothing; on one holding another ledger,
-scale or schema identifier it is refused as `Error::Config`. `open` only reads
-the `meta` row and the genesis record.
+scale or schema identifier it is refused as `Error::Config`. A schema that
+holds tables but no ledger — another application's, or a doubleentry 0.7
+ledger — is refused as
+`ConfigError::ForeignSchema`, naming the tables, and nothing is created in it.
+`open` only reads the `meta` row and the genesis record.
 
-Then grant the application role exactly this (schema `ledger_acme`, role
-`app`). The crate's PostgreSQL tests run the conformance suite as a role with only
-these grants:
+`grant_runtime(role)` applies exactly the statements
+`SqlStore::<Postgres>::runtime_grants(role)` returns — or, without a
+connection, `Postgres::runtime_grants(schema, role)`, for a migration tool or a
+DBA to review. They are generated from the schema's own table catalogue, so a
+release that adds a table also adds its grant, and they name every table and
+column explicitly: `GRANT … ON ALL TABLES` would only reach the tables that
+exist when it runs. For schema `ledger` and role `app`:
 
+<!-- runtime-grants -->
 ```sql
-GRANT USAGE ON SCHEMA ledger_acme TO app;
-GRANT SELECT, INSERT ON ALL TABLES IN SCHEMA ledger_acme TO app;
-GRANT UPDATE ON ledger_acme.balances, ledger_acme.cleared,
-                ledger_acme.outstanding, ledger_acme.slices TO app;
-GRANT UPDATE (resolved_by, how) ON ledger_acme.holds TO app;
-GRANT UPDATE (salt, text) ON ledger_acme.memos TO app;
-GRANT UPDATE (fingerprint) ON ledger_acme.entries TO app;
+REVOKE ALL ON SCHEMA "ledger" FROM "app";
+REVOKE ALL ON ALL TABLES IN SCHEMA "ledger" FROM "app";
+GRANT USAGE ON SCHEMA "ledger" TO "app";
+GRANT SELECT, INSERT ON "ledger".meta TO "app";
+GRANT SELECT, INSERT ON "ledger".leaves TO "app";
+GRANT SELECT, INSERT ON "ledger".nodes TO "app";
+GRANT SELECT, INSERT ON "ledger".accounts TO "app";
+GRANT SELECT, INSERT ON "ledger".account_versions TO "app";
+GRANT SELECT, INSERT ON "ledger".currency_versions TO "app";
+GRANT SELECT, INSERT ON "ledger".policy_versions TO "app";
+GRANT SELECT, INSERT ON "ledger".periods TO "app";
+GRANT SELECT, INSERT ON "ledger".postings TO "app";
+GRANT SELECT, INSERT ON "ledger".posting_dims TO "app";
+GRANT SELECT, INSERT ON "ledger".seals TO "app";
+GRANT SELECT, INSERT ON "ledger".seal_leaves TO "app";
+GRANT SELECT, INSERT ON "ledger".seal_nodes TO "app";
+GRANT SELECT, INSERT ON "ledger".clearings TO "app";
+GRANT SELECT, INSERT ON "ledger".clearing_resets TO "app";
+GRANT SELECT, INSERT ON "ledger".clearing_refs TO "app";
+GRANT SELECT, INSERT ON "ledger".balances TO "app";
+GRANT SELECT, INSERT ON "ledger".cleared TO "app";
+GRANT SELECT, INSERT ON "ledger".outstanding TO "app";
+GRANT SELECT, INSERT ON "ledger".slices TO "app";
+GRANT SELECT, INSERT ON "ledger".memos TO "app";
+GRANT SELECT, INSERT ON "ledger".holds TO "app";
+GRANT SELECT, INSERT ON "ledger".entries TO "app";
+GRANT UPDATE ON "ledger".balances TO "app";
+GRANT UPDATE ON "ledger".cleared TO "app";
+GRANT UPDATE ON "ledger".outstanding TO "app";
+GRANT UPDATE ON "ledger".slices TO "app";
+GRANT UPDATE (salt, text) ON "ledger".memos TO "app";
+GRANT UPDATE (resolved_by, how) ON "ledger".holds TO "app";
+GRANT UPDATE (fingerprint) ON "ledger".entries TO "app";
 ```
 
-`UPDATE` covers the four maintained-value tables (caches `audit()` recomputes)
-and three columns, each also limited by a trigger: a hold resolves once, a memo
-is erased (`salt`, `text` to NULL), a fingerprint is nulled only with its
-entry's memo. No `DELETE`, no `TRUNCATE`, no DDL, no ownership. Run the grants
-after `create`: `ON ALL TABLES` covers only existing tables.
+The list starts by revoking everything, so applying it again leaves exactly
+these. `UPDATE` covers the four maintained-value tables (caches `audit()`
+recomputes) and three columns, each also limited by a trigger: a hold resolves
+once, a memo is erased (`salt`, `text` to NULL), a fingerprint is nulled only
+with its entry's memo. No `DELETE`, no `TRUNCATE`, no DDL, no ownership: the
+role must not own the schema or its tables, because an owner bypasses grants
+and can drop triggers. The crate's PostgreSQL tests run the conformance suite
+as a role with only these grants, and check that leaving out any one of them
+makes a write or a read fail.
 
 ```rust,no_run
 use doubleentry::prelude::*;
 use doubleentry::store::{Postgres, SqlOptions, SqlStore};
 
 // The service, as `app`.
-let options = SqlOptions { schema: "ledger_acme".into(), max_connections: 20, ..SqlOptions::default() };
+let options = SqlOptions { schema: "ledger".into(), max_connections: 20, ..SqlOptions::default() };
 let store = SqlStore::<Postgres>::postgres_with("postgres://app:secret@db/books", options).await?;
 let books = Ledger::new(store, LedgerId::new("example.com/acme")?).await?;
 books
@@ -93,7 +131,8 @@ row, a wrong maintained value, an owner dropping triggers) `audit()` finds.
 ## Schema names
 
 `SqlOptions::schema` must match `[A-Za-z_][A-Za-z0-9_]{0,62}`, or it is refused
-with `StoreErrorKind::InvalidSchemaName` before connecting. It is always quoted
+with `ConfigError::InvalidSchemaName` (`StoreErrorKind::InvalidSchemaName` on
+the store) before connecting. It is always quoted
 (case is kept) and never put into the `search_path`. `with_schema` returns a
 store for another schema over the same pool, without connecting:
 
@@ -142,7 +181,8 @@ Enable `postgres-tls` (rustls on aws-lc-rs) and ask for TLS in the URL:
 
 ## Limits
 
-- The crate creates no roles and runs no GRANTs.
+- The crate creates no roles; it runs GRANTs only when asked
+  (`grant_runtime`).
 - The schema owner or a superuser can drop the triggers: detect it with
   `audit()` and witnessed checkpoints.
 - Connection poolers (PgBouncer and similar) are not tested.

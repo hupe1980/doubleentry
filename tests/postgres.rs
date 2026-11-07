@@ -834,7 +834,7 @@ async fn regress_qs5_open_does_not_wait_for_readers() {
     execute(&mut reader, "ROLLBACK").await.unwrap();
 }
 
-/// The suite passes under exactly the documented grants.
+/// The suite passes under exactly the generated grants.
 #[tokio::test(flavor = "multi_thread")]
 async fn least_privilege_role_conforms() {
     let mut db = raw(url().await).await;
@@ -847,21 +847,14 @@ async fn least_privilege_role_conforms() {
         async move {
             let schema = next_schema();
             let owner = store_in(url().await, &schema).await;
-            owner.create(&Genesis { ledger: LedgerId::new("example.com/conformance").unwrap() }).await.unwrap();
-            let mut db = raw(url().await).await;
-            execute(
-                &mut db,
-                &format!(
-                    "GRANT USAGE ON SCHEMA {schema} TO app; \
-                     GRANT SELECT, INSERT ON ALL TABLES IN SCHEMA {schema} TO app; \
-                     GRANT UPDATE ON {schema}.balances, {schema}.cleared, {schema}.outstanding, {schema}.slices TO app; \
-                     GRANT UPDATE (resolved_by, how) ON {schema}.holds TO app; \
-                     GRANT UPDATE (salt, text) ON {schema}.memos TO app; \
-                     GRANT UPDATE (fingerprint) ON {schema}.entries TO app;"
-                ),
-            )
-            .await
-            .unwrap();
+            owner
+                .create(&Genesis {
+                    ledger: LedgerId::new("example.com/conformance").unwrap(),
+                })
+                .await
+                .unwrap();
+            // Exactly the generated grants (028 US4), never a hand copy.
+            owner.grant_runtime("app").await.unwrap();
             store_in(&app, &schema).await
         }
     })
@@ -970,7 +963,7 @@ async fn a3_s5_a_nul_memo_is_refused_like_everywhere() {
     books.audit().await.unwrap();
 }
 
-/// A3-S1 under exactly the documented least-privilege grants: a version the
+/// A3-S1 under exactly the generated least-privilege grants: a version the
 /// application role inserts (no trigger fires on INSERT) fails the audit.
 // PoC: A3-S1 a3_s1_least_privilege_role_lifts_a_limit
 #[tokio::test(flavor = "multi_thread")]
@@ -979,19 +972,9 @@ async fn a3_s1_an_app_role_insert_fails_the_audit() {
     populated(owner).await;
     let mut db = raw(url().await).await;
     let _ = execute(&mut db, "CREATE ROLE a3app LOGIN PASSWORD 'app'").await;
-    execute(
-        &mut db,
-        &format!(
-            "GRANT USAGE ON SCHEMA {schema} TO a3app; \
-             GRANT SELECT, INSERT ON ALL TABLES IN SCHEMA {schema} TO a3app; \
-             GRANT UPDATE ON {schema}.balances, {schema}.cleared, {schema}.outstanding, {schema}.slices TO a3app; \
-             GRANT UPDATE (resolved_by, how) ON {schema}.holds TO a3app; \
-             GRANT UPDATE (salt, text) ON {schema}.memos TO a3app; \
-             GRANT UPDATE (fingerprint) ON {schema}.entries TO a3app;"
-        ),
-    )
-    .await
-    .unwrap();
+    for grant in Postgres::runtime_grants(&schema, "a3app").unwrap() {
+        execute(&mut db, &grant).await.unwrap();
+    }
     let app_url = url().await.replace("postgres:postgres@", "a3app:app@");
     let mut app = PgConnection::connect(&app_url).await.unwrap();
     execute(
@@ -1250,4 +1233,147 @@ async fn cancelled_writes_leak_nothing() {
     .await;
     assert!(matches!(next, Ok(Ok(_))), "{next:?}");
     books.audit().await.unwrap();
+}
+
+/// 028 US2: periods, seals and the watermark, also pinned.
+#[tokio::test]
+async fn calendar_reads() {
+    store_checks::calendar_reads(fresh().await).await;
+}
+
+/// 028 US5: totals per entry kind.
+#[tokio::test]
+async fn kind_queries() {
+    store_checks::kind_queries(fresh().await).await;
+}
+
+// ── 028: the host surface ───────────────────────────────────────────────────
+
+/// The workload a runtime role runs: every write kind (entries, holds,
+/// clearings and resets, a seal, a mixed batch, a memo erasure) and an
+/// audit, which reads every table. Panics on the first failure.
+async fn runtime_workload(store: SqlStore<Postgres>) {
+    let (books, _) = populated(store.clone()).await;
+    let inv = entry_by_key_and_id(&store, "inv").await;
+    books.erase_memo(inv.id).await.unwrap();
+    books.audit().await.unwrap();
+}
+
+/// FR-016–FR-019, SC-004: the generated grants are sufficient — the
+/// workload passes under them — and each one is necessary: without it, the
+/// workload fails. A role name that is not an identifier is refused before
+/// anything runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn each_runtime_grant_is_needed() {
+    let mut db = raw(url().await).await;
+    let _ = execute(&mut db, "CREATE ROLE grants LOGIN PASSWORD 'grants'").await;
+    let app = url().await.replace("postgres:postgres@", "grants:grants@");
+    let (owner, schema) = fresh_named().await;
+    assert!(matches!(
+        owner.runtime_grants("bad\"role").unwrap_err().kind(),
+        StoreErrorKind::InvalidRoleName { .. }
+    ));
+    let all = owner.runtime_grants("grants").unwrap();
+    owner.create(&Genesis { ledger: ledger() }).await.unwrap();
+    owner.grant_runtime("grants").await.unwrap();
+    // Twice is the same as once: the list starts by revoking.
+    owner.grant_runtime("grants").await.unwrap();
+    runtime_workload(store_in(&app, &schema).await).await;
+
+    // Each GRANT left out in turn (the REVOKEs only make the list exact),
+    // by its place in the list: each round has a schema of its own.
+    let mut unneeded = Vec::new();
+    for (left_out, grant) in all.iter().enumerate() {
+        if !grant.starts_with("GRANT") {
+            continue;
+        }
+        let (owner, schema) = fresh_named().await;
+        owner.create(&Genesis { ledger: ledger() }).await.unwrap();
+        let grants = owner.runtime_grants("grants").unwrap();
+        assert_eq!(grants.len(), all.len());
+        for (index, grant) in grants.iter().enumerate() {
+            if index != left_out {
+                execute(&mut db, grant).await.unwrap();
+            }
+        }
+        let store = store_in(&app, &schema).await;
+        if tokio::spawn(runtime_workload(store)).await.is_ok() {
+            unneeded.push(grants[left_out].clone());
+        }
+    }
+    assert!(
+        unneeded.is_empty(),
+        "grants the workload does not need: {unneeded:#?}"
+    );
+}
+
+/// FR-001–FR-003, SC-001: a schema holding a doubleentry 0.7 ledger (or
+/// any table without `meta`) is refused by `Ledger::new`, naming its tables,
+/// and nothing is created in it; an empty or missing schema creates.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_foreign_schema_is_named_and_left_alone() {
+    let schema = next_schema();
+    let mut db = raw(url().await).await;
+    execute(
+        &mut db,
+        &format!(
+            "CREATE SCHEMA {schema}; \
+             CREATE TABLE {schema}.ledger_meta (only_row INTEGER PRIMARY KEY); \
+             CREATE TABLE {schema}.accounts (id INTEGER PRIMARY KEY); \
+             CREATE VIEW {schema}.v AS SELECT 1 AS one"
+        ),
+    )
+    .await
+    .unwrap();
+    let store = store_in(url().await, &schema).await;
+    let error = doubleentry::Ledger::new(store.clone(), ledger())
+        .await
+        .unwrap_err();
+    let doubleentry::Error::Config(config) = &error else {
+        panic!("{error:?}");
+    };
+    assert_eq!(
+        config,
+        &doubleentry::error::ConfigError::ForeignSchema {
+            schema: schema.clone(),
+            tables: vec![String::from("accounts"), String::from("ledger_meta")],
+        }
+    );
+    assert!(
+        error.to_string().contains("doubleentry 0.7 ledger"),
+        "{error}"
+    );
+    assert!(matches!(
+        store
+            .create(&Genesis { ledger: ledger() })
+            .await
+            .unwrap_err()
+            .kind(),
+        StoreErrorKind::ForeignSchema { .. }
+    ));
+    let tables: Vec<String> = sqlx::query_scalar(
+        "SELECT CAST(table_name AS TEXT) FROM information_schema.tables \
+         WHERE table_schema = $1 ORDER BY 1",
+    )
+    .bind(&schema)
+    .fetch_all(&mut db)
+    .await
+    .unwrap();
+    assert_eq!(
+        tables,
+        ["accounts", "ledger_meta", "v"],
+        "nothing was created"
+    );
+
+    // A schema that does not exist yet is created, as before.
+    doubleentry::Ledger::new(fresh().await, ledger())
+        .await
+        .unwrap();
+}
+
+/// 028 US3 on PostgreSQL: a payment and its assignment to two invoices in
+/// one batch; a refusal at any index writes nothing; a retry replays.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_payment_run_is_one_commit() {
+    store_checks::payment_run(fresh().await).await;
 }

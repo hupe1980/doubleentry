@@ -10,7 +10,7 @@ use crate::core::BalanceKey;
 use crate::error::QueryError;
 use crate::log::TreeHead;
 use crate::model::{AccountRef, Currency, Label, Layer, PeriodId, pad};
-use crate::store::{AccountRow, PostingCursor, PostingLine, PostingOrder, PostingRead};
+use crate::store::{AccountRow, KindFilter, PostingCursor, PostingLine, PostingOrder, PostingRead};
 
 /// Which date of an entry a date window, a statement's order and its opening
 /// balance read.
@@ -53,8 +53,10 @@ impl fmt::Display for DateBasis {
 /// [`period`](Self::period) — refined by modifiers:
 /// [`by_value_date`](Self::by_value_date) (booking date by default),
 /// [`matching`](Self::matching) and [`missing`](Self::missing) dimension
-/// clauses (all must hold), [`pending`](Self::pending) (the Settled layer by
-/// default) and [`pinned`](Self::pinned) to a tree head.
+/// clauses (all must hold), [`of_kind`](Self::of_kind) and
+/// [`without_kind`](Self::without_kind) (the entry's kind),
+/// [`pending`](Self::pending) (the Settled layer by default) and
+/// [`pinned`](Self::pinned) to a tree head.
 ///
 /// The builder is infallible: names are checked when the query runs, and a
 /// bad one is [`QueryError::InvalidLabel`]. Every read evaluates one log
@@ -88,6 +90,8 @@ pub struct BalanceQuery {
     basis: DateBasis,
     layer: Layer,
     clauses: Vec<Clause>,
+    kinds: Vec<String>,
+    without_kind: bool,
     pin: Option<TreeHead>,
 }
 
@@ -125,6 +129,8 @@ impl BalanceQuery {
             basis: DateBasis::Booking,
             layer: Layer::Settled,
             clauses: Vec::new(),
+            kinds: Vec::new(),
+            without_kind: false,
             pin: None,
         }
     }
@@ -194,6 +200,51 @@ impl BalanceQuery {
         self
     }
 
+    /// Only postings of entries of `kind` (`invoice`, `payment`, …: what
+    /// [`Entry::kind`](crate::Entry::kind) set). Repeated, it widens: any of
+    /// the kinds counts. An entry without a kind never matches.
+    ///
+    /// ```
+    /// use doubleentry::prelude::*;
+    ///
+    /// let mut books = Journal::new(LedgerId::new("example.com/acme")?);
+    /// books.declare_currency(EUR, 2, date!("2026-01-01"))?;
+    /// books.open("Assets:Receivables", AccountKind::Asset, date!("2026-01-01"))?;
+    /// books.open("Assets:Bank", AccountKind::Asset, date!("2026-01-01"))?;
+    /// books.open("Income:Sales", AccountKind::Income, date!("2026-01-01"))?;
+    /// books.define_months(2026, 1..=12)?;
+    /// let book = |key: &str, kind: &str, debit: &str, credit: &str, eur| {
+    ///     Entry::new(key, date!("2026-03-02"))
+    ///         .kind(kind)
+    ///         .debit(debit, eur, EUR)
+    ///         .credit(credit, eur, EUR)
+    /// };
+    /// books.record(book("inv-1", "invoice", "Assets:Receivables", "Income:Sales", amount!("100.00")))?;
+    /// books.record(book("pay-1", "payment", "Assets:Bank", "Assets:Receivables", amount!("60.00")))?;
+    ///
+    /// let year = BalanceQuery::between(date!("2026-01-01"), date!("2026-12-31"));
+    /// let invoiced = books.balance("Assets:Receivables", EUR, &year.clone().of_kind("invoice"))?;
+    /// assert_eq!(invoiced.debit(), amount!("100.00"));
+    /// let paid = books.balance("Assets:Receivables", EUR, &year.of_kind("payment"))?;
+    /// assert_eq!(paid.credit(), amount!("60.00"));
+    /// # Ok::<(), Error>(())
+    /// ```
+    #[must_use]
+    pub fn of_kind(mut self, kind: impl AsRef<str>) -> Self {
+        self.kinds.push(kind.as_ref().to_owned());
+        self
+    }
+
+    /// Only postings of entries recorded without a kind. With
+    /// [`of_kind`](Self::of_kind) it matches nothing.
+    #[must_use]
+    pub fn without_kind(self) -> Self {
+        Self {
+            without_kind: true,
+            ..self
+        }
+    }
+
     /// The Pending layer (holds) instead of the Settled one.
     #[must_use]
     pub fn pending(self) -> Self {
@@ -247,6 +298,24 @@ impl BalanceQuery {
                 ))
             })
             .collect::<Result<Vec<_>, QueryError>>()?;
+        let kinds = match (self.kinds.is_empty(), self.without_kind) {
+            (true, false) => KindFilter::Any,
+            (true, true) => KindFilter::Without,
+            (false, without) => {
+                let mut kinds = self
+                    .kinds
+                    .iter()
+                    .map(|kind| label(kind))
+                    .collect::<Result<Vec<_>, QueryError>>()?;
+                kinds.sort_unstable();
+                kinds.dedup();
+                if without {
+                    // A kind and no kind at once: nothing.
+                    kinds.clear();
+                }
+                KindFilter::OneOf(kinds)
+            }
+        };
         let period = match &self.window {
             Window::Period(id) => Some(label(id)?),
             _ => None,
@@ -271,7 +340,8 @@ impl BalanceQuery {
             Window::ThroughPosition(position) => position.saturating_add(1),
             _ => limit,
         };
-        let plan = match (&self.window, clauses.is_empty(), self.pin.is_some()) {
+        let unfiltered = clauses.is_empty() && kinds == KindFilter::Any;
+        let plan = match (&self.window, unfiltered, self.pin.is_some()) {
             (Window::All, true, false) => Plan::Maintained,
             (Window::All | Window::ThroughPosition(_), true, _) => Plan::AtPosition(bound),
             _ => Plan::Fold,
@@ -291,6 +361,7 @@ impl BalanceQuery {
                 basis: self.basis,
                 layer: self.layer,
                 clauses,
+                kinds,
                 plan,
             },
         })
@@ -367,6 +438,7 @@ pub(crate) struct Selection {
     basis: DateBasis,
     layer: Layer,
     clauses: Vec<(Label, Option<Label>)>,
+    kinds: KindFilter,
     plan: Plan,
 }
 
@@ -401,10 +473,10 @@ impl Selection {
         self.end
     }
 
-    /// Whether a dimension clause narrows the selection (a filtered trial
-    /// balance need not balance).
+    /// Whether a dimension clause or a kind narrows the selection (a
+    /// filtered trial balance need not balance).
     pub(crate) fn is_filtered(&self) -> bool {
-        !self.clauses.is_empty()
+        !self.clauses.is_empty() || self.kinds != KindFilter::Any
     }
 
     /// The date of `line` the window reads.
@@ -415,14 +487,15 @@ impl Selection {
         }
     }
 
-    /// Whether `line` is in the prefix and satisfies every dimension clause,
-    /// whatever its date.
+    /// Whether `line` is in the prefix, satisfies every dimension clause
+    /// and is of a selected kind, whatever its date.
     pub(crate) fn filters<const P: u8>(&self, line: &PostingLine<P>) -> bool {
         line.position < self.bound
             && self
                 .clauses
                 .iter()
                 .all(|(axis, value)| line.dimensions.get(axis) == value.as_ref())
+            && self.kinds.keeps(line.kind.as_ref())
     }
 
     /// Whether the window holds `date`.
@@ -462,12 +535,17 @@ impl Selection {
         };
         let mut page = PageRead::first(PageRead::<()>::MAX_LIMIT).through(self.bound);
         page.after = after;
+        let kinds = match &self.kinds {
+            KindFilter::OneOf(kinds) if kinds.len() > KindFilter::MAX_KINDS => KindFilter::Any,
+            kinds => kinds.clone(),
+        };
         PostingRead {
             key,
             order: PostingOrder::Position,
             booking,
             value,
             dimensions,
+            kinds,
             page,
         }
     }
@@ -560,6 +638,7 @@ mod tests {
             dimensions: set,
             balance_after: Balance::ZERO,
             cleared: Amount::ZERO,
+            kind: None,
         }
     }
 

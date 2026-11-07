@@ -489,6 +489,7 @@ pub(crate) async fn all_postings<S: Store<P>, const P: u8>(
                 booking: None,
                 value: None,
                 dimensions: Vec::new(),
+                kinds: crate::store::KindFilter::Any,
                 page: page.clone(),
             })
             .await

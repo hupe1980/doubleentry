@@ -28,6 +28,7 @@
         One rule core decides every entry — over a database, inside the store's
         write transaction under the ledger's lock. Every entry balances per
         currency and layer, and <code>audit()</code> decides each one again.
+        A payment and its assignment to open invoices commit as one batch.
       </p>
     </article>
     <article class="card">

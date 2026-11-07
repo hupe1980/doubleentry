@@ -290,3 +290,21 @@ fn the_dialects_stay_small() {
         + rust_lines(include_str!("../src/store/sql/postgres.rs"));
     assert!(lines <= 300, "{lines} dialect lines");
 }
+
+/// 028 US2: periods, seals and the watermark, also pinned.
+#[tokio::test]
+async fn calendar_reads() {
+    store_checks::calendar_reads(MemoryStore::new()).await;
+}
+
+/// 028 US5: totals per entry kind.
+#[tokio::test]
+async fn kind_queries() {
+    store_checks::kind_queries(MemoryStore::new()).await;
+}
+
+/// 028 US3: a payment and its assignment in one commit.
+#[tokio::test]
+async fn payment_run() {
+    store_checks::payment_run(MemoryStore::new()).await;
+}

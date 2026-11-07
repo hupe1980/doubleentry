@@ -575,6 +575,13 @@ fn postings<const P: u8>(
             "more than eight dimension filters",
         ));
     }
+    if matches!(&read.kinds, super::KindFilter::OneOf(kinds) if kinds.len() > super::KindFilter::MAX_KINDS)
+    {
+        return Err(StoreError::backend_message(
+            "postings",
+            "more than eight kind filters",
+        ));
+    }
     let size = size(state);
     let through = bound(read.page.through, size);
     let key = read.key;
@@ -590,6 +597,7 @@ fn postings<const P: u8>(
                 .dimensions
                 .iter()
                 .all(|(axis, value)| line.dimensions.get(axis) == Some(value))
+            && read.kinds.keeps(line.kind.as_ref())
     };
     let rows: Vec<(PostingCursor, PostingLine<P>)> = match read.order {
         PostingOrder::Position => state

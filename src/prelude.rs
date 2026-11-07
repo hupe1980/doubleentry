@@ -30,7 +30,8 @@ pub use crate::{
     Date,
 };
 pub use crate::{
-    Document, Entry, EntryId, Label, Layer, LedgerId, PostingRef, Rate, Recorded, Rounding, Side,
+    BatchItem, Clearing, Document, Entry, EntryId, Label, Layer, LedgerId, PostingRef, Rate,
+    Recorded, Rounding, Side,
 };
 pub use crate::{Error, Journal, Ledger, Rejection, Result};
 pub use crate::{amount, date};

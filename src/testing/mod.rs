@@ -298,6 +298,11 @@ where
         })
         .await?;
     suite
+        .run("concurrency/payment_runs_race", &factory, |store| {
+            concurrency::payment_runs_race(store, &ledger)
+        })
+        .await?;
+    suite
         .run("concurrency/concurrent_replays", &factory, |store| {
             concurrency::concurrent_replays(store, &ledger)
         })

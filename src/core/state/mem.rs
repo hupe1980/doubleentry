@@ -85,6 +85,8 @@ pub(crate) struct Line<const P: u8> {
     pub(crate) dimensions: Dimensions,
     /// The balance's gross totals after this posting.
     pub(crate) balance_after: Balance<P>,
+    /// The entry's kind.
+    pub(crate) kind: Option<Label>,
 }
 
 /// A leaf and the side data kept beside it.
@@ -288,6 +290,7 @@ impl<const P: u8> MemState<P> {
             dimensions: line.dimensions.clone(),
             balance_after: line.balance_after,
             cleared: StateView::applied(self, PostingRef::at(line.entry, index)),
+            kind: line.kind.clone(),
         }
     }
 
@@ -482,6 +485,10 @@ impl<const P: u8> MemState<P> {
             IndexRow::EntryKey { id, .. } => Some(*id),
             _ => None,
         });
+        let kind = match &write.record {
+            Record::Entry(record) => record.parts().kind.clone(),
+            _ => None,
+        };
         // The balances a clearing record touches: those of the postings it
         // changes the cleared amount of (an apply's two, a reset's two).
         let cleared_keys: Vec<BalanceKey> = write
@@ -520,6 +527,7 @@ impl<const P: u8> MemState<P> {
                         value: row.value,
                         dimensions: row.dimensions.clone(),
                         balance_after: row.balance_after,
+                        kind: kind.clone(),
                     },
                 );
             }

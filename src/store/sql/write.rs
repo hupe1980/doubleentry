@@ -42,6 +42,10 @@ pub(crate) async fn create<D: Dialect, const P: u8>(
         None => false,
     };
     let leaf = Record::<P>::Genesis(genesis.clone()).to_leaf_bytes();
+    if !exists && let Some(foreign) = foreign::<D, P>(store, &mut session).await? {
+        session.rollback().await?;
+        return Err(foreign);
+    }
     if exists {
         let info = existing::<D, P>(&mut session).await?;
         let stored = stored_leaf(&mut session, 0).await?;
@@ -150,10 +154,57 @@ pub(crate) async fn open<D: Dialect, const P: u8>(
     store: &SqlStore<D, P>,
 ) -> Result<LedgerInfo, StoreError> {
     let mut session = store.session(Mode::Read, "open").await?;
-    let info = existing::<D, P>(&mut session).await?;
+    let info = match existing::<D, P>(&mut session).await {
+        Err(error) if *error.kind() == crate::store::StoreErrorKind::NotCreated => {
+            // A session whose statement failed is aborted on PostgreSQL:
+            // the probe runs in a fresh one.
+            drop(session);
+            let mut probe = store.session(Mode::Read, "open").await?;
+            let foreign = foreign::<D, P>(store, &mut probe).await?;
+            probe.commit().await?;
+            return Err(foreign.unwrap_or(error));
+        }
+        result => result?,
+    };
     session.commit().await?;
     store.remember(info.ledger.clone());
     Ok(info)
+}
+
+/// `ForeignSchema` when the ledger's schema (or file) holds tables but no
+/// `meta` table: another application's, or a doubleentry 0.7 ledger. Asked
+/// only after the `meta` table was found missing, before any DDL.
+async fn foreign<D: Dialect, const P: u8>(
+    store: &SqlStore<D, P>,
+    session: &mut Session<'_, D>,
+) -> Result<Option<StoreError>, StoreError> {
+    let operation = session.operation;
+    let probe = Statement::render(D::TABLES_PROBE, "", &[Kind::Text]);
+    let schemas = D::TABLES_PROBE.contains("$1");
+    let args = if schemas {
+        vec![codec::text(&store.inner.schema)]
+    } else {
+        Vec::new()
+    };
+    let mut tables = session
+        .fetch(&probe, args)
+        .await?
+        .iter()
+        .map(|row| row.text(0).map(str::to_owned))
+        .collect::<Result<Vec<_>, _>>()?;
+    if tables.is_empty() {
+        return Ok(None);
+    }
+    tables.sort_unstable();
+    Ok(Some(StoreError::foreign_schema(
+        operation,
+        if schemas {
+            store.inner.schema.clone()
+        } else {
+            String::from("main")
+        },
+        tables,
+    )))
 }
 
 /// The write pipeline: lock, header, plan loop, execute, persist, commit.
@@ -211,12 +262,15 @@ pub(crate) async fn write<D: Dialect, const P: u8>(
         }
         Ok(Outcome::Batch { writes, done }) => {
             // Each write set persisted against the header its predecessors
-            // leave, all in this one transaction.
+            // leave, all in this one transaction. Only an entry advances the
+            // entry count (a batch also holds clearings and resets).
             let (mut header, mut known) = (header, Known::default());
             for write in &writes {
                 persist(&mut session, &header, write, &mut known).await?;
                 header.size = header.size.saturating_add(1);
-                header.entries = header.entries.saturating_add(1);
+                if matches!(write.record, Record::Entry(_)) {
+                    header.entries = header.entries.saturating_add(1);
+                }
             }
             session.commit().await?;
             Ok(Ok(done))
@@ -497,6 +551,14 @@ fn index<'s, const P: u8>(
                         fingerprint
                             .map_or(Value::Null(Kind::Bytes), |f| codec::bytes(f.as_bytes())),
                         reverses.map_or(Value::Null(Kind::Bytes), |t| codec::bytes(t.as_bytes())),
+                        match &write.record {
+                            Record::Entry(entry) => entry
+                                .parts()
+                                .kind
+                                .as_ref()
+                                .map_or(Value::Null(Kind::Text), |kind| codec::text(kind.as_str())),
+                            _ => Value::Null(Kind::Text),
+                        },
                     ],
                 ));
             }

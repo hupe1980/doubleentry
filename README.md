@@ -55,6 +55,40 @@ books.prove_consistency(archived.size, books.head().size)?.verify(&archived, &bo
 The idempotency key (`"invoice-2026-0001"`) is the entry's identity: recording the same draft
 again writes nothing and returns the original receipt with `replayed == true`.
 
+`batch` records entries, clearings and resets in one transaction, all or none — a payment
+and its assignment to open invoices commit together. `entry_id` gives the payment's id before
+it is recorded, so a clearing in the same batch can name its posting:
+
+```rust
+# use doubleentry::prelude::*;
+# let mut books = Journal::new(LedgerId::new("example.com/acme")?);
+# books.declare_currency(EUR, 2, date!("2026-01-01"))?;
+# books.define_months(2026, 1..=12)?;
+# books.open("Assets:Receivables", AccountKind::Asset, date!("2026-01-01"))?;
+# books.open("Assets:Bank", AccountKind::Asset, date!("2026-01-01"))?;
+# books.open("Income:Sales", AccountKind::Income, date!("2026-01-01"))?;
+# let invoice = books.record(Entry::new("INV-1", date!("2026-03-01")).kind("invoice")
+#     .debit("Assets:Receivables", amount!("100.00"), EUR).credit("Income:Sales", amount!("100.00"), EUR))?;
+let (paid, on) = (amount!("100.00"), date!("2026-03-10"));
+let payment = PostingRef::at(books.entry_id("PAY-1")?, 1);
+let receipts = books.batch([
+    Entry::new("PAY-1", on)
+        .kind("payment")
+        .debit("Assets:Bank", paid, EUR)
+        .credit("Assets:Receivables", paid, EUR)
+        .into(),
+    Clearing::new("PAY-1/INV-1", PostingRef::at(invoice.id, 0), payment, paid, on).into(),
+])?; // a refused item is `Error::BatchRejected { index, .. }`, and nothing is written
+assert_eq!(receipts.len(), 2);
+
+books.seal_through("2026-03")?;
+assert_eq!(books.watermark()?, Some(date!("2026-03-31"))); // nothing books on or before it
+let year = BalanceQuery::between(date!("2026-01-01"), date!("2026-12-31"));
+let invoiced = books.balance("Assets:Receivables", EUR, &year.of_kind("invoice"))?;
+assert_eq!(invoiced.debit(), amount!("100.00"));
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
 Over SQLite (feature `sqlite`) the same calls are `async`:
 
 ```rust
@@ -85,7 +119,10 @@ ledger.audit().await?; // replays the log and compares every stored table
 # fn main() {}
 ```
 
-`SqlStore::postgres(url)` is the same for PostgreSQL. More in
+`SqlStore::postgres(url)` is the same for PostgreSQL. A ledger needs a schema (or SQLite file)
+of its own; one holding other tables is refused with `ConfigError::ForeignSchema`. The
+service can run as a least-privilege role: `grant_runtime(role)` applies the grants generated
+from the schema (`runtime_grants(role)` lists them). More in
 [Getting started](https://hupe1980.github.io/doubleentry/docs/start/getting-started/) and the
 programs in [`examples/`](https://github.com/hupe1980/doubleentry/tree/main/examples).
 
@@ -100,6 +137,7 @@ programs in [`examples/`](https://github.com/hupe1980/doubleentry/tree/main/exam
 | **Provable balances** | A seal commits, per (currency, layer), to a tree of account balances; `prove_balance` proves one, named, against a head alone. |
 | **Witnessable** | `checkpoint` signs a C2SP `tlog-checkpoint`; `WitnessSession` speaks `tlog-witness` to stock witnesses; `Policy` and `Verifier` check cosignatures. Tested against the Go reference implementations. |
 | **Full audit** | `audit()` replays every record through the rule core and compares every table the store keeps, row by row. |
+| **Atomic batches** | `batch` writes entries, clearings and resets in one transaction, each decided against its predecessors; a refusal names the item and writes nothing; a retry replays every receipt. |
 | **One behaviour** | `Journal`, `MemoryStore`, SQLite and PostgreSQL return the same `Rejection` for the same input, checked by a public conformance suite. |
 
 It does not prevent a database superuser from editing tables — it detects it: on read, in

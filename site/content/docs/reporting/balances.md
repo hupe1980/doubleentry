@@ -32,6 +32,7 @@ takes a `BalanceQuery`: one **window** plus optional **modifiers**.
 |---|---|
 | `.by_value_date()` | date windows read the value date |
 | `.matching(axis, value)` / `.missing(axis)` | [dimension](@/docs/reporting/dimensions.md) filters, conjunctive |
+| `.of_kind(kind)` / `.without_kind()` | the entry's kind (`Entry::kind`): `of_kind` repeated is any of the kinds; `without_kind` keeps entries recorded without one; both match nothing |
 | `.pending()` | the Pending layer (open [holds](@/docs/concepts/holds.md)) instead of Settled |
 | `.pinned(head)` | evaluate against the log prefix of `head` |
 
@@ -69,6 +70,31 @@ assert_eq!(bank(&BalanceQuery::period("2026-04"))?, amount!("50.00"));
 let sales = books.balance("Income:Sales", EUR, &BalanceQuery::all())?;
 assert_eq!((sales.debit(), sales.credit(), sales.postings()), (amount!("0.00"), amount!("150.00"), 2));
 assert_eq!(sales.to_string(), "dr 0.00 cr 150.00 net -150.00 (2 postings)");
+```
+
+An entry's kind (`invoice`, `payment`, `credit_note`, …) is a property of the
+whole entry, so per-kind totals need no dimension mirrored onto a posting:
+
+```rust
+use doubleentry::prelude::*;
+
+let mut books = Journal::new(LedgerId::new("example.com/acme")?);
+books.declare_currency(EUR, 2, date!("2026-01-01"))?;
+books.define_months(2026, 1..=12)?;
+books.open("Assets:Receivables", AccountKind::Asset, date!("2026-01-01"))?;
+books.open("Income:Sales", AccountKind::Income, date!("2026-01-01"))?;
+let book = |key: &str, kind: &str, eur| {
+    Entry::new(key, date!("2026-05-04")).kind(kind).debit("Assets:Receivables", eur, EUR).credit("Income:Sales", eur, EUR)
+};
+books.record(book("INV-1", "invoice", amount!("300.00")))?;
+books.record(book("INV-2", "invoice", amount!("200.00")))?;
+books.record(book("FEE-1", "dunning_fee", amount!("5.00")))?;
+
+let year = BalanceQuery::between(date!("2026-01-01"), date!("2026-12-31"));
+let sales = |q: BalanceQuery| books.balance("Income:Sales", EUR, &q).map(|b| b.credit());
+assert_eq!(sales(year.clone().of_kind("invoice"))?, amount!("500.00"));
+assert_eq!(sales(year.clone().of_kind("invoice").of_kind("dunning_fee"))?, amount!("505.00"));
+assert_eq!(sales(year.without_kind())?, amount!("0.00"));
 ```
 
 A `Balance` is **gross**: total debits, total credits, posting count. `net()`

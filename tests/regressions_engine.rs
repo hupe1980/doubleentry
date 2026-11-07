@@ -435,7 +435,8 @@ fn qe5_clearing_dates_checked() {
     );
     let applied = books
         .clear("c", debit, credit, eur("10.00"), date!("2026-06-30"))
-        .unwrap();
+        .unwrap()
+        .position;
     assert_eq!(
         rejected(books.reset_clearing("r", applied, date!("1999-01-01"))),
         Rejection::NoPeriod {

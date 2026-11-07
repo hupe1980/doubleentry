@@ -28,12 +28,13 @@ use std::sync::Arc;
 use time::Date;
 
 use crate::core::{
-    self, AccountSpec, AuditFailure, AuditFailureKind, AuditReport, ChangeInput, Done, HoldState,
-    MemState, Op, Outcome, Recorded, ReplayLeaf, Replayer, SealReceipt, StateView,
+    self, AccountSpec, AuditFailure, AuditFailureKind, AuditReport, BatchItem, BatchReceipt,
+    ChangeInput, Cleared, Clearing, Done, HoldState, MemState, Op, Outcome, Recorded, ReplayLeaf,
+    Replayer, SealReceipt, StateView,
 };
 use crate::error::{Error, QueryError};
 use crate::export::{Export, ExportScope, Exporter};
-use crate::facade::{Account, Reads, SaltSource, now, seal_first, unexpected};
+use crate::facade::{Account, Period, Reads, SaltSource, now, seal_first, unexpected};
 use crate::log::{ConsistencyProof, InclusionProof, SealedBalanceProof, TreeHead};
 use crate::model::{
     AccountHandle, AccountKind, AccountRef, Amount, Balance, BalanceLimit, Currency, Entry,
@@ -201,6 +202,20 @@ impl<const P: u8> Journal<P> {
     #[must_use]
     pub fn id(&self) -> &LedgerId {
         self.state.ledger()
+    }
+
+    /// The id the entry recorded under `key` has in this ledger — known
+    /// before it is recorded, so a business row, a clearing in the same
+    /// [`batch`](Self::batch) or an outbox message can name it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Value`] when `key` is not a valid idempotency key.
+    pub fn entry_id(&self, key: &str) -> Result<EntryId, Error> {
+        Ok(EntryId::derive(
+            self.state.ledger(),
+            &crate::model::IdempotencyKey::new(key)?,
+        ))
     }
 
     /// Every read, over the journal's state.
@@ -584,19 +599,116 @@ impl<const P: u8> Journal<P> {
     /// randomness for a memo salt.
     #[cfg_attr(
         feature = "tracing",
-        tracing::instrument(name = "record_batch", target = "doubleentry", level = "info", skip_all, fields(ledger = %self.id(), outcome = tracing::field::Empty, code = tracing::field::Empty, index = tracing::field::Empty, position = tracing::field::Empty))
+        tracing::instrument(name = "batch", target = "doubleentry", level = "info", skip_all, fields(ledger = %self.id(), items = tracing::field::Empty, outcome = tracing::field::Empty, code = tracing::field::Empty, index = tracing::field::Empty, position = tracing::field::Empty))
     )]
     pub fn record_batch(
         &mut self,
         drafts: impl IntoIterator<Item = Entry<P>>,
     ) -> Result<Vec<Recorded>, Error> {
-        let result = self
-            .salt
-            .salted_all(drafts)
-            .and_then(|drafts| self.run(&Op::Batch(drafts)))
+        self.run_batch(drafts.into_iter().map(BatchItem::Record))
+            .and_then(crate::facade::recorded_all)
+    }
+
+    /// The most items one batch holds ([`Op::MAX_BATCH`]).
+    pub const MAX_BATCH: usize = Op::<P>::MAX_BATCH;
+
+    /// Records entries, clearings and clearing resets atomically, in order,
+    /// each against the state the items before it leave: all of them or
+    /// none. One receipt per item, in order; a retry of the same batch
+    /// returns the original receipts, each `replayed`.
+    ///
+    /// A clearing may name a posting of an entry earlier in the batch: its
+    /// id is derived from the ledger and the key
+    /// ([`entry_id`](Self::entry_id)), so a payment and its
+    /// assignment to open invoices commit together.
+    ///
+    /// ```
+    /// use doubleentry::{
+    ///     AccountKind, AccountSpec, BatchItem, Clearing, Entry, Error, Journal, LedgerId,
+    ///     PostingRef, amount, currency::EUR, date,
+    /// };
+    ///
+    /// let mut books = Journal::new(LedgerId::new("example.com/acme")?);
+    /// books.declare_currency(EUR, 2, date!("2026-01-01"))?;
+    /// books.define_months(2026, 1..=12)?;
+    /// books.register(AccountSpec::new("Assets:Receivables", AccountKind::Asset, date!("2026-01-01")))?;
+    /// books.register(AccountSpec::new("Assets:Bank", AccountKind::Asset, date!("2026-01-01")))?;
+    /// books.register(AccountSpec::new("Income:Sales", AccountKind::Income, date!("2026-01-01")))?;
+    /// for (key, eur) in [("inv-1", amount!("100.00")), ("inv-2", amount!("50.00"))] {
+    ///     books.record(
+    ///         Entry::new(key, date!("2026-03-02"))
+    ///             .kind("invoice")
+    ///             .debit("Assets:Receivables", eur, EUR)
+    ///             .credit("Income:Sales", eur, EUR),
+    ///     )?;
+    /// }
+    /// let invoice = PostingRef::at(books.entry_id("inv-1")?, 0);
+    /// let invoice2 = PostingRef::at(books.entry_id("inv-2")?, 0);
+    /// let payment = PostingRef::at(books.entry_id("pay-1")?, 1);
+    /// let run: Vec<BatchItem> = vec![
+    ///     Entry::new("pay-1", date!("2026-03-20"))
+    ///         .kind("payment")
+    ///         .debit("Assets:Bank", amount!("150.00"), EUR)
+    ///         .credit("Assets:Receivables", amount!("150.00"), EUR)
+    ///         .into(),
+    ///     Clearing::new("pay-1/inv-1", invoice, payment, amount!("100.00"), date!("2026-03-20")).into(),
+    ///     Clearing::new("pay-1/inv-2", invoice2, payment, amount!("50.00"), date!("2026-03-20")).into(),
+    /// ];
+    /// let receipts = books.batch(run.clone())?;
+    /// assert_eq!(receipts.len(), 3);
+    /// assert!(books.batch(run)?.iter().all(|receipt| receipt.replayed()));
+    /// # Ok::<(), Error>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BatchRejected`] naming the first refused item and its
+    /// rejection (the one a single write of it would get in that state);
+    /// [`Error::Rejected`] with 124 for more than [`MAX_BATCH`](Self::MAX_BATCH)
+    /// items; [`Error::Backend`] when the operating system has no randomness
+    /// for a memo salt.
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "batch", target = "doubleentry", level = "info", skip_all, fields(ledger = %self.id(), items = tracing::field::Empty, outcome = tracing::field::Empty, code = tracing::field::Empty, index = tracing::field::Empty, position = tracing::field::Empty))
+    )]
+    pub fn batch(
+        &mut self,
+        items: impl IntoIterator<Item = BatchItem<P>>,
+    ) -> Result<Vec<BatchReceipt>, Error> {
+        self.run_batch(items)
+    }
+
+    /// Applies clearings atomically, in order: [`batch`](Self::batch) of
+    /// clearings only.
+    ///
+    /// # Errors
+    ///
+    /// As [`batch`](Self::batch).
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(name = "batch", target = "doubleentry", level = "info", skip_all, fields(ledger = %self.id(), items = tracing::field::Empty, outcome = tracing::field::Empty, code = tracing::field::Empty, index = tracing::field::Empty, position = tracing::field::Empty))
+    )]
+    pub fn clear_batch(
+        &mut self,
+        clearings: impl IntoIterator<Item = Clearing<P>>,
+    ) -> Result<Vec<Cleared>, Error> {
+        self.run_batch(clearings.into_iter().map(BatchItem::Clear))
+            .and_then(crate::facade::cleared_all)
+    }
+
+    /// Runs a batch: salts its entries, decides and applies it.
+    fn run_batch(
+        &mut self,
+        items: impl IntoIterator<Item = BatchItem<P>>,
+    ) -> Result<Vec<BatchReceipt>, Error> {
+        let items = self.salt.salted_items(items);
+        #[cfg(feature = "tracing")]
+        let count = items.as_ref().map_or(0, Vec::len);
+        let result = items
+            .and_then(|items| self.run(&Op::Batch(items)))
             .and_then(Done::into_batch);
         #[cfg(feature = "tracing")]
-        crate::trace::batch(result.as_ref());
+        crate::trace::batch(count, result.as_deref());
         result
     }
 
@@ -612,8 +724,9 @@ impl<const P: u8> Journal<P> {
     }
 
     /// Clears `amount` of a debit posting against a credit posting of the
-    /// same balance; returns the clearing record's position (replays
-    /// included).
+    /// same balance; returns the clearing record's receipt (a retry under
+    /// the same key returns the original's, `replayed`). Several clearings
+    /// that must commit together go in one [`batch`](Self::batch).
     ///
     /// # Errors
     ///
@@ -629,7 +742,7 @@ impl<const P: u8> Journal<P> {
         credit: PostingRef,
         amount: Amount<P>,
         on: Date,
-    ) -> Result<u64, Error> {
+    ) -> Result<Cleared, Error> {
         let result = self.clearing(&Op::Clear {
             key: key.to_owned(),
             debit,
@@ -642,13 +755,13 @@ impl<const P: u8> Journal<P> {
         result
     }
 
-    /// Runs a clearing operation; its record's position.
-    fn clearing(&mut self, op: &Op<P>) -> Result<u64, Error> {
+    /// Runs a clearing operation; its record's receipt.
+    fn clearing(&mut self, op: &Op<P>) -> Result<Cleared, Error> {
         self.run(op)?.into_cleared()
     }
 
     /// Resets the clearing applied at position `clearing`; returns the reset
-    /// record's position.
+    /// record's receipt.
     ///
     /// # Errors
     ///
@@ -657,7 +770,7 @@ impl<const P: u8> Journal<P> {
         feature = "tracing",
         tracing::instrument(name = "record", target = "doubleentry", level = "info", skip_all, fields(ledger = %self.id(), key = %crate::trace::key(key), outcome = tracing::field::Empty, code = tracing::field::Empty, position = tracing::field::Empty))
     )]
-    pub fn reset_clearing(&mut self, key: &str, clearing: u64, on: Date) -> Result<u64, Error> {
+    pub fn reset_clearing(&mut self, key: &str, clearing: u64, on: Date) -> Result<Cleared, Error> {
         let result = self.clearing(&Op::ResetClearing {
             key: key.to_owned(),
             clearing,
@@ -872,6 +985,68 @@ impl<const P: u8> Journal<P> {
     /// [`Error::Query`] for a size beyond the head.
     pub fn head_at(&self, size: u64) -> Result<TreeHead, Error> {
         now(self.reads().head_at(size))
+    }
+
+    /// Every period of the calendar, in order: its id, first and last day,
+    /// definition position and, once sealed, its seal — the periods a host
+    /// shows as open or locked, whatever they are called.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Integrity`] for a stored seal that does not decode.
+    pub fn periods(&self) -> Result<Vec<Period<P>>, Error> {
+        now(self.reads().periods(None))
+    }
+
+    /// [`periods`](Self::periods) as they were at `head` (a checkpoint, for
+    /// example): only records below its size count.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Query`] for a head beyond the log; [`Error::Integrity`]
+    /// when the store's root at its size is not the head's.
+    pub fn periods_at(&self, head: TreeHead) -> Result<Vec<Period<P>>, Error> {
+        now(self.reads().periods(Some(head)))
+    }
+
+    /// Every seal, in order: what was sealed (festgeschrieben), from and
+    /// through which day, at which position, covering which records.
+    ///
+    /// # Errors
+    ///
+    /// As [`periods`](Self::periods).
+    pub fn seals(&self) -> Result<Vec<SealReceipt<P>>, Error> {
+        now(self.reads().seals(None))
+    }
+
+    /// [`seals`](Self::seals) as they were at `head`.
+    ///
+    /// # Errors
+    ///
+    /// As [`periods_at`](Self::periods_at).
+    pub fn seals_at(&self, head: TreeHead) -> Result<Vec<SealReceipt<P>>, Error> {
+        now(self.reads().seals(Some(head)))
+    }
+
+    /// The sealed watermark: the last day of the last sealed period, or
+    /// `None` before the first seal. No posting may be booked on or before
+    /// it (301, 309) — the "closed through" date a host checks input
+    /// against before it reaches the ledger.
+    ///
+    /// # Errors
+    ///
+    /// As [`periods`](Self::periods).
+    pub fn watermark(&self) -> Result<Option<Date>, Error> {
+        now(self.reads().watermark(None))
+    }
+
+    /// [`watermark`](Self::watermark) as it was at `head`.
+    ///
+    /// # Errors
+    ///
+    /// As [`periods_at`](Self::periods_at).
+    pub fn watermark_at(&self, head: TreeHead) -> Result<Option<Date>, Error> {
+        now(self.reads().watermark(Some(head)))
     }
 
     /// The proof that entry `id` is in the log, against [`head`](Self::head).

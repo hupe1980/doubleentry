@@ -22,7 +22,7 @@ use crate::model::{
 ///
 /// | Codes | Stage | Checks |
 /// |---|---|---|
-/// | 100–123 | [`Stage::Structural`] | the input alone: key, postings, balance, labels, sizes |
+/// | 100–124 | [`Stage::Structural`] | the input alone: key, postings, balance, labels, sizes, the batch bound |
 /// | 140–145 | [`Stage::Structural`] | the shape of a hold or a hold resolution |
 /// | 200 | [`Stage::Idempotency`] | a key already used for other content |
 /// | 300–311 | [`Stage::Context`] | the ledger's state on the booking date: periods, accounts, currencies, policy, watermark |
@@ -159,6 +159,15 @@ pub enum Rejection {
         exponent: u8,
         /// The ledger's scale `P`.
         max: u8,
+    },
+    /// 124: a batch holds more items than
+    /// [`Op::MAX_BATCH`](crate::store::Op::MAX_BATCH); refused before any
+    /// state is read.
+    BatchTooLarge {
+        /// The number of items.
+        items: usize,
+        /// The most a batch holds.
+        max: usize,
     },
     /// 140: a hold does not have exactly two Pending postings, one debit and
     /// one credit.
@@ -610,6 +619,9 @@ impl fmt::Display for Rejection {
             Self::ExponentTooLarge { exponent, max } => {
                 format!("[123] currency exponent {exponent} exceeds the ledger scale {max}")
             }
+            Self::BatchTooLarge { items, max } => {
+                format!("[124] a batch holds at most {max} items, not {items}")
+            }
             Self::HoldLegs => String::from(
                 "[140] a hold needs exactly two pending postings, one debit and one credit",
             ),
@@ -852,6 +864,7 @@ impl Rejection {
             Self::InvalidPeriodRange { .. } => 121,
             Self::InvalidOpenWindow { .. } => 122,
             Self::ExponentTooLarge { .. } => 123,
+            Self::BatchTooLarge { .. } => 124,
             Self::HoldLegs => 140,
             Self::HoldExpiry { .. } => 141,
             Self::ResolutionPostings { .. } => 142,
@@ -935,6 +948,7 @@ impl Rejection {
             | Self::InvalidPeriodRange { .. }
             | Self::InvalidOpenWindow { .. }
             | Self::ExponentTooLarge { .. }
+            | Self::BatchTooLarge { .. }
             | Self::HoldLegs
             | Self::HoldExpiry { .. }
             | Self::ResolutionPostings { .. }

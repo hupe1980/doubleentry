@@ -76,6 +76,21 @@ pub enum StoreErrorKind {
         /// The name refused.
         name: String,
     },
+    /// The schema (PostgreSQL) or database file (SQLite) holds tables but
+    /// no doubleentry ledger — another application's, or a ledger of
+    /// doubleentry 0.7. Nothing was created or changed.
+    ForeignSchema {
+        /// The schema (`main` for a SQLite file).
+        schema: String,
+        /// The tables found, sorted.
+        tables: Vec<String>,
+    },
+    /// A role name is not an identifier the store accepts:
+    /// `[A-Za-z_][A-Za-z0-9_]{0,62}`. Nothing was run.
+    InvalidRoleName {
+        /// The name refused.
+        name: String,
+    },
 }
 
 impl StoreError {
@@ -149,6 +164,13 @@ impl StoreError {
         Self::new(StoreErrorKind::SchemaMismatch { found }, operation)
     }
 
+    /// `operation` found the tables of something other than a ledger in
+    /// `schema`.
+    #[must_use]
+    pub fn foreign_schema(operation: &'static str, schema: String, tables: Vec<String>) -> Self {
+        Self::new(StoreErrorKind::ForeignSchema { schema, tables }, operation)
+    }
+
     /// `operation` found another ledger (or another scale).
     #[must_use]
     pub fn ledger_mismatch(operation: &'static str) -> Self {
@@ -180,6 +202,17 @@ impl StoreError {
             source: Some(Box::new(source)),
             ..self
         }
+    }
+
+    /// The role name `name` is refused before anything runs.
+    #[cfg(feature = "postgres")]
+    pub(crate) fn invalid_role_name(name: &str) -> Self {
+        Self::new(
+            StoreErrorKind::InvalidRoleName {
+                name: name.to_owned(),
+            },
+            "grant",
+        )
     }
 
     /// The schema name `name` is refused at construction.
@@ -265,6 +298,13 @@ impl fmt::Display for StoreError {
             StoreErrorKind::InvalidSchemaName { name } => write!(
                 f,
                 "the schema name {name:?} is not [A-Za-z_][A-Za-z0-9_]{{0,62}}"
+            )?,
+            StoreErrorKind::ForeignSchema { schema, tables } => {
+                f.write_str(&crate::error::foreign_schema(schema, tables))?;
+            }
+            StoreErrorKind::InvalidRoleName { name } => write!(
+                f,
+                "the role name {name:?} is not [A-Za-z_][A-Za-z0-9_]{{0,62}}"
             )?,
         }
         if !self.what.is_empty() {

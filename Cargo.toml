@@ -1,6 +1,6 @@
 [package]
 name        = "doubleentry"
-version     = "0.8.1"
+version     = "0.9.0"
 edition     = "2024"
 # MSRV, the single source: `just msrv` (and CI) checks it and the README badge.
 # 1.94 is required by sqlx 0.9. Never raised in a patch release, and only to a
@@ -48,7 +48,7 @@ default = []
 serde = ["dep:serde", "time/serde"]
 
 ## `SqlStore<Postgres>`, on sqlx. Enables no TLS stack: use `postgres-tls`.
-## One schema, `doubleentry/1`; no migrations.
+## One schema, `doubleentry/2`; no migrations.
 postgres = ["dep:sqlx", "sqlx/postgres"]
 
 ## `postgres` with TLS: rustls on aws-lc-rs, Mozilla's root set. Ask for it in
@@ -56,7 +56,7 @@ postgres = ["dep:sqlx", "sqlx/postgres"]
 postgres-tls = ["postgres", "sqlx/tls-rustls-aws-lc-rs"]
 
 ## `SqlStore<Sqlite>`, on sqlx, with SQLite bundled. One schema,
-## `doubleentry/1`; no migrations.
+## `doubleentry/2`; no migrations.
 sqlite = ["dep:sqlx", "sqlx/sqlite-bundled", "sqlx/sqlite-unlock-notify"]
 
 ## Ed25519 for `transparency`: `LogKey` signs checkpoints; cosignatures and
@@ -139,6 +139,9 @@ name = "wallet"
 
 [[example]]
 name = "invoice_clearing"
+
+[[example]]
+name = "payment_run"
 
 [[example]]
 name = "month_close"

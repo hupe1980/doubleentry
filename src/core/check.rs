@@ -27,11 +27,12 @@ pub enum Op<const P: u8> {
     /// Record an entry draft. A memo must carry its salt: the façades draw
     /// one when the caller did not.
     Record(Box<Entry<P>>),
-    /// Record entry drafts atomically, in order, each against the state the
-    /// ones before it leave. The outcome is `Batch` (or `Unchanged`
-    /// when every draft replays), or `Unchanged(Done::BatchRejected)` for a
-    /// refused draft — then nothing is written.
-    Batch(Vec<Entry<P>>),
+    /// Record entries, clearings and clearing resets atomically, in order,
+    /// each against the state the ones before it leave. The outcome is
+    /// `Batch` (or `Unchanged` when every item replays), or
+    /// `Unchanged(Done::BatchRejected)` for a refused item — then nothing is
+    /// written. At most [`Op::MAX_BATCH`] items (124 otherwise).
+    Batch(Vec<BatchItem<P>>),
     /// Register an account.
     Register {
         /// The account.
@@ -119,7 +120,103 @@ pub enum Op<const P: u8> {
     },
 }
 
+/// A clearing apply as raw caller input: clear `amount` of the debit
+/// posting against the credit posting on `on`, under the idempotency key
+/// `key`. The core validates every field (100, 120, 410 … 419).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Clearing<const P: u8 = 2> {
+    /// The clearing's idempotency key.
+    pub key: String,
+    /// The debit posting.
+    pub debit: PostingRef,
+    /// The credit posting.
+    pub credit: PostingRef,
+    /// The amount (positive).
+    pub amount: Amount<P>,
+    /// The clearing date.
+    pub on: Date,
+}
+
+impl<const P: u8> Clearing<P> {
+    /// Clears `amount` of `debit` against `credit` on `on`, under `key`.
+    #[must_use]
+    pub fn new(
+        key: impl Into<String>,
+        debit: PostingRef,
+        credit: PostingRef,
+        amount: Amount<P>,
+        on: Date,
+    ) -> Self {
+        Self {
+            key: key.into(),
+            debit,
+            credit,
+            amount,
+            on,
+        }
+    }
+}
+
+/// One item of an atomic batch ([`Op::Batch`], `Ledger::batch`).
+///
+/// A clearing may name a posting of an entry earlier in the same batch: its
+/// [`EntryId`](crate::EntryId) is derived from the ledger and the key, so it
+/// is known before the entry is recorded. A reset names a clearing by
+/// position; a clearing earlier in the batch is at the log size before the
+/// batch plus its offset among the items appended before it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "most items of a batch are entries: boxing them would cost an allocation each \
+              to save space on the clearings"
+)]
+pub enum BatchItem<const P: u8 = 2> {
+    /// Record an entry draft.
+    Record(Entry<P>),
+    /// Apply a clearing.
+    Clear(Clearing<P>),
+    /// Reset (release) the clearing applied at position `clearing`.
+    Reset {
+        /// The reset's idempotency key.
+        key: String,
+        /// The position of the clearing's apply record.
+        clearing: u64,
+        /// The reset date.
+        on: Date,
+    },
+}
+
+impl<const P: u8> BatchItem<P> {
+    /// A reset of the clearing at position `clearing`, on `on`, under `key`.
+    #[must_use]
+    pub fn reset(key: impl Into<String>, clearing: u64, on: Date) -> Self {
+        Self::Reset {
+            key: key.into(),
+            clearing,
+            on,
+        }
+    }
+}
+
+impl<const P: u8> From<Entry<P>> for BatchItem<P> {
+    fn from(entry: Entry<P>) -> Self {
+        Self::Record(entry)
+    }
+}
+
+impl<const P: u8> From<Clearing<P>> for BatchItem<P> {
+    fn from(clearing: Clearing<P>) -> Self {
+        Self::Clear(clearing)
+    }
+}
+
 impl<const P: u8> Op<P> {
+    /// The most items one batch holds: one transaction under the ledger's
+    /// lock stays short. Split a longer run; each chunk is atomic.
+    pub const MAX_BATCH: usize = 1_000;
+
     /// How many rounds of [`plan`](super::plan) a store may run before it
     /// gives up. Each round discovers every independent read; the deepest
     /// chain (a hold Post) needs four, and a batch may need the bound once
@@ -128,7 +225,7 @@ impl<const P: u8> Op<P> {
     pub fn max_rounds(&self) -> usize {
         const ROUNDS: usize = 8;
         match self {
-            Self::Batch(drafts) => ROUNDS.saturating_mul(drafts.len().saturating_add(1)),
+            Self::Batch(items) => ROUNDS.saturating_mul(items.len().saturating_add(1)),
             _ => ROUNDS,
         }
     }
@@ -159,7 +256,11 @@ pub fn execute<const P: u8>(view: &impl StateView<P>, op: &Op<P>) -> Result<Outc
     match op {
         Op::Genesis => Ok(genesis(view)),
         Op::Record(draft) => check(view, draft),
-        Op::Batch(drafts) => Ok(batch::batch(view, drafts)),
+        Op::Batch(items) if items.len() > Op::<P>::MAX_BATCH => Err(Rejection::BatchTooLarge {
+            items: items.len(),
+            max: Op::<P>::MAX_BATCH,
+        }),
+        Op::Batch(items) => Ok(batch::batch(view, items)),
         Op::Register { spec, actor } => master::register(view, spec, actor),
         Op::Change {
             account,

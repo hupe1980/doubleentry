@@ -5,7 +5,7 @@
 
 use tracing::Span;
 
-use crate::core::{AuditReport, Recorded, SealReceipt};
+use crate::core::{AuditReport, BatchReceipt, Cleared, Recorded, SealReceipt};
 use crate::error::Error;
 use crate::model::Entry;
 
@@ -51,15 +51,16 @@ pub(crate) fn recorded(result: Result<&Recorded, &Error>) {
     }
 }
 
-/// Records a `record_batch`: `new` unless every draft replayed, the highest
-/// position, or the failure (with the refused draft's index).
-pub(crate) fn batch(result: Result<&Vec<Recorded>, &Error>) {
+/// Records a batch: its item count, `new` unless every item replayed, the
+/// highest position, or the failure (with the refused item's index).
+pub(crate) fn batch(items: usize, result: Result<&[BatchReceipt], &Error>) {
     let span = Span::current();
+    span.record("items", items);
     match result {
-        Ok(recorded) => {
-            let new = recorded.iter().any(|receipt| !receipt.replayed);
+        Ok(receipts) => {
+            let new = receipts.iter().any(|receipt| !receipt.replayed());
             span.record("outcome", if new { "new" } else { "replay" });
-            if let Some(last) = recorded.iter().map(|receipt| receipt.position).max() {
+            if let Some(last) = receipts.iter().map(BatchReceipt::position).max() {
                 span.record("position", last);
             }
         }
@@ -72,14 +73,14 @@ pub(crate) fn batch(result: Result<&Vec<Recorded>, &Error>) {
     }
 }
 
-/// Records a `clear` or `reset_clearing`: the record's position (a replay
-/// is not told apart), or the failure.
-pub(crate) fn cleared(result: Result<&u64, &Error>) {
+/// Records a `clear` or `reset_clearing`: `new` or `replay` at its
+/// position, or the failure.
+pub(crate) fn cleared(result: Result<&Cleared, &Error>) {
     let span = Span::current();
     match result {
-        Ok(position) => {
-            span.record("outcome", "ok");
-            span.record("position", *position);
+        Ok(cleared) => {
+            span.record("outcome", if cleared.replayed { "replay" } else { "new" });
+            span.record("position", cleared.position);
         }
         Err(error) => failed(&span, error),
     }

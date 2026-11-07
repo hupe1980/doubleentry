@@ -12,7 +12,7 @@ use super::model::{Check, Oracle, SplitMix64, check_invariants, proofs_verify, s
 use super::reports::{export_checks, report_checks};
 use super::transparency::transparency_checks;
 use crate::PageRead;
-use crate::core::{BalanceKey, ChangeInput, Done, Op};
+use crate::core::{BalanceKey, BatchItem, BatchReceipt, ChangeInput, Clearing, Done, Op};
 use crate::error::{Error, Rejection};
 use crate::model::{
     AccountKind, AccountRef, Amount, BalanceLimit, CHF, Currency, EUR, Entry, EntryId, GBP,
@@ -590,8 +590,44 @@ impl<const P: u8> Generator<P> {
     /// and their resolutions — sometimes of a hold opened earlier in the same
     /// batch — retries, and repeats of a draft of the batch itself.
     fn batch(&mut self, journal: &Journal<P>, oracle: &Oracle<P>) -> Op<P> {
-        let mut drafts: Vec<Entry<P>> = Vec::new();
+        let mut items: Vec<BatchItem<P>> = Vec::new();
         for _ in 0..self.random.between(1, 7) {
+            // Clearings and resets of committed postings, mixed in; a
+            // repeat of an earlier clearing under a new key over-applies
+            // across the batch's own items.
+            match self.random.below(14) {
+                10 | 11 => {
+                    if let Some(item) = self.clear(oracle).and_then(as_item) {
+                        items.push(item);
+                        continue;
+                    }
+                }
+                12 => {
+                    let earlier = items.iter().rev().find_map(|item| match item {
+                        BatchItem::Clear(clearing) => Some(clearing.clone()),
+                        _ => None,
+                    });
+                    if let Some(mut clearing) = earlier {
+                        clearing.key = self.next_key("clr");
+                        items.push(BatchItem::Clear(clearing));
+                        continue;
+                    }
+                }
+                13 => {
+                    if let Some(item) = self.op(Kind::Reset, journal, oracle).and_then(as_item) {
+                        items.push(item);
+                        continue;
+                    }
+                }
+                _ => {}
+            }
+            let drafts: Vec<Entry<P>> = items
+                .iter()
+                .filter_map(|item| match item {
+                    BatchItem::Record(draft) => Some(draft.clone()),
+                    _ => None,
+                })
+                .collect();
             let draft = match self.random.below(10) {
                 0 => self.hold(),
                 1 => match self.op(Kind::Resolve, journal, oracle) {
@@ -613,15 +649,19 @@ impl<const P: u8> Generator<P> {
                 .filter(|action| matches!(action, HoldAction::Open { .. }))
                 .and(draft.key().cloned())
                 .map(|key| (EntryId::derive(journal.id(), &key), draft.booking_date()));
-            drafts.push(draft);
+            items.push(BatchItem::Record(draft));
             if let Some((hold, booked)) = opened
                 && self.random.chance(50)
             {
                 let key = self.next_key("r");
-                drafts.push(Entry::void_hold(key.as_str(), plus(booked, 1), hold));
+                items.push(BatchItem::Record(Entry::void_hold(
+                    key.as_str(),
+                    plus(booked, 1),
+                    hold,
+                )));
             }
         }
-        Op::Batch(drafts)
+        Op::Batch(items)
     }
 
     /// A clearing of a debit against a credit posting of one balance.
@@ -706,20 +746,51 @@ impl<const P: u8> Generator<P> {
                     self.world.retries.push((**draft).clone());
                 }
             }
-            (Op::Batch(drafts), Done::Batch(recorded)) => {
-                for (draft, receipt) in drafts.iter().zip(recorded) {
-                    self.learn(
-                        &Op::Record(Box::new(draft.clone())),
-                        &Ok(Done::Entry(*receipt)),
-                    );
+            (Op::Batch(items), Done::Batch(receipts)) => {
+                for (item, receipt) in items.iter().zip(receipts) {
+                    match (item, receipt) {
+                        (BatchItem::Record(draft), BatchReceipt::Recorded(recorded)) => self.learn(
+                            &Op::Record(Box::new(draft.clone())),
+                            &Ok(Done::Entry(*recorded)),
+                        ),
+                        (BatchItem::Clear(_), BatchReceipt::Cleared(cleared))
+                            if !cleared.replayed =>
+                        {
+                            self.world.applies.push(cleared.position);
+                        }
+                        _ => {}
+                    }
                 }
             }
-            (Op::Clear { .. }, Done::Cleared(position)) => self.world.applies.push(*position),
+            (Op::Clear { .. }, Done::Cleared(cleared)) if !cleared.replayed => {
+                self.world.applies.push(cleared.position);
+            }
             (Op::CloseYear { .. }, Done::Closing(drafts)) => {
                 self.world.pending = drafts.iter().rev().cloned().collect();
             }
             _ => {}
         }
+    }
+}
+
+/// A single clearing or reset as a batch item.
+fn as_item<const P: u8>(op: Op<P>) -> Option<BatchItem<P>> {
+    match op {
+        Op::Clear {
+            key,
+            debit,
+            credit,
+            amount,
+            date,
+        } => Some(BatchItem::Clear(Clearing::new(
+            key, debit, credit, amount, date,
+        ))),
+        Op::ResetClearing {
+            key,
+            clearing,
+            date,
+        } => Some(BatchItem::reset(key, clearing, date)),
+        _ => None,
     }
 }
 
@@ -758,11 +829,15 @@ fn equal<const P: u8>(expected: &Outcome<P>, actual: &Outcome<P>, maybe: bool) -
             (a.id, a.position) == (b.id, b.position)
         }
         (Ok(Done::Batch(a)), Ok(Done::Batch(b))) if maybe => {
-            a.len() == b.len()
-                && a.iter()
-                    .zip(b)
-                    .all(|(a, b)| (a.id, a.position) == (b.id, b.position))
+            let same = |receipt: &BatchReceipt| {
+                (
+                    receipt.position(),
+                    receipt.as_recorded().map(|recorded| recorded.id),
+                )
+            };
+            a.len() == b.len() && a.iter().zip(b).all(|(a, b)| same(a) == same(b))
         }
+        (Ok(Done::Cleared(a)), Ok(Done::Cleared(b))) if maybe => a.position == b.position,
         _ => expected == actual,
     }
 }
@@ -1127,6 +1202,7 @@ async fn postings_page<S: Store<P>, const P: u8>(
                 booking: booking.clone(),
                 value: value.clone(),
                 dimensions: dimensions.clone(),
+                kinds: crate::store::KindFilter::Any,
                 page: page.clone(),
             })
             .await

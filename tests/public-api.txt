@@ -101,6 +101,13 @@ impl core::marker::UnsafeUnpin for doubleentry::error::AuditFailureKind
 impl core::panic::unwind_safe::RefUnwindSafe for doubleentry::error::AuditFailureKind
 impl core::panic::unwind_safe::UnwindSafe for doubleentry::error::AuditFailureKind
 #[non_exhaustive] pub enum doubleentry::error::ConfigError
+pub doubleentry::error::ConfigError::ForeignSchema
+pub doubleentry::error::ConfigError::ForeignSchema::schema: alloc::string::String
+pub doubleentry::error::ConfigError::ForeignSchema::tables: alloc::vec::Vec<alloc::string::String>
+pub doubleentry::error::ConfigError::InvalidRoleName
+pub doubleentry::error::ConfigError::InvalidRoleName::name: alloc::string::String
+pub doubleentry::error::ConfigError::InvalidSchemaName
+pub doubleentry::error::ConfigError::InvalidSchemaName::name: alloc::string::String
 pub doubleentry::error::ConfigError::LedgerMismatch
 pub doubleentry::error::ConfigError::LedgerMismatch::expected: core::option::Option<alloc::string::String>
 pub doubleentry::error::ConfigError::LedgerMismatch::found: core::option::Option<alloc::string::String>
@@ -1293,6 +1300,34 @@ impl core::marker::Unpin for doubleentry::BalanceLimit
 impl core::marker::UnsafeUnpin for doubleentry::BalanceLimit
 impl core::panic::unwind_safe::RefUnwindSafe for doubleentry::BalanceLimit
 impl core::panic::unwind_safe::UnwindSafe for doubleentry::BalanceLimit
+#[non_exhaustive] pub enum doubleentry::prelude::BatchItem<const P: u8>
+pub doubleentry::prelude::BatchItem::Clear(doubleentry::Clearing<P>)
+pub doubleentry::prelude::BatchItem::Record(doubleentry::Entry<P>)
+pub doubleentry::prelude::BatchItem::Reset
+pub doubleentry::prelude::BatchItem::Reset::clearing: u64
+pub doubleentry::prelude::BatchItem::Reset::key: alloc::string::String
+pub doubleentry::prelude::BatchItem::Reset::on: time::date::Date
+impl<const P: u8> doubleentry::BatchItem<P>
+pub fn doubleentry::BatchItem<P>::reset(impl core::convert::Into<alloc::string::String>, u64, time::date::Date) -> Self
+impl<const P: u8> core::clone::Clone for doubleentry::BatchItem<P>
+pub fn doubleentry::BatchItem<P>::clone(&self) -> Self
+impl<const P: u8> core::cmp::Eq for doubleentry::BatchItem<P>
+impl<const P: u8> core::cmp::PartialEq for doubleentry::BatchItem<P>
+pub fn doubleentry::BatchItem<P>::eq(&self, &Self) -> bool
+impl<const P: u8> core::convert::From<doubleentry::Clearing<P>> for doubleentry::BatchItem<P>
+pub fn doubleentry::BatchItem<P>::from(doubleentry::Clearing<P>) -> Self
+impl<const P: u8> core::convert::From<doubleentry::Entry<P>> for doubleentry::BatchItem<P>
+pub fn doubleentry::BatchItem<P>::from(doubleentry::Entry<P>) -> Self
+impl<const P: u8> core::fmt::Debug for doubleentry::BatchItem<P>
+pub fn doubleentry::BatchItem<P>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl<const P: u8> core::marker::StructuralPartialEq for doubleentry::BatchItem<P>
+impl<const P: u8> core::marker::Freeze for doubleentry::BatchItem<P> where doubleentry::Entry<P>: core::marker::Freeze, doubleentry::Clearing<P>: core::marker::Freeze
+impl<const P: u8> core::marker::Send for doubleentry::BatchItem<P> where doubleentry::Entry<P>: core::marker::Send, doubleentry::Clearing<P>: core::marker::Send
+impl<const P: u8> core::marker::Sync for doubleentry::BatchItem<P> where doubleentry::Entry<P>: core::marker::Sync, doubleentry::Clearing<P>: core::marker::Sync
+impl<const P: u8> core::marker::Unpin for doubleentry::BatchItem<P> where doubleentry::Entry<P>: core::marker::Unpin, doubleentry::Clearing<P>: core::marker::Unpin
+impl<const P: u8> core::marker::UnsafeUnpin for doubleentry::BatchItem<P> where doubleentry::Entry<P>: core::marker::UnsafeUnpin, doubleentry::Clearing<P>: core::marker::UnsafeUnpin
+impl<const P: u8> core::panic::unwind_safe::RefUnwindSafe for doubleentry::BatchItem<P> where doubleentry::Entry<P>: core::panic::unwind_safe::RefUnwindSafe, doubleentry::Clearing<P>: core::panic::unwind_safe::RefUnwindSafe
+impl<const P: u8> core::panic::unwind_safe::UnwindSafe for doubleentry::BatchItem<P> where doubleentry::Entry<P>: core::panic::unwind_safe::UnwindSafe, doubleentry::Clearing<P>: core::panic::unwind_safe::UnwindSafe
 #[non_exhaustive] pub enum doubleentry::prelude::Error
 pub doubleentry::prelude::Error::Amount(doubleentry::error::AmountError)
 pub doubleentry::prelude::Error::Backend(doubleentry::error::BackendError)
@@ -1401,6 +1436,9 @@ pub doubleentry::prelude::Rejection::BalanceOverflow
 pub doubleentry::prelude::Rejection::BalanceOverflow::account: core::option::Option<doubleentry::AccountPath>
 pub doubleentry::prelude::Rejection::BalanceOverflow::currency: doubleentry::Currency
 pub doubleentry::prelude::Rejection::BalanceOverflow::layer: doubleentry::Layer
+pub doubleentry::prelude::Rejection::BatchTooLarge
+pub doubleentry::prelude::Rejection::BatchTooLarge::items: usize
+pub doubleentry::prelude::Rejection::BatchTooLarge::max: usize
 pub doubleentry::prelude::Rejection::ClassFrozen
 pub doubleentry::prelude::Rejection::ClassFrozen::account: doubleentry::AccountPath
 pub doubleentry::prelude::Rejection::ClearingAlreadyReset
@@ -1877,11 +1915,13 @@ pub fn doubleentry::BalanceQuery::by_value_date(self) -> Self
 pub const fn doubleentry::BalanceQuery::layer(&self) -> doubleentry::Layer
 pub fn doubleentry::BalanceQuery::matching(self, impl core::convert::AsRef<str>, impl core::convert::AsRef<str>) -> Self
 pub fn doubleentry::BalanceQuery::missing(self, impl core::convert::AsRef<str>) -> Self
+pub fn doubleentry::BalanceQuery::of_kind(self, impl core::convert::AsRef<str>) -> Self
 pub fn doubleentry::BalanceQuery::pending(self) -> Self
 pub fn doubleentry::BalanceQuery::period(impl core::convert::AsRef<str>) -> Self
 pub fn doubleentry::BalanceQuery::pinned(self, doubleentry::TreeHead) -> Self
 pub fn doubleentry::BalanceQuery::through(time::date::Date) -> Self
 pub fn doubleentry::BalanceQuery::through_position(u64) -> Self
+pub fn doubleentry::BalanceQuery::without_kind(self) -> Self
 impl core::clone::Clone for doubleentry::BalanceQuery
 pub fn doubleentry::BalanceQuery::clone(&self) -> Self
 impl core::cmp::Eq for doubleentry::BalanceQuery
@@ -1903,6 +1943,31 @@ impl core::marker::Unpin for doubleentry::BalanceQuery
 impl core::marker::UnsafeUnpin for doubleentry::BalanceQuery
 impl core::panic::unwind_safe::RefUnwindSafe for doubleentry::BalanceQuery
 impl core::panic::unwind_safe::UnwindSafe for doubleentry::BalanceQuery
+#[non_exhaustive] pub struct doubleentry::prelude::Clearing<const P: u8>
+pub doubleentry::prelude::Clearing::amount: doubleentry::Amount<P>
+pub doubleentry::prelude::Clearing::credit: doubleentry::PostingRef
+pub doubleentry::prelude::Clearing::debit: doubleentry::PostingRef
+pub doubleentry::prelude::Clearing::key: alloc::string::String
+pub doubleentry::prelude::Clearing::on: time::date::Date
+impl<const P: u8> doubleentry::Clearing<P>
+pub fn doubleentry::Clearing<P>::new(impl core::convert::Into<alloc::string::String>, doubleentry::PostingRef, doubleentry::PostingRef, doubleentry::Amount<P>, time::date::Date) -> Self
+impl<const P: u8> core::clone::Clone for doubleentry::Clearing<P>
+pub fn doubleentry::Clearing<P>::clone(&self) -> Self
+impl<const P: u8> core::cmp::Eq for doubleentry::Clearing<P>
+impl<const P: u8> core::cmp::PartialEq for doubleentry::Clearing<P>
+pub fn doubleentry::Clearing<P>::eq(&self, &Self) -> bool
+impl<const P: u8> core::convert::From<doubleentry::Clearing<P>> for doubleentry::BatchItem<P>
+pub fn doubleentry::BatchItem<P>::from(doubleentry::Clearing<P>) -> Self
+impl<const P: u8> core::fmt::Debug for doubleentry::Clearing<P>
+pub fn doubleentry::Clearing<P>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl<const P: u8> core::marker::StructuralPartialEq for doubleentry::Clearing<P>
+impl<const P: u8> core::marker::Freeze for doubleentry::Clearing<P> where doubleentry::Amount<P>: core::marker::Freeze
+impl<const P: u8> core::marker::Send for doubleentry::Clearing<P> where doubleentry::Amount<P>: core::marker::Send
+impl<const P: u8> core::marker::Sync for doubleentry::Clearing<P> where doubleentry::Amount<P>: core::marker::Sync
+impl<const P: u8> core::marker::Unpin for doubleentry::Clearing<P> where doubleentry::Amount<P>: core::marker::Unpin
+impl<const P: u8> core::marker::UnsafeUnpin for doubleentry::Clearing<P> where doubleentry::Amount<P>: core::marker::UnsafeUnpin
+impl<const P: u8> core::panic::unwind_safe::RefUnwindSafe for doubleentry::Clearing<P> where doubleentry::Amount<P>: core::panic::unwind_safe::RefUnwindSafe
+impl<const P: u8> core::panic::unwind_safe::UnwindSafe for doubleentry::Clearing<P> where doubleentry::Amount<P>: core::panic::unwind_safe::UnwindSafe
 pub struct doubleentry::prelude::Currency
 impl doubleentry::Currency
 pub fn doubleentry::Currency::as_str(&self) -> &str
@@ -2018,6 +2083,8 @@ pub fn doubleentry::Entry<P>::clone(&self) -> Self
 impl<const P: u8> core::cmp::Eq for doubleentry::Entry<P>
 impl<const P: u8> core::cmp::PartialEq for doubleentry::Entry<P>
 pub fn doubleentry::Entry<P>::eq(&self, &Self) -> bool
+impl<const P: u8> core::convert::From<doubleentry::Entry<P>> for doubleentry::BatchItem<P>
+pub fn doubleentry::BatchItem<P>::from(doubleentry::Entry<P>) -> Self
 impl<const P: u8> core::fmt::Debug for doubleentry::Entry<P>
 pub fn doubleentry::Entry<P>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl<const P: u8> core::hash::Hash for doubleentry::Entry<P>
@@ -2072,14 +2139,17 @@ pub struct doubleentry::prelude::Journal<const P: u8>
 impl doubleentry::Journal<2>
 pub fn doubleentry::Journal<2>::new(doubleentry::LedgerId) -> Self
 impl<const P: u8> doubleentry::Journal<P>
+pub const doubleentry::Journal<P>::MAX_BATCH: usize
 pub fn doubleentry::Journal<P>::account<A>(&self, A) -> core::option::Option<doubleentry::Account> where A: core::convert::TryInto<doubleentry::AccountRef>, <A as core::convert::TryInto>::Error: core::convert::Into<doubleentry::error::ValueError>
 pub fn doubleentry::Journal<P>::actor(&self) -> &str
 pub fn doubleentry::Journal<P>::as_actor(self, impl core::convert::AsRef<str>) -> Self
 pub fn doubleentry::Journal<P>::audit(&self) -> core::result::Result<doubleentry::AuditReport, doubleentry::Error>
 pub fn doubleentry::Journal<P>::balance<A>(&self, A, doubleentry::Currency, &doubleentry::BalanceQuery) -> core::result::Result<doubleentry::Balance<P>, doubleentry::Error> where A: core::convert::TryInto<doubleentry::AccountRef> + core::fmt::Display, <A as core::convert::TryInto>::Error: core::convert::Into<doubleentry::error::ValueError>
+pub fn doubleentry::Journal<P>::batch(&mut self, impl core::iter::traits::collect::IntoIterator<Item = doubleentry::BatchItem<P>>) -> core::result::Result<alloc::vec::Vec<doubleentry::BatchReceipt>, doubleentry::Error>
 pub fn doubleentry::Journal<P>::check_assertion(&self, &doubleentry::report::BalanceAssertion<P>) -> core::result::Result<doubleentry::report::AssertionOutcome<P>, doubleentry::Error>
 pub fn doubleentry::Journal<P>::check_assertions(&self, &[doubleentry::report::BalanceAssertion<P>]) -> core::result::Result<alloc::vec::Vec<doubleentry::report::AssertionOutcome<P>>, doubleentry::Error>
-pub fn doubleentry::Journal<P>::clear(&mut self, &str, doubleentry::PostingRef, doubleentry::PostingRef, doubleentry::Amount<P>, time::date::Date) -> core::result::Result<u64, doubleentry::Error>
+pub fn doubleentry::Journal<P>::clear(&mut self, &str, doubleentry::PostingRef, doubleentry::PostingRef, doubleentry::Amount<P>, time::date::Date) -> core::result::Result<doubleentry::Cleared, doubleentry::Error>
+pub fn doubleentry::Journal<P>::clear_batch(&mut self, impl core::iter::traits::collect::IntoIterator<Item = doubleentry::Clearing<P>>) -> core::result::Result<alloc::vec::Vec<doubleentry::Cleared>, doubleentry::Error>
 pub fn doubleentry::Journal<P>::close_account<A>(&mut self, A, time::date::Date) -> core::result::Result<(), doubleentry::Error> where A: core::convert::TryInto<doubleentry::AccountRef>, <A as core::convert::TryInto>::Error: core::convert::Into<doubleentry::error::ValueError>
 pub fn doubleentry::Journal<P>::close_year<A>(&self, &str, time::date::Date, A) -> core::result::Result<alloc::vec::Vec<doubleentry::Entry<P>>, doubleentry::Error> where A: core::convert::TryInto<doubleentry::AccountRef>, <A as core::convert::TryInto>::Error: core::convert::Into<doubleentry::error::ValueError>
 pub fn doubleentry::Journal<P>::declare_currency(&mut self, doubleentry::Currency, u8, time::date::Date) -> core::result::Result<(), doubleentry::Error>
@@ -2087,6 +2157,7 @@ pub fn doubleentry::Journal<P>::define_months(&mut self, i32, core::ops::range::
 pub fn doubleentry::Journal<P>::define_period(&mut self, impl core::convert::AsRef<str>, time::date::Date, time::date::Date) -> core::result::Result<(), doubleentry::Error>
 pub fn doubleentry::Journal<P>::entry(&self, doubleentry::EntryId) -> core::option::Option<doubleentry::EntryRecord<P>>
 pub fn doubleentry::Journal<P>::entry_by_key(&self, impl core::convert::AsRef<str>) -> core::option::Option<doubleentry::EntryRecord<P>>
+pub fn doubleentry::Journal<P>::entry_id(&self, &str) -> core::result::Result<doubleentry::EntryId, doubleentry::Error>
 pub fn doubleentry::Journal<P>::erase_memo(&mut self, doubleentry::EntryId) -> core::result::Result<(), doubleentry::Error>
 pub fn doubleentry::Journal<P>::exponent(&self, doubleentry::Currency) -> core::option::Option<u8>
 pub fn doubleentry::Journal<P>::export(&self, doubleentry::export::ExportScope, core::option::Option<doubleentry::TreeHead>) -> core::result::Result<doubleentry::export::Export<'_, P>, doubleentry::Error>
@@ -2100,6 +2171,8 @@ pub fn doubleentry::Journal<P>::leaves(&self) -> impl core::iter::traits::iterat
 pub fn doubleentry::Journal<P>::memo(&self, doubleentry::EntryId) -> core::option::Option<alloc::string::String>
 pub fn doubleentry::Journal<P>::open(&mut self, impl core::convert::AsRef<str>, doubleentry::AccountKind, time::date::Date) -> core::result::Result<doubleentry::AccountHandle, doubleentry::Error>
 pub fn doubleentry::Journal<P>::open_items<A>(&self, A, doubleentry::Currency, &doubleentry::BalanceQuery) -> core::result::Result<alloc::vec::Vec<doubleentry::report::OpenItem<P>>, doubleentry::Error> where A: core::convert::TryInto<doubleentry::AccountRef> + core::fmt::Display, <A as core::convert::TryInto>::Error: core::convert::Into<doubleentry::error::ValueError>
+pub fn doubleentry::Journal<P>::periods(&self) -> core::result::Result<alloc::vec::Vec<doubleentry::Period<P>>, doubleentry::Error>
+pub fn doubleentry::Journal<P>::periods_at(&self, doubleentry::TreeHead) -> core::result::Result<alloc::vec::Vec<doubleentry::Period<P>>, doubleentry::Error>
 pub fn doubleentry::Journal<P>::prove_consistency(&self, u64, u64) -> core::result::Result<doubleentry::log::ConsistencyProof, doubleentry::Error>
 pub fn doubleentry::Journal<P>::prove_entry(&self, doubleentry::EntryId) -> core::result::Result<doubleentry::log::InclusionProof, doubleentry::Error>
 pub fn doubleentry::Journal<P>::prove_entry_at(&self, doubleentry::EntryId, u64) -> core::result::Result<doubleentry::log::InclusionProof, doubleentry::Error>
@@ -2107,16 +2180,20 @@ pub fn doubleentry::Journal<P>::record(&mut self, doubleentry::Entry<P>) -> core
 pub fn doubleentry::Journal<P>::record_batch(&mut self, impl core::iter::traits::collect::IntoIterator<Item = doubleentry::Entry<P>>) -> core::result::Result<alloc::vec::Vec<doubleentry::Recorded>, doubleentry::Error>
 pub fn doubleentry::Journal<P>::register(&mut self, doubleentry::AccountSpec) -> core::result::Result<doubleentry::AccountHandle, doubleentry::Error>
 pub fn doubleentry::Journal<P>::reopen_account<A>(&mut self, A, time::date::Date) -> core::result::Result<(), doubleentry::Error> where A: core::convert::TryInto<doubleentry::AccountRef>, <A as core::convert::TryInto>::Error: core::convert::Into<doubleentry::error::ValueError>
-pub fn doubleentry::Journal<P>::reset_clearing(&mut self, &str, u64, time::date::Date) -> core::result::Result<u64, doubleentry::Error>
+pub fn doubleentry::Journal<P>::reset_clearing(&mut self, &str, u64, time::date::Date) -> core::result::Result<doubleentry::Cleared, doubleentry::Error>
 pub fn doubleentry::Journal<P>::reversal(&self, doubleentry::EntryId, &str, time::date::Date) -> core::result::Result<doubleentry::Entry<P>, doubleentry::Error>
 pub fn doubleentry::Journal<P>::rollup(&self, doubleentry::Currency, &doubleentry::BalanceQuery) -> core::result::Result<doubleentry::report::Rollup<P>, doubleentry::Error>
 pub fn doubleentry::Journal<P>::seal_period(&mut self, impl core::convert::AsRef<str>) -> core::result::Result<doubleentry::SealReceipt<P>, doubleentry::Error>
 pub fn doubleentry::Journal<P>::seal_through(&mut self, impl core::convert::AsRef<str>) -> core::result::Result<alloc::vec::Vec<doubleentry::SealReceipt<P>>, doubleentry::Error>
+pub fn doubleentry::Journal<P>::seals(&self) -> core::result::Result<alloc::vec::Vec<doubleentry::SealReceipt<P>>, doubleentry::Error>
+pub fn doubleentry::Journal<P>::seals_at(&self, doubleentry::TreeHead) -> core::result::Result<alloc::vec::Vec<doubleentry::SealReceipt<P>>, doubleentry::Error>
 pub fn doubleentry::Journal<P>::set_class<A>(&mut self, A, core::option::Option<&str>, time::date::Date) -> core::result::Result<(), doubleentry::Error> where A: core::convert::TryInto<doubleentry::AccountRef>, <A as core::convert::TryInto>::Error: core::convert::Into<doubleentry::error::ValueError>
 pub fn doubleentry::Journal<P>::set_limit<A>(&mut self, A, doubleentry::BalanceLimit, time::date::Date) -> core::result::Result<(), doubleentry::Error> where A: core::convert::TryInto<doubleentry::AccountRef>, <A as core::convert::TryInto>::Error: core::convert::Into<doubleentry::error::ValueError>
 pub fn doubleentry::Journal<P>::set_policy(&mut self, doubleentry::LedgerPolicy, time::date::Date) -> core::result::Result<(), doubleentry::Error>
 pub fn doubleentry::Journal<P>::statement<A>(&self, A, doubleentry::Currency, &doubleentry::BalanceQuery) -> core::result::Result<doubleentry::report::Statement<P>, doubleentry::Error> where A: core::convert::TryInto<doubleentry::AccountRef> + core::fmt::Display, <A as core::convert::TryInto>::Error: core::convert::Into<doubleentry::error::ValueError>
 pub fn doubleentry::Journal<P>::trial_balance(&self, &doubleentry::BalanceQuery) -> core::result::Result<doubleentry::report::TrialBalance<P>, doubleentry::Error>
+pub fn doubleentry::Journal<P>::watermark(&self) -> core::result::Result<core::option::Option<time::date::Date>, doubleentry::Error>
+pub fn doubleentry::Journal<P>::watermark_at(&self, doubleentry::TreeHead) -> core::result::Result<core::option::Option<time::date::Date>, doubleentry::Error>
 pub fn doubleentry::Journal<P>::with_precision(doubleentry::LedgerId) -> Self
 pub fn doubleentry::Journal<P>::with_salt_source(self, impl core::ops::function::Fn() -> doubleentry::MemoSalt + core::marker::Send + core::marker::Sync + 'static) -> Self
 impl<const P: u8> doubleentry::Journal<P>
@@ -2185,14 +2262,17 @@ pub struct doubleentry::prelude::Ledger<S, const P: u8>
 impl<S: doubleentry::store::Store<2>> doubleentry::Ledger<S, 2>
 pub async fn doubleentry::Ledger<S, 2>::new(S, doubleentry::LedgerId) -> core::result::Result<Self, doubleentry::Error>
 impl<S: doubleentry::store::Store<P>, const P: u8> doubleentry::Ledger<S, P>
+pub const doubleentry::Ledger<S, P>::MAX_BATCH: usize
 pub async fn doubleentry::Ledger<S, P>::account<A>(&self, A) -> core::result::Result<core::option::Option<doubleentry::Account>, doubleentry::Error> where A: core::convert::TryInto<doubleentry::AccountRef>, <A as core::convert::TryInto>::Error: core::convert::Into<doubleentry::error::ValueError>
 pub fn doubleentry::Ledger<S, P>::actor(&self) -> &str
 pub fn doubleentry::Ledger<S, P>::as_actor(self, impl core::convert::AsRef<str>) -> Self
 pub async fn doubleentry::Ledger<S, P>::audit(&self) -> core::result::Result<doubleentry::AuditReport, doubleentry::Error>
 pub async fn doubleentry::Ledger<S, P>::balance<A>(&self, A, doubleentry::Currency, &doubleentry::BalanceQuery) -> core::result::Result<doubleentry::Balance<P>, doubleentry::Error> where A: core::convert::TryInto<doubleentry::AccountRef> + core::fmt::Display, <A as core::convert::TryInto>::Error: core::convert::Into<doubleentry::error::ValueError>
+pub async fn doubleentry::Ledger<S, P>::batch(&self, impl core::iter::traits::collect::IntoIterator<Item = doubleentry::BatchItem<P>>) -> core::result::Result<alloc::vec::Vec<doubleentry::BatchReceipt>, doubleentry::Error>
 pub async fn doubleentry::Ledger<S, P>::check_assertion(&self, &doubleentry::report::BalanceAssertion<P>) -> core::result::Result<doubleentry::report::AssertionOutcome<P>, doubleentry::Error>
 pub async fn doubleentry::Ledger<S, P>::check_assertions(&self, &[doubleentry::report::BalanceAssertion<P>]) -> core::result::Result<alloc::vec::Vec<doubleentry::report::AssertionOutcome<P>>, doubleentry::Error>
-pub async fn doubleentry::Ledger<S, P>::clear(&self, &str, doubleentry::PostingRef, doubleentry::PostingRef, doubleentry::Amount<P>, time::date::Date) -> core::result::Result<u64, doubleentry::Error>
+pub async fn doubleentry::Ledger<S, P>::clear(&self, &str, doubleentry::PostingRef, doubleentry::PostingRef, doubleentry::Amount<P>, time::date::Date) -> core::result::Result<doubleentry::Cleared, doubleentry::Error>
+pub async fn doubleentry::Ledger<S, P>::clear_batch(&self, impl core::iter::traits::collect::IntoIterator<Item = doubleentry::Clearing<P>>) -> core::result::Result<alloc::vec::Vec<doubleentry::Cleared>, doubleentry::Error>
 pub async fn doubleentry::Ledger<S, P>::close_account<A>(&self, A, time::date::Date) -> core::result::Result<(), doubleentry::Error> where A: core::convert::TryInto<doubleentry::AccountRef>, <A as core::convert::TryInto>::Error: core::convert::Into<doubleentry::error::ValueError>
 pub async fn doubleentry::Ledger<S, P>::close_year<A>(&self, &str, time::date::Date, A) -> core::result::Result<alloc::vec::Vec<doubleentry::Entry<P>>, doubleentry::Error> where A: core::convert::TryInto<doubleentry::AccountRef>, <A as core::convert::TryInto>::Error: core::convert::Into<doubleentry::error::ValueError>
 pub async fn doubleentry::Ledger<S, P>::declare_currency(&self, doubleentry::Currency, u8, time::date::Date) -> core::result::Result<(), doubleentry::Error>
@@ -2200,6 +2280,7 @@ pub async fn doubleentry::Ledger<S, P>::define_months(&self, i32, core::ops::ran
 pub async fn doubleentry::Ledger<S, P>::define_period(&self, impl core::convert::AsRef<str>, time::date::Date, time::date::Date) -> core::result::Result<(), doubleentry::Error>
 pub async fn doubleentry::Ledger<S, P>::entry(&self, doubleentry::EntryId) -> core::result::Result<core::option::Option<doubleentry::EntryRecord<P>>, doubleentry::Error>
 pub async fn doubleentry::Ledger<S, P>::entry_by_key(&self, impl core::convert::AsRef<str>) -> core::result::Result<core::option::Option<doubleentry::EntryRecord<P>>, doubleentry::Error>
+pub fn doubleentry::Ledger<S, P>::entry_id(&self, &str) -> core::result::Result<doubleentry::EntryId, doubleentry::Error>
 pub async fn doubleentry::Ledger<S, P>::erase_memo(&self, doubleentry::EntryId) -> core::result::Result<(), doubleentry::Error>
 pub async fn doubleentry::Ledger<S, P>::exponent(&self, doubleentry::Currency) -> core::result::Result<core::option::Option<u8>, doubleentry::Error>
 pub async fn doubleentry::Ledger<S, P>::export(&self, doubleentry::export::ExportScope, core::option::Option<doubleentry::TreeHead>) -> core::result::Result<doubleentry::export::ExportPages<'_, S, P>, doubleentry::Error>
@@ -2211,6 +2292,8 @@ pub const fn doubleentry::Ledger<S, P>::id(&self) -> &doubleentry::LedgerId
 pub async fn doubleentry::Ledger<S, P>::memo(&self, doubleentry::EntryId) -> core::result::Result<core::option::Option<alloc::string::String>, doubleentry::Error>
 pub async fn doubleentry::Ledger<S, P>::open(&self, impl core::convert::AsRef<str>, doubleentry::AccountKind, time::date::Date) -> core::result::Result<doubleentry::AccountHandle, doubleentry::Error>
 pub async fn doubleentry::Ledger<S, P>::open_items<A>(&self, A, doubleentry::Currency, &doubleentry::BalanceQuery) -> core::result::Result<alloc::vec::Vec<doubleentry::report::OpenItem<P>>, doubleentry::Error> where A: core::convert::TryInto<doubleentry::AccountRef> + core::fmt::Display, <A as core::convert::TryInto>::Error: core::convert::Into<doubleentry::error::ValueError>
+pub async fn doubleentry::Ledger<S, P>::periods(&self) -> core::result::Result<alloc::vec::Vec<doubleentry::Period<P>>, doubleentry::Error>
+pub async fn doubleentry::Ledger<S, P>::periods_at(&self, doubleentry::TreeHead) -> core::result::Result<alloc::vec::Vec<doubleentry::Period<P>>, doubleentry::Error>
 pub async fn doubleentry::Ledger<S, P>::prove_consistency(&self, u64, u64) -> core::result::Result<doubleentry::log::ConsistencyProof, doubleentry::Error>
 pub async fn doubleentry::Ledger<S, P>::prove_entry(&self, doubleentry::EntryId) -> core::result::Result<doubleentry::log::InclusionProof, doubleentry::Error>
 pub async fn doubleentry::Ledger<S, P>::prove_entry_at(&self, doubleentry::EntryId, u64) -> core::result::Result<doubleentry::log::InclusionProof, doubleentry::Error>
@@ -2218,17 +2301,21 @@ pub async fn doubleentry::Ledger<S, P>::record(&self, doubleentry::Entry<P>) -> 
 pub async fn doubleentry::Ledger<S, P>::record_batch(&self, impl core::iter::traits::collect::IntoIterator<Item = doubleentry::Entry<P>>) -> core::result::Result<alloc::vec::Vec<doubleentry::Recorded>, doubleentry::Error>
 pub async fn doubleentry::Ledger<S, P>::register(&self, doubleentry::AccountSpec) -> core::result::Result<doubleentry::AccountHandle, doubleentry::Error>
 pub async fn doubleentry::Ledger<S, P>::reopen_account<A>(&self, A, time::date::Date) -> core::result::Result<(), doubleentry::Error> where A: core::convert::TryInto<doubleentry::AccountRef>, <A as core::convert::TryInto>::Error: core::convert::Into<doubleentry::error::ValueError>
-pub async fn doubleentry::Ledger<S, P>::reset_clearing(&self, &str, u64, time::date::Date) -> core::result::Result<u64, doubleentry::Error>
+pub async fn doubleentry::Ledger<S, P>::reset_clearing(&self, &str, u64, time::date::Date) -> core::result::Result<doubleentry::Cleared, doubleentry::Error>
 pub async fn doubleentry::Ledger<S, P>::reversal(&self, doubleentry::EntryId, &str, time::date::Date) -> core::result::Result<doubleentry::Entry<P>, doubleentry::Error>
 pub async fn doubleentry::Ledger<S, P>::rollup(&self, doubleentry::Currency, &doubleentry::BalanceQuery) -> core::result::Result<doubleentry::report::Rollup<P>, doubleentry::Error>
 pub async fn doubleentry::Ledger<S, P>::seal_period(&self, impl core::convert::AsRef<str>) -> core::result::Result<doubleentry::SealReceipt<P>, doubleentry::Error>
 pub async fn doubleentry::Ledger<S, P>::seal_through(&self, impl core::convert::AsRef<str>) -> core::result::Result<alloc::vec::Vec<doubleentry::SealReceipt<P>>, doubleentry::Error>
+pub async fn doubleentry::Ledger<S, P>::seals(&self) -> core::result::Result<alloc::vec::Vec<doubleentry::SealReceipt<P>>, doubleentry::Error>
+pub async fn doubleentry::Ledger<S, P>::seals_at(&self, doubleentry::TreeHead) -> core::result::Result<alloc::vec::Vec<doubleentry::SealReceipt<P>>, doubleentry::Error>
 pub async fn doubleentry::Ledger<S, P>::set_class<A>(&self, A, core::option::Option<&str>, time::date::Date) -> core::result::Result<(), doubleentry::Error> where A: core::convert::TryInto<doubleentry::AccountRef>, <A as core::convert::TryInto>::Error: core::convert::Into<doubleentry::error::ValueError>
 pub async fn doubleentry::Ledger<S, P>::set_limit<A>(&self, A, doubleentry::BalanceLimit, time::date::Date) -> core::result::Result<(), doubleentry::Error> where A: core::convert::TryInto<doubleentry::AccountRef>, <A as core::convert::TryInto>::Error: core::convert::Into<doubleentry::error::ValueError>
 pub async fn doubleentry::Ledger<S, P>::set_policy(&self, doubleentry::LedgerPolicy, time::date::Date) -> core::result::Result<(), doubleentry::Error>
 pub async fn doubleentry::Ledger<S, P>::statement<A>(&self, A, doubleentry::Currency, &doubleentry::BalanceQuery) -> core::result::Result<doubleentry::report::Statement<P>, doubleentry::Error> where A: core::convert::TryInto<doubleentry::AccountRef> + core::fmt::Display, <A as core::convert::TryInto>::Error: core::convert::Into<doubleentry::error::ValueError>
 pub async fn doubleentry::Ledger<S, P>::to_journal(&self) -> core::result::Result<doubleentry::Journal<P>, doubleentry::Error>
 pub async fn doubleentry::Ledger<S, P>::trial_balance(&self, &doubleentry::BalanceQuery) -> core::result::Result<doubleentry::report::TrialBalance<P>, doubleentry::Error>
+pub async fn doubleentry::Ledger<S, P>::watermark(&self) -> core::result::Result<core::option::Option<time::date::Date>, doubleentry::Error>
+pub async fn doubleentry::Ledger<S, P>::watermark_at(&self, doubleentry::TreeHead) -> core::result::Result<core::option::Option<time::date::Date>, doubleentry::Error>
 pub async fn doubleentry::Ledger<S, P>::with_precision(S, doubleentry::LedgerId) -> core::result::Result<Self, doubleentry::Error>
 pub fn doubleentry::Ledger<S, P>::with_salt_source(self, impl core::ops::function::Fn() -> doubleentry::MemoSalt + core::marker::Send + core::marker::Sync + 'static) -> Self
 impl<S: doubleentry::store::Store<P>, const P: u8> doubleentry::Ledger<S, P>
@@ -3428,12 +3515,12 @@ impl core::panic::unwind_safe::RefUnwindSafe for doubleentry::store::ChangeInput
 impl core::panic::unwind_safe::UnwindSafe for doubleentry::store::ChangeInput
 #[non_exhaustive] pub enum doubleentry::store::Done<const P: u8>
 pub doubleentry::store::Done::Account(doubleentry::AccountHandle)
-pub doubleentry::store::Done::Batch(alloc::vec::Vec<doubleentry::Recorded>)
+pub doubleentry::store::Done::Batch(alloc::vec::Vec<doubleentry::BatchReceipt>)
 pub doubleentry::store::Done::BatchRejected
 pub doubleentry::store::Done::BatchRejected::index: usize
 pub doubleentry::store::Done::BatchRejected::rejection: doubleentry::Rejection
 pub doubleentry::store::Done::Changed
-pub doubleentry::store::Done::Cleared(u64)
+pub doubleentry::store::Done::Cleared(doubleentry::Cleared)
 pub doubleentry::store::Done::Closing(alloc::vec::Vec<doubleentry::Entry<P>>)
 pub doubleentry::store::Done::Entry(doubleentry::Recorded)
 pub doubleentry::store::Done::Genesis
@@ -3647,6 +3734,30 @@ impl<const P: u8> core::marker::Unpin for doubleentry::store::IndexRow<P> where 
 impl<const P: u8> core::marker::UnsafeUnpin for doubleentry::store::IndexRow<P> where alloc::vec::Vec<(doubleentry::AccountHandle, doubleentry::Balance<P>)>: core::marker::UnsafeUnpin, doubleentry::Amount<P>: core::marker::UnsafeUnpin
 impl<const P: u8> core::panic::unwind_safe::RefUnwindSafe for doubleentry::store::IndexRow<P> where alloc::vec::Vec<(doubleentry::AccountHandle, doubleentry::Balance<P>)>: core::panic::unwind_safe::RefUnwindSafe, doubleentry::Amount<P>: core::panic::unwind_safe::RefUnwindSafe
 impl<const P: u8> core::panic::unwind_safe::UnwindSafe for doubleentry::store::IndexRow<P> where alloc::vec::Vec<(doubleentry::AccountHandle, doubleentry::Balance<P>)>: core::panic::unwind_safe::UnwindSafe, doubleentry::Amount<P>: core::panic::unwind_safe::UnwindSafe
+#[non_exhaustive] pub enum doubleentry::store::KindFilter
+pub doubleentry::store::KindFilter::Any
+pub doubleentry::store::KindFilter::OneOf(alloc::vec::Vec<doubleentry::Label>)
+pub doubleentry::store::KindFilter::Without
+impl doubleentry::store::KindFilter
+pub const doubleentry::store::KindFilter::MAX_KINDS: usize
+pub fn doubleentry::store::KindFilter::keeps(&self, core::option::Option<&doubleentry::Label>) -> bool
+impl core::clone::Clone for doubleentry::store::KindFilter
+pub fn doubleentry::store::KindFilter::clone(&self) -> Self
+impl core::cmp::Eq for doubleentry::store::KindFilter
+impl core::cmp::PartialEq for doubleentry::store::KindFilter
+pub fn doubleentry::store::KindFilter::eq(&self, &Self) -> bool
+impl core::default::Default for doubleentry::store::KindFilter
+pub fn doubleentry::store::KindFilter::default() -> Self
+impl core::fmt::Debug for doubleentry::store::KindFilter
+pub fn doubleentry::store::KindFilter::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for doubleentry::store::KindFilter
+impl core::marker::Freeze for doubleentry::store::KindFilter
+impl core::marker::Send for doubleentry::store::KindFilter
+impl core::marker::Sync for doubleentry::store::KindFilter
+impl core::marker::Unpin for doubleentry::store::KindFilter
+impl core::marker::UnsafeUnpin for doubleentry::store::KindFilter
+impl core::panic::unwind_safe::RefUnwindSafe for doubleentry::store::KindFilter
+impl core::panic::unwind_safe::UnwindSafe for doubleentry::store::KindFilter
 #[non_exhaustive] pub enum doubleentry::store::Memo
 pub doubleentry::store::Memo::Erased
 pub doubleentry::store::Memo::Kept
@@ -3669,7 +3780,7 @@ impl core::marker::UnsafeUnpin for doubleentry::store::Memo
 impl core::panic::unwind_safe::RefUnwindSafe for doubleentry::store::Memo
 impl core::panic::unwind_safe::UnwindSafe for doubleentry::store::Memo
 #[non_exhaustive] pub enum doubleentry::store::Op<const P: u8>
-pub doubleentry::store::Op::Batch(alloc::vec::Vec<doubleentry::Entry<P>>)
+pub doubleentry::store::Op::Batch(alloc::vec::Vec<doubleentry::BatchItem<P>>)
 pub doubleentry::store::Op::Change
 pub doubleentry::store::Op::Change::account: doubleentry::AccountRef
 pub doubleentry::store::Op::Change::actor: alloc::string::String
@@ -3710,6 +3821,7 @@ pub doubleentry::store::Op::ResetClearing::key: alloc::string::String
 pub doubleentry::store::Op::Seal
 pub doubleentry::store::Op::Seal::period: alloc::string::String
 impl<const P: u8> doubleentry::store::Op<P>
+pub const doubleentry::store::Op<P>::MAX_BATCH: usize
 pub fn doubleentry::store::Op<P>::max_rounds(&self) -> usize
 impl<const P: u8> core::clone::Clone for doubleentry::store::Op<P>
 pub fn doubleentry::store::Op<P>::clone(&self) -> Self
@@ -3719,13 +3831,13 @@ pub fn doubleentry::store::Op<P>::eq(&self, &Self) -> bool
 impl<const P: u8> core::fmt::Debug for doubleentry::store::Op<P>
 pub fn doubleentry::store::Op<P>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl<const P: u8> core::marker::StructuralPartialEq for doubleentry::store::Op<P>
-impl<const P: u8> core::marker::Freeze for doubleentry::store::Op<P> where alloc::boxed::Box<doubleentry::Entry<P>>: core::marker::Freeze, alloc::vec::Vec<doubleentry::Entry<P>>: core::marker::Freeze, doubleentry::Amount<P>: core::marker::Freeze
-impl<const P: u8> core::marker::Send for doubleentry::store::Op<P> where alloc::boxed::Box<doubleentry::Entry<P>>: core::marker::Send, alloc::vec::Vec<doubleentry::Entry<P>>: core::marker::Send, doubleentry::Amount<P>: core::marker::Send
-impl<const P: u8> core::marker::Sync for doubleentry::store::Op<P> where alloc::boxed::Box<doubleentry::Entry<P>>: core::marker::Sync, alloc::vec::Vec<doubleentry::Entry<P>>: core::marker::Sync, doubleentry::Amount<P>: core::marker::Sync
-impl<const P: u8> core::marker::Unpin for doubleentry::store::Op<P> where alloc::boxed::Box<doubleentry::Entry<P>>: core::marker::Unpin, alloc::vec::Vec<doubleentry::Entry<P>>: core::marker::Unpin, doubleentry::Amount<P>: core::marker::Unpin
-impl<const P: u8> core::marker::UnsafeUnpin for doubleentry::store::Op<P> where alloc::boxed::Box<doubleentry::Entry<P>>: core::marker::UnsafeUnpin, alloc::vec::Vec<doubleentry::Entry<P>>: core::marker::UnsafeUnpin, doubleentry::Amount<P>: core::marker::UnsafeUnpin
-impl<const P: u8> core::panic::unwind_safe::RefUnwindSafe for doubleentry::store::Op<P> where alloc::boxed::Box<doubleentry::Entry<P>>: core::panic::unwind_safe::RefUnwindSafe, alloc::vec::Vec<doubleentry::Entry<P>>: core::panic::unwind_safe::RefUnwindSafe, doubleentry::Amount<P>: core::panic::unwind_safe::RefUnwindSafe
-impl<const P: u8> core::panic::unwind_safe::UnwindSafe for doubleentry::store::Op<P> where alloc::boxed::Box<doubleentry::Entry<P>>: core::panic::unwind_safe::UnwindSafe, alloc::vec::Vec<doubleentry::Entry<P>>: core::panic::unwind_safe::UnwindSafe, doubleentry::Amount<P>: core::panic::unwind_safe::UnwindSafe
+impl<const P: u8> core::marker::Freeze for doubleentry::store::Op<P> where alloc::boxed::Box<doubleentry::Entry<P>>: core::marker::Freeze, alloc::vec::Vec<doubleentry::BatchItem<P>>: core::marker::Freeze, doubleentry::Amount<P>: core::marker::Freeze
+impl<const P: u8> core::marker::Send for doubleentry::store::Op<P> where alloc::boxed::Box<doubleentry::Entry<P>>: core::marker::Send, alloc::vec::Vec<doubleentry::BatchItem<P>>: core::marker::Send, doubleentry::Amount<P>: core::marker::Send
+impl<const P: u8> core::marker::Sync for doubleentry::store::Op<P> where alloc::boxed::Box<doubleentry::Entry<P>>: core::marker::Sync, alloc::vec::Vec<doubleentry::BatchItem<P>>: core::marker::Sync, doubleentry::Amount<P>: core::marker::Sync
+impl<const P: u8> core::marker::Unpin for doubleentry::store::Op<P> where alloc::boxed::Box<doubleentry::Entry<P>>: core::marker::Unpin, alloc::vec::Vec<doubleentry::BatchItem<P>>: core::marker::Unpin, doubleentry::Amount<P>: core::marker::Unpin
+impl<const P: u8> core::marker::UnsafeUnpin for doubleentry::store::Op<P> where alloc::boxed::Box<doubleentry::Entry<P>>: core::marker::UnsafeUnpin, alloc::vec::Vec<doubleentry::BatchItem<P>>: core::marker::UnsafeUnpin, doubleentry::Amount<P>: core::marker::UnsafeUnpin
+impl<const P: u8> core::panic::unwind_safe::RefUnwindSafe for doubleentry::store::Op<P> where alloc::boxed::Box<doubleentry::Entry<P>>: core::panic::unwind_safe::RefUnwindSafe, alloc::vec::Vec<doubleentry::BatchItem<P>>: core::panic::unwind_safe::RefUnwindSafe, doubleentry::Amount<P>: core::panic::unwind_safe::RefUnwindSafe
+impl<const P: u8> core::panic::unwind_safe::UnwindSafe for doubleentry::store::Op<P> where alloc::boxed::Box<doubleentry::Entry<P>>: core::panic::unwind_safe::UnwindSafe, alloc::vec::Vec<doubleentry::BatchItem<P>>: core::panic::unwind_safe::UnwindSafe, doubleentry::Amount<P>: core::panic::unwind_safe::UnwindSafe
 #[non_exhaustive] pub enum doubleentry::store::Outcome<const P: u8>
 pub doubleentry::store::Outcome::Append(alloc::boxed::Box<doubleentry::store::WriteSet<P>>)
 pub doubleentry::store::Outcome::Batch
@@ -3871,7 +3983,12 @@ impl core::panic::unwind_safe::RefUnwindSafe for doubleentry::store::Read
 impl core::panic::unwind_safe::UnwindSafe for doubleentry::store::Read
 #[non_exhaustive] pub enum doubleentry::store::StoreErrorKind
 pub doubleentry::store::StoreErrorKind::Backend
+pub doubleentry::store::StoreErrorKind::ForeignSchema
+pub doubleentry::store::StoreErrorKind::ForeignSchema::schema: alloc::string::String
+pub doubleentry::store::StoreErrorKind::ForeignSchema::tables: alloc::vec::Vec<alloc::string::String>
 pub doubleentry::store::StoreErrorKind::Integrity
+pub doubleentry::store::StoreErrorKind::InvalidRoleName
+pub doubleentry::store::StoreErrorKind::InvalidRoleName::name: alloc::string::String
 pub doubleentry::store::StoreErrorKind::InvalidSchemaName
 pub doubleentry::store::StoreErrorKind::InvalidSchemaName::name: alloc::string::String
 pub doubleentry::store::StoreErrorKind::LedgerMismatch
@@ -4403,6 +4520,8 @@ impl<const P: u8> core::marker::UnsafeUnpin for doubleentry::store::PeriodView<P
 impl<const P: u8> core::panic::unwind_safe::RefUnwindSafe for doubleentry::store::PeriodView<P> where core::option::Option<doubleentry::SealReceipt<P>>: core::panic::unwind_safe::RefUnwindSafe
 impl<const P: u8> core::panic::unwind_safe::UnwindSafe for doubleentry::store::PeriodView<P> where core::option::Option<doubleentry::SealReceipt<P>>: core::panic::unwind_safe::UnwindSafe
 pub struct doubleentry::store::Postgres
+impl doubleentry::store::Postgres
+pub fn doubleentry::store::Postgres::runtime_grants(&str, &str) -> core::result::Result<alloc::vec::Vec<alloc::string::String>, doubleentry::store::StoreError>
 impl core::clone::Clone for doubleentry::store::Postgres
 pub fn doubleentry::store::Postgres::clone(&self) -> Self
 impl core::fmt::Debug for doubleentry::store::Postgres
@@ -4447,6 +4566,7 @@ pub doubleentry::store::PostingLine::cleared: doubleentry::Amount<P>
 pub doubleentry::store::PostingLine::dimensions: doubleentry::Dimensions
 pub doubleentry::store::PostingLine::entry: doubleentry::EntryId
 pub doubleentry::store::PostingLine::index: u16
+pub doubleentry::store::PostingLine::kind: core::option::Option<doubleentry::Label>
 pub doubleentry::store::PostingLine::position: doubleentry::store::Position
 pub doubleentry::store::PostingLine::side: doubleentry::Side
 pub doubleentry::store::PostingLine::value: time::date::Date
@@ -4471,6 +4591,7 @@ pub struct doubleentry::store::PostingRead
 pub doubleentry::store::PostingRead::booking: core::option::Option<core::ops::range::RangeInclusive<time::date::Date>>
 pub doubleentry::store::PostingRead::dimensions: alloc::vec::Vec<(doubleentry::Label, doubleentry::Label)>
 pub doubleentry::store::PostingRead::key: doubleentry::store::BalanceKey
+pub doubleentry::store::PostingRead::kinds: doubleentry::store::KindFilter
 pub doubleentry::store::PostingRead::order: doubleentry::store::PostingOrder
 pub doubleentry::store::PostingRead::page: doubleentry::PageRead<doubleentry::store::PostingCursor>
 pub doubleentry::store::PostingRead::value: core::option::Option<core::ops::range::RangeInclusive<time::date::Date>>
@@ -4705,6 +4826,9 @@ pub struct doubleentry::store::SqlStore<D: doubleentry::store::Dialect, const P:
 impl<D: doubleentry::store::Dialect, const P: u8> doubleentry::store::SqlStore<D, P>
 pub async fn doubleentry::store::SqlStore<D, P>::close(&self)
 impl<const P: u8> doubleentry::store::SqlStore<doubleentry::store::Postgres, P>
+pub async fn doubleentry::store::SqlStore<doubleentry::store::Postgres, P>::grant_runtime(&self, &str) -> core::result::Result<(), doubleentry::store::StoreError>
+pub fn doubleentry::store::SqlStore<doubleentry::store::Postgres, P>::runtime_grants(&self, &str) -> core::result::Result<alloc::vec::Vec<alloc::string::String>, doubleentry::store::StoreError>
+impl<const P: u8> doubleentry::store::SqlStore<doubleentry::store::Postgres, P>
 pub async fn doubleentry::store::SqlStore<doubleentry::store::Postgres, P>::postgres(&str) -> core::result::Result<Self, doubleentry::store::StoreError>
 pub async fn doubleentry::store::SqlStore<doubleentry::store::Postgres, P>::postgres_with(&str, doubleentry::store::SqlOptions) -> core::result::Result<Self, doubleentry::store::StoreError>
 impl<const P: u8> doubleentry::store::SqlStore<doubleentry::store::Postgres, P>
@@ -4758,6 +4882,7 @@ impl core::panic::unwind_safe::UnwindSafe for doubleentry::store::Sqlite
 pub struct doubleentry::store::StoreError
 impl doubleentry::store::StoreError
 pub fn doubleentry::store::StoreError::backend(&'static str, impl core::error::Error + core::marker::Send + core::marker::Sync + 'static) -> Self
+pub fn doubleentry::store::StoreError::foreign_schema(&'static str, alloc::string::String, alloc::vec::Vec<alloc::string::String>) -> Self
 pub fn doubleentry::store::StoreError::integrity(&'static str, &'static str, core::option::Option<u64>) -> Self
 pub const fn doubleentry::store::StoreError::is_transient(&self) -> bool
 pub const fn doubleentry::store::StoreError::kind(&self) -> &doubleentry::store::StoreErrorKind
@@ -6267,6 +6392,62 @@ impl core::marker::Unpin for doubleentry::BalanceLimit
 impl core::marker::UnsafeUnpin for doubleentry::BalanceLimit
 impl core::panic::unwind_safe::RefUnwindSafe for doubleentry::BalanceLimit
 impl core::panic::unwind_safe::UnwindSafe for doubleentry::BalanceLimit
+#[non_exhaustive] pub enum doubleentry::BatchItem<const P: u8>
+pub doubleentry::BatchItem::Clear(doubleentry::Clearing<P>)
+pub doubleentry::BatchItem::Record(doubleentry::Entry<P>)
+pub doubleentry::BatchItem::Reset
+pub doubleentry::BatchItem::Reset::clearing: u64
+pub doubleentry::BatchItem::Reset::key: alloc::string::String
+pub doubleentry::BatchItem::Reset::on: time::date::Date
+impl<const P: u8> doubleentry::BatchItem<P>
+pub fn doubleentry::BatchItem<P>::reset(impl core::convert::Into<alloc::string::String>, u64, time::date::Date) -> Self
+impl<const P: u8> core::clone::Clone for doubleentry::BatchItem<P>
+pub fn doubleentry::BatchItem<P>::clone(&self) -> Self
+impl<const P: u8> core::cmp::Eq for doubleentry::BatchItem<P>
+impl<const P: u8> core::cmp::PartialEq for doubleentry::BatchItem<P>
+pub fn doubleentry::BatchItem<P>::eq(&self, &Self) -> bool
+impl<const P: u8> core::convert::From<doubleentry::Clearing<P>> for doubleentry::BatchItem<P>
+pub fn doubleentry::BatchItem<P>::from(doubleentry::Clearing<P>) -> Self
+impl<const P: u8> core::convert::From<doubleentry::Entry<P>> for doubleentry::BatchItem<P>
+pub fn doubleentry::BatchItem<P>::from(doubleentry::Entry<P>) -> Self
+impl<const P: u8> core::fmt::Debug for doubleentry::BatchItem<P>
+pub fn doubleentry::BatchItem<P>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl<const P: u8> core::marker::StructuralPartialEq for doubleentry::BatchItem<P>
+impl<const P: u8> core::marker::Freeze for doubleentry::BatchItem<P> where doubleentry::Entry<P>: core::marker::Freeze, doubleentry::Clearing<P>: core::marker::Freeze
+impl<const P: u8> core::marker::Send for doubleentry::BatchItem<P> where doubleentry::Entry<P>: core::marker::Send, doubleentry::Clearing<P>: core::marker::Send
+impl<const P: u8> core::marker::Sync for doubleentry::BatchItem<P> where doubleentry::Entry<P>: core::marker::Sync, doubleentry::Clearing<P>: core::marker::Sync
+impl<const P: u8> core::marker::Unpin for doubleentry::BatchItem<P> where doubleentry::Entry<P>: core::marker::Unpin, doubleentry::Clearing<P>: core::marker::Unpin
+impl<const P: u8> core::marker::UnsafeUnpin for doubleentry::BatchItem<P> where doubleentry::Entry<P>: core::marker::UnsafeUnpin, doubleentry::Clearing<P>: core::marker::UnsafeUnpin
+impl<const P: u8> core::panic::unwind_safe::RefUnwindSafe for doubleentry::BatchItem<P> where doubleentry::Entry<P>: core::panic::unwind_safe::RefUnwindSafe, doubleentry::Clearing<P>: core::panic::unwind_safe::RefUnwindSafe
+impl<const P: u8> core::panic::unwind_safe::UnwindSafe for doubleentry::BatchItem<P> where doubleentry::Entry<P>: core::panic::unwind_safe::UnwindSafe, doubleentry::Clearing<P>: core::panic::unwind_safe::UnwindSafe
+#[non_exhaustive] pub enum doubleentry::BatchReceipt
+pub doubleentry::BatchReceipt::Cleared(doubleentry::Cleared)
+pub doubleentry::BatchReceipt::Recorded(doubleentry::Recorded)
+impl doubleentry::BatchReceipt
+pub const fn doubleentry::BatchReceipt::as_cleared(&self) -> core::option::Option<&doubleentry::Cleared>
+pub const fn doubleentry::BatchReceipt::as_recorded(&self) -> core::option::Option<&doubleentry::Recorded>
+pub const fn doubleentry::BatchReceipt::position(&self) -> u64
+pub const fn doubleentry::BatchReceipt::replayed(&self) -> bool
+impl core::clone::Clone for doubleentry::BatchReceipt
+pub fn doubleentry::BatchReceipt::clone(&self) -> Self
+impl core::cmp::Eq for doubleentry::BatchReceipt
+impl core::cmp::PartialEq for doubleentry::BatchReceipt
+pub fn doubleentry::BatchReceipt::eq(&self, &Self) -> bool
+impl core::fmt::Debug for doubleentry::BatchReceipt
+pub fn doubleentry::BatchReceipt::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for doubleentry::BatchReceipt
+pub fn doubleentry::BatchReceipt::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::hash::Hash for doubleentry::BatchReceipt
+pub fn doubleentry::BatchReceipt::hash<__H: core::hash::Hasher>(&self, &mut __H)
+impl core::marker::Copy for doubleentry::BatchReceipt
+impl core::marker::StructuralPartialEq for doubleentry::BatchReceipt
+impl core::marker::Freeze for doubleentry::BatchReceipt
+impl core::marker::Send for doubleentry::BatchReceipt
+impl core::marker::Sync for doubleentry::BatchReceipt
+impl core::marker::Unpin for doubleentry::BatchReceipt
+impl core::marker::UnsafeUnpin for doubleentry::BatchReceipt
+impl core::panic::unwind_safe::RefUnwindSafe for doubleentry::BatchReceipt
+impl core::panic::unwind_safe::UnwindSafe for doubleentry::BatchReceipt
 #[non_exhaustive] pub enum doubleentry::Error
 pub doubleentry::Error::Amount(doubleentry::error::AmountError)
 pub doubleentry::Error::Backend(doubleentry::error::BackendError)
@@ -6435,6 +6616,9 @@ pub doubleentry::Rejection::BalanceOverflow
 pub doubleentry::Rejection::BalanceOverflow::account: core::option::Option<doubleentry::AccountPath>
 pub doubleentry::Rejection::BalanceOverflow::currency: doubleentry::Currency
 pub doubleentry::Rejection::BalanceOverflow::layer: doubleentry::Layer
+pub doubleentry::Rejection::BatchTooLarge
+pub doubleentry::Rejection::BatchTooLarge::items: usize
+pub doubleentry::Rejection::BatchTooLarge::max: usize
 pub doubleentry::Rejection::ClassFrozen
 pub doubleentry::Rejection::ClassFrozen::account: doubleentry::AccountPath
 pub doubleentry::Rejection::ClearingAlreadyReset
@@ -7011,11 +7195,13 @@ pub fn doubleentry::BalanceQuery::by_value_date(self) -> Self
 pub const fn doubleentry::BalanceQuery::layer(&self) -> doubleentry::Layer
 pub fn doubleentry::BalanceQuery::matching(self, impl core::convert::AsRef<str>, impl core::convert::AsRef<str>) -> Self
 pub fn doubleentry::BalanceQuery::missing(self, impl core::convert::AsRef<str>) -> Self
+pub fn doubleentry::BalanceQuery::of_kind(self, impl core::convert::AsRef<str>) -> Self
 pub fn doubleentry::BalanceQuery::pending(self) -> Self
 pub fn doubleentry::BalanceQuery::period(impl core::convert::AsRef<str>) -> Self
 pub fn doubleentry::BalanceQuery::pinned(self, doubleentry::TreeHead) -> Self
 pub fn doubleentry::BalanceQuery::through(time::date::Date) -> Self
 pub fn doubleentry::BalanceQuery::through_position(u64) -> Self
+pub fn doubleentry::BalanceQuery::without_kind(self) -> Self
 impl core::clone::Clone for doubleentry::BalanceQuery
 pub fn doubleentry::BalanceQuery::clone(&self) -> Self
 impl core::cmp::Eq for doubleentry::BalanceQuery
@@ -7068,6 +7254,54 @@ impl core::marker::Unpin for doubleentry::CaptureTime
 impl core::marker::UnsafeUnpin for doubleentry::CaptureTime
 impl core::panic::unwind_safe::RefUnwindSafe for doubleentry::CaptureTime
 impl core::panic::unwind_safe::UnwindSafe for doubleentry::CaptureTime
+#[non_exhaustive] pub struct doubleentry::Cleared
+pub doubleentry::Cleared::position: u64
+pub doubleentry::Cleared::replayed: bool
+impl core::clone::Clone for doubleentry::Cleared
+pub fn doubleentry::Cleared::clone(&self) -> Self
+impl core::cmp::Eq for doubleentry::Cleared
+impl core::cmp::PartialEq for doubleentry::Cleared
+pub fn doubleentry::Cleared::eq(&self, &Self) -> bool
+impl core::fmt::Debug for doubleentry::Cleared
+pub fn doubleentry::Cleared::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for doubleentry::Cleared
+pub fn doubleentry::Cleared::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::hash::Hash for doubleentry::Cleared
+pub fn doubleentry::Cleared::hash<__H: core::hash::Hasher>(&self, &mut __H)
+impl core::marker::Copy for doubleentry::Cleared
+impl core::marker::StructuralPartialEq for doubleentry::Cleared
+impl core::marker::Freeze for doubleentry::Cleared
+impl core::marker::Send for doubleentry::Cleared
+impl core::marker::Sync for doubleentry::Cleared
+impl core::marker::Unpin for doubleentry::Cleared
+impl core::marker::UnsafeUnpin for doubleentry::Cleared
+impl core::panic::unwind_safe::RefUnwindSafe for doubleentry::Cleared
+impl core::panic::unwind_safe::UnwindSafe for doubleentry::Cleared
+#[non_exhaustive] pub struct doubleentry::Clearing<const P: u8>
+pub doubleentry::Clearing::amount: doubleentry::Amount<P>
+pub doubleentry::Clearing::credit: doubleentry::PostingRef
+pub doubleentry::Clearing::debit: doubleentry::PostingRef
+pub doubleentry::Clearing::key: alloc::string::String
+pub doubleentry::Clearing::on: time::date::Date
+impl<const P: u8> doubleentry::Clearing<P>
+pub fn doubleentry::Clearing<P>::new(impl core::convert::Into<alloc::string::String>, doubleentry::PostingRef, doubleentry::PostingRef, doubleentry::Amount<P>, time::date::Date) -> Self
+impl<const P: u8> core::clone::Clone for doubleentry::Clearing<P>
+pub fn doubleentry::Clearing<P>::clone(&self) -> Self
+impl<const P: u8> core::cmp::Eq for doubleentry::Clearing<P>
+impl<const P: u8> core::cmp::PartialEq for doubleentry::Clearing<P>
+pub fn doubleentry::Clearing<P>::eq(&self, &Self) -> bool
+impl<const P: u8> core::convert::From<doubleentry::Clearing<P>> for doubleentry::BatchItem<P>
+pub fn doubleentry::BatchItem<P>::from(doubleentry::Clearing<P>) -> Self
+impl<const P: u8> core::fmt::Debug for doubleentry::Clearing<P>
+pub fn doubleentry::Clearing<P>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl<const P: u8> core::marker::StructuralPartialEq for doubleentry::Clearing<P>
+impl<const P: u8> core::marker::Freeze for doubleentry::Clearing<P> where doubleentry::Amount<P>: core::marker::Freeze
+impl<const P: u8> core::marker::Send for doubleentry::Clearing<P> where doubleentry::Amount<P>: core::marker::Send
+impl<const P: u8> core::marker::Sync for doubleentry::Clearing<P> where doubleentry::Amount<P>: core::marker::Sync
+impl<const P: u8> core::marker::Unpin for doubleentry::Clearing<P> where doubleentry::Amount<P>: core::marker::Unpin
+impl<const P: u8> core::marker::UnsafeUnpin for doubleentry::Clearing<P> where doubleentry::Amount<P>: core::marker::UnsafeUnpin
+impl<const P: u8> core::panic::unwind_safe::RefUnwindSafe for doubleentry::Clearing<P> where doubleentry::Amount<P>: core::panic::unwind_safe::RefUnwindSafe
+impl<const P: u8> core::panic::unwind_safe::UnwindSafe for doubleentry::Clearing<P> where doubleentry::Amount<P>: core::panic::unwind_safe::UnwindSafe
 pub struct doubleentry::Currency
 impl doubleentry::Currency
 pub fn doubleentry::Currency::as_str(&self) -> &str
@@ -7219,6 +7453,8 @@ pub fn doubleentry::Entry<P>::clone(&self) -> Self
 impl<const P: u8> core::cmp::Eq for doubleentry::Entry<P>
 impl<const P: u8> core::cmp::PartialEq for doubleentry::Entry<P>
 pub fn doubleentry::Entry<P>::eq(&self, &Self) -> bool
+impl<const P: u8> core::convert::From<doubleentry::Entry<P>> for doubleentry::BatchItem<P>
+pub fn doubleentry::BatchItem<P>::from(doubleentry::Entry<P>) -> Self
 impl<const P: u8> core::fmt::Debug for doubleentry::Entry<P>
 pub fn doubleentry::Entry<P>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl<const P: u8> core::hash::Hash for doubleentry::Entry<P>
@@ -7374,14 +7610,17 @@ pub struct doubleentry::Journal<const P: u8>
 impl doubleentry::Journal<2>
 pub fn doubleentry::Journal<2>::new(doubleentry::LedgerId) -> Self
 impl<const P: u8> doubleentry::Journal<P>
+pub const doubleentry::Journal<P>::MAX_BATCH: usize
 pub fn doubleentry::Journal<P>::account<A>(&self, A) -> core::option::Option<doubleentry::Account> where A: core::convert::TryInto<doubleentry::AccountRef>, <A as core::convert::TryInto>::Error: core::convert::Into<doubleentry::error::ValueError>
 pub fn doubleentry::Journal<P>::actor(&self) -> &str
 pub fn doubleentry::Journal<P>::as_actor(self, impl core::convert::AsRef<str>) -> Self
 pub fn doubleentry::Journal<P>::audit(&self) -> core::result::Result<doubleentry::AuditReport, doubleentry::Error>
 pub fn doubleentry::Journal<P>::balance<A>(&self, A, doubleentry::Currency, &doubleentry::BalanceQuery) -> core::result::Result<doubleentry::Balance<P>, doubleentry::Error> where A: core::convert::TryInto<doubleentry::AccountRef> + core::fmt::Display, <A as core::convert::TryInto>::Error: core::convert::Into<doubleentry::error::ValueError>
+pub fn doubleentry::Journal<P>::batch(&mut self, impl core::iter::traits::collect::IntoIterator<Item = doubleentry::BatchItem<P>>) -> core::result::Result<alloc::vec::Vec<doubleentry::BatchReceipt>, doubleentry::Error>
 pub fn doubleentry::Journal<P>::check_assertion(&self, &doubleentry::report::BalanceAssertion<P>) -> core::result::Result<doubleentry::report::AssertionOutcome<P>, doubleentry::Error>
 pub fn doubleentry::Journal<P>::check_assertions(&self, &[doubleentry::report::BalanceAssertion<P>]) -> core::result::Result<alloc::vec::Vec<doubleentry::report::AssertionOutcome<P>>, doubleentry::Error>
-pub fn doubleentry::Journal<P>::clear(&mut self, &str, doubleentry::PostingRef, doubleentry::PostingRef, doubleentry::Amount<P>, time::date::Date) -> core::result::Result<u64, doubleentry::Error>
+pub fn doubleentry::Journal<P>::clear(&mut self, &str, doubleentry::PostingRef, doubleentry::PostingRef, doubleentry::Amount<P>, time::date::Date) -> core::result::Result<doubleentry::Cleared, doubleentry::Error>
+pub fn doubleentry::Journal<P>::clear_batch(&mut self, impl core::iter::traits::collect::IntoIterator<Item = doubleentry::Clearing<P>>) -> core::result::Result<alloc::vec::Vec<doubleentry::Cleared>, doubleentry::Error>
 pub fn doubleentry::Journal<P>::close_account<A>(&mut self, A, time::date::Date) -> core::result::Result<(), doubleentry::Error> where A: core::convert::TryInto<doubleentry::AccountRef>, <A as core::convert::TryInto>::Error: core::convert::Into<doubleentry::error::ValueError>
 pub fn doubleentry::Journal<P>::close_year<A>(&self, &str, time::date::Date, A) -> core::result::Result<alloc::vec::Vec<doubleentry::Entry<P>>, doubleentry::Error> where A: core::convert::TryInto<doubleentry::AccountRef>, <A as core::convert::TryInto>::Error: core::convert::Into<doubleentry::error::ValueError>
 pub fn doubleentry::Journal<P>::declare_currency(&mut self, doubleentry::Currency, u8, time::date::Date) -> core::result::Result<(), doubleentry::Error>
@@ -7389,6 +7628,7 @@ pub fn doubleentry::Journal<P>::define_months(&mut self, i32, core::ops::range::
 pub fn doubleentry::Journal<P>::define_period(&mut self, impl core::convert::AsRef<str>, time::date::Date, time::date::Date) -> core::result::Result<(), doubleentry::Error>
 pub fn doubleentry::Journal<P>::entry(&self, doubleentry::EntryId) -> core::option::Option<doubleentry::EntryRecord<P>>
 pub fn doubleentry::Journal<P>::entry_by_key(&self, impl core::convert::AsRef<str>) -> core::option::Option<doubleentry::EntryRecord<P>>
+pub fn doubleentry::Journal<P>::entry_id(&self, &str) -> core::result::Result<doubleentry::EntryId, doubleentry::Error>
 pub fn doubleentry::Journal<P>::erase_memo(&mut self, doubleentry::EntryId) -> core::result::Result<(), doubleentry::Error>
 pub fn doubleentry::Journal<P>::exponent(&self, doubleentry::Currency) -> core::option::Option<u8>
 pub fn doubleentry::Journal<P>::export(&self, doubleentry::export::ExportScope, core::option::Option<doubleentry::TreeHead>) -> core::result::Result<doubleentry::export::Export<'_, P>, doubleentry::Error>
@@ -7402,6 +7642,8 @@ pub fn doubleentry::Journal<P>::leaves(&self) -> impl core::iter::traits::iterat
 pub fn doubleentry::Journal<P>::memo(&self, doubleentry::EntryId) -> core::option::Option<alloc::string::String>
 pub fn doubleentry::Journal<P>::open(&mut self, impl core::convert::AsRef<str>, doubleentry::AccountKind, time::date::Date) -> core::result::Result<doubleentry::AccountHandle, doubleentry::Error>
 pub fn doubleentry::Journal<P>::open_items<A>(&self, A, doubleentry::Currency, &doubleentry::BalanceQuery) -> core::result::Result<alloc::vec::Vec<doubleentry::report::OpenItem<P>>, doubleentry::Error> where A: core::convert::TryInto<doubleentry::AccountRef> + core::fmt::Display, <A as core::convert::TryInto>::Error: core::convert::Into<doubleentry::error::ValueError>
+pub fn doubleentry::Journal<P>::periods(&self) -> core::result::Result<alloc::vec::Vec<doubleentry::Period<P>>, doubleentry::Error>
+pub fn doubleentry::Journal<P>::periods_at(&self, doubleentry::TreeHead) -> core::result::Result<alloc::vec::Vec<doubleentry::Period<P>>, doubleentry::Error>
 pub fn doubleentry::Journal<P>::prove_consistency(&self, u64, u64) -> core::result::Result<doubleentry::log::ConsistencyProof, doubleentry::Error>
 pub fn doubleentry::Journal<P>::prove_entry(&self, doubleentry::EntryId) -> core::result::Result<doubleentry::log::InclusionProof, doubleentry::Error>
 pub fn doubleentry::Journal<P>::prove_entry_at(&self, doubleentry::EntryId, u64) -> core::result::Result<doubleentry::log::InclusionProof, doubleentry::Error>
@@ -7409,16 +7651,20 @@ pub fn doubleentry::Journal<P>::record(&mut self, doubleentry::Entry<P>) -> core
 pub fn doubleentry::Journal<P>::record_batch(&mut self, impl core::iter::traits::collect::IntoIterator<Item = doubleentry::Entry<P>>) -> core::result::Result<alloc::vec::Vec<doubleentry::Recorded>, doubleentry::Error>
 pub fn doubleentry::Journal<P>::register(&mut self, doubleentry::AccountSpec) -> core::result::Result<doubleentry::AccountHandle, doubleentry::Error>
 pub fn doubleentry::Journal<P>::reopen_account<A>(&mut self, A, time::date::Date) -> core::result::Result<(), doubleentry::Error> where A: core::convert::TryInto<doubleentry::AccountRef>, <A as core::convert::TryInto>::Error: core::convert::Into<doubleentry::error::ValueError>
-pub fn doubleentry::Journal<P>::reset_clearing(&mut self, &str, u64, time::date::Date) -> core::result::Result<u64, doubleentry::Error>
+pub fn doubleentry::Journal<P>::reset_clearing(&mut self, &str, u64, time::date::Date) -> core::result::Result<doubleentry::Cleared, doubleentry::Error>
 pub fn doubleentry::Journal<P>::reversal(&self, doubleentry::EntryId, &str, time::date::Date) -> core::result::Result<doubleentry::Entry<P>, doubleentry::Error>
 pub fn doubleentry::Journal<P>::rollup(&self, doubleentry::Currency, &doubleentry::BalanceQuery) -> core::result::Result<doubleentry::report::Rollup<P>, doubleentry::Error>
 pub fn doubleentry::Journal<P>::seal_period(&mut self, impl core::convert::AsRef<str>) -> core::result::Result<doubleentry::SealReceipt<P>, doubleentry::Error>
 pub fn doubleentry::Journal<P>::seal_through(&mut self, impl core::convert::AsRef<str>) -> core::result::Result<alloc::vec::Vec<doubleentry::SealReceipt<P>>, doubleentry::Error>
+pub fn doubleentry::Journal<P>::seals(&self) -> core::result::Result<alloc::vec::Vec<doubleentry::SealReceipt<P>>, doubleentry::Error>
+pub fn doubleentry::Journal<P>::seals_at(&self, doubleentry::TreeHead) -> core::result::Result<alloc::vec::Vec<doubleentry::SealReceipt<P>>, doubleentry::Error>
 pub fn doubleentry::Journal<P>::set_class<A>(&mut self, A, core::option::Option<&str>, time::date::Date) -> core::result::Result<(), doubleentry::Error> where A: core::convert::TryInto<doubleentry::AccountRef>, <A as core::convert::TryInto>::Error: core::convert::Into<doubleentry::error::ValueError>
 pub fn doubleentry::Journal<P>::set_limit<A>(&mut self, A, doubleentry::BalanceLimit, time::date::Date) -> core::result::Result<(), doubleentry::Error> where A: core::convert::TryInto<doubleentry::AccountRef>, <A as core::convert::TryInto>::Error: core::convert::Into<doubleentry::error::ValueError>
 pub fn doubleentry::Journal<P>::set_policy(&mut self, doubleentry::LedgerPolicy, time::date::Date) -> core::result::Result<(), doubleentry::Error>
 pub fn doubleentry::Journal<P>::statement<A>(&self, A, doubleentry::Currency, &doubleentry::BalanceQuery) -> core::result::Result<doubleentry::report::Statement<P>, doubleentry::Error> where A: core::convert::TryInto<doubleentry::AccountRef> + core::fmt::Display, <A as core::convert::TryInto>::Error: core::convert::Into<doubleentry::error::ValueError>
 pub fn doubleentry::Journal<P>::trial_balance(&self, &doubleentry::BalanceQuery) -> core::result::Result<doubleentry::report::TrialBalance<P>, doubleentry::Error>
+pub fn doubleentry::Journal<P>::watermark(&self) -> core::result::Result<core::option::Option<time::date::Date>, doubleentry::Error>
+pub fn doubleentry::Journal<P>::watermark_at(&self, doubleentry::TreeHead) -> core::result::Result<core::option::Option<time::date::Date>, doubleentry::Error>
 pub fn doubleentry::Journal<P>::with_precision(doubleentry::LedgerId) -> Self
 pub fn doubleentry::Journal<P>::with_salt_source(self, impl core::ops::function::Fn() -> doubleentry::MemoSalt + core::marker::Send + core::marker::Sync + 'static) -> Self
 impl<const P: u8> doubleentry::Journal<P>
@@ -7487,14 +7733,17 @@ pub struct doubleentry::Ledger<S, const P: u8>
 impl<S: doubleentry::store::Store<2>> doubleentry::Ledger<S, 2>
 pub async fn doubleentry::Ledger<S, 2>::new(S, doubleentry::LedgerId) -> core::result::Result<Self, doubleentry::Error>
 impl<S: doubleentry::store::Store<P>, const P: u8> doubleentry::Ledger<S, P>
+pub const doubleentry::Ledger<S, P>::MAX_BATCH: usize
 pub async fn doubleentry::Ledger<S, P>::account<A>(&self, A) -> core::result::Result<core::option::Option<doubleentry::Account>, doubleentry::Error> where A: core::convert::TryInto<doubleentry::AccountRef>, <A as core::convert::TryInto>::Error: core::convert::Into<doubleentry::error::ValueError>
 pub fn doubleentry::Ledger<S, P>::actor(&self) -> &str
 pub fn doubleentry::Ledger<S, P>::as_actor(self, impl core::convert::AsRef<str>) -> Self
 pub async fn doubleentry::Ledger<S, P>::audit(&self) -> core::result::Result<doubleentry::AuditReport, doubleentry::Error>
 pub async fn doubleentry::Ledger<S, P>::balance<A>(&self, A, doubleentry::Currency, &doubleentry::BalanceQuery) -> core::result::Result<doubleentry::Balance<P>, doubleentry::Error> where A: core::convert::TryInto<doubleentry::AccountRef> + core::fmt::Display, <A as core::convert::TryInto>::Error: core::convert::Into<doubleentry::error::ValueError>
+pub async fn doubleentry::Ledger<S, P>::batch(&self, impl core::iter::traits::collect::IntoIterator<Item = doubleentry::BatchItem<P>>) -> core::result::Result<alloc::vec::Vec<doubleentry::BatchReceipt>, doubleentry::Error>
 pub async fn doubleentry::Ledger<S, P>::check_assertion(&self, &doubleentry::report::BalanceAssertion<P>) -> core::result::Result<doubleentry::report::AssertionOutcome<P>, doubleentry::Error>
 pub async fn doubleentry::Ledger<S, P>::check_assertions(&self, &[doubleentry::report::BalanceAssertion<P>]) -> core::result::Result<alloc::vec::Vec<doubleentry::report::AssertionOutcome<P>>, doubleentry::Error>
-pub async fn doubleentry::Ledger<S, P>::clear(&self, &str, doubleentry::PostingRef, doubleentry::PostingRef, doubleentry::Amount<P>, time::date::Date) -> core::result::Result<u64, doubleentry::Error>
+pub async fn doubleentry::Ledger<S, P>::clear(&self, &str, doubleentry::PostingRef, doubleentry::PostingRef, doubleentry::Amount<P>, time::date::Date) -> core::result::Result<doubleentry::Cleared, doubleentry::Error>
+pub async fn doubleentry::Ledger<S, P>::clear_batch(&self, impl core::iter::traits::collect::IntoIterator<Item = doubleentry::Clearing<P>>) -> core::result::Result<alloc::vec::Vec<doubleentry::Cleared>, doubleentry::Error>
 pub async fn doubleentry::Ledger<S, P>::close_account<A>(&self, A, time::date::Date) -> core::result::Result<(), doubleentry::Error> where A: core::convert::TryInto<doubleentry::AccountRef>, <A as core::convert::TryInto>::Error: core::convert::Into<doubleentry::error::ValueError>
 pub async fn doubleentry::Ledger<S, P>::close_year<A>(&self, &str, time::date::Date, A) -> core::result::Result<alloc::vec::Vec<doubleentry::Entry<P>>, doubleentry::Error> where A: core::convert::TryInto<doubleentry::AccountRef>, <A as core::convert::TryInto>::Error: core::convert::Into<doubleentry::error::ValueError>
 pub async fn doubleentry::Ledger<S, P>::declare_currency(&self, doubleentry::Currency, u8, time::date::Date) -> core::result::Result<(), doubleentry::Error>
@@ -7502,6 +7751,7 @@ pub async fn doubleentry::Ledger<S, P>::define_months(&self, i32, core::ops::ran
 pub async fn doubleentry::Ledger<S, P>::define_period(&self, impl core::convert::AsRef<str>, time::date::Date, time::date::Date) -> core::result::Result<(), doubleentry::Error>
 pub async fn doubleentry::Ledger<S, P>::entry(&self, doubleentry::EntryId) -> core::result::Result<core::option::Option<doubleentry::EntryRecord<P>>, doubleentry::Error>
 pub async fn doubleentry::Ledger<S, P>::entry_by_key(&self, impl core::convert::AsRef<str>) -> core::result::Result<core::option::Option<doubleentry::EntryRecord<P>>, doubleentry::Error>
+pub fn doubleentry::Ledger<S, P>::entry_id(&self, &str) -> core::result::Result<doubleentry::EntryId, doubleentry::Error>
 pub async fn doubleentry::Ledger<S, P>::erase_memo(&self, doubleentry::EntryId) -> core::result::Result<(), doubleentry::Error>
 pub async fn doubleentry::Ledger<S, P>::exponent(&self, doubleentry::Currency) -> core::result::Result<core::option::Option<u8>, doubleentry::Error>
 pub async fn doubleentry::Ledger<S, P>::export(&self, doubleentry::export::ExportScope, core::option::Option<doubleentry::TreeHead>) -> core::result::Result<doubleentry::export::ExportPages<'_, S, P>, doubleentry::Error>
@@ -7513,6 +7763,8 @@ pub const fn doubleentry::Ledger<S, P>::id(&self) -> &doubleentry::LedgerId
 pub async fn doubleentry::Ledger<S, P>::memo(&self, doubleentry::EntryId) -> core::result::Result<core::option::Option<alloc::string::String>, doubleentry::Error>
 pub async fn doubleentry::Ledger<S, P>::open(&self, impl core::convert::AsRef<str>, doubleentry::AccountKind, time::date::Date) -> core::result::Result<doubleentry::AccountHandle, doubleentry::Error>
 pub async fn doubleentry::Ledger<S, P>::open_items<A>(&self, A, doubleentry::Currency, &doubleentry::BalanceQuery) -> core::result::Result<alloc::vec::Vec<doubleentry::report::OpenItem<P>>, doubleentry::Error> where A: core::convert::TryInto<doubleentry::AccountRef> + core::fmt::Display, <A as core::convert::TryInto>::Error: core::convert::Into<doubleentry::error::ValueError>
+pub async fn doubleentry::Ledger<S, P>::periods(&self) -> core::result::Result<alloc::vec::Vec<doubleentry::Period<P>>, doubleentry::Error>
+pub async fn doubleentry::Ledger<S, P>::periods_at(&self, doubleentry::TreeHead) -> core::result::Result<alloc::vec::Vec<doubleentry::Period<P>>, doubleentry::Error>
 pub async fn doubleentry::Ledger<S, P>::prove_consistency(&self, u64, u64) -> core::result::Result<doubleentry::log::ConsistencyProof, doubleentry::Error>
 pub async fn doubleentry::Ledger<S, P>::prove_entry(&self, doubleentry::EntryId) -> core::result::Result<doubleentry::log::InclusionProof, doubleentry::Error>
 pub async fn doubleentry::Ledger<S, P>::prove_entry_at(&self, doubleentry::EntryId, u64) -> core::result::Result<doubleentry::log::InclusionProof, doubleentry::Error>
@@ -7520,17 +7772,21 @@ pub async fn doubleentry::Ledger<S, P>::record(&self, doubleentry::Entry<P>) -> 
 pub async fn doubleentry::Ledger<S, P>::record_batch(&self, impl core::iter::traits::collect::IntoIterator<Item = doubleentry::Entry<P>>) -> core::result::Result<alloc::vec::Vec<doubleentry::Recorded>, doubleentry::Error>
 pub async fn doubleentry::Ledger<S, P>::register(&self, doubleentry::AccountSpec) -> core::result::Result<doubleentry::AccountHandle, doubleentry::Error>
 pub async fn doubleentry::Ledger<S, P>::reopen_account<A>(&self, A, time::date::Date) -> core::result::Result<(), doubleentry::Error> where A: core::convert::TryInto<doubleentry::AccountRef>, <A as core::convert::TryInto>::Error: core::convert::Into<doubleentry::error::ValueError>
-pub async fn doubleentry::Ledger<S, P>::reset_clearing(&self, &str, u64, time::date::Date) -> core::result::Result<u64, doubleentry::Error>
+pub async fn doubleentry::Ledger<S, P>::reset_clearing(&self, &str, u64, time::date::Date) -> core::result::Result<doubleentry::Cleared, doubleentry::Error>
 pub async fn doubleentry::Ledger<S, P>::reversal(&self, doubleentry::EntryId, &str, time::date::Date) -> core::result::Result<doubleentry::Entry<P>, doubleentry::Error>
 pub async fn doubleentry::Ledger<S, P>::rollup(&self, doubleentry::Currency, &doubleentry::BalanceQuery) -> core::result::Result<doubleentry::report::Rollup<P>, doubleentry::Error>
 pub async fn doubleentry::Ledger<S, P>::seal_period(&self, impl core::convert::AsRef<str>) -> core::result::Result<doubleentry::SealReceipt<P>, doubleentry::Error>
 pub async fn doubleentry::Ledger<S, P>::seal_through(&self, impl core::convert::AsRef<str>) -> core::result::Result<alloc::vec::Vec<doubleentry::SealReceipt<P>>, doubleentry::Error>
+pub async fn doubleentry::Ledger<S, P>::seals(&self) -> core::result::Result<alloc::vec::Vec<doubleentry::SealReceipt<P>>, doubleentry::Error>
+pub async fn doubleentry::Ledger<S, P>::seals_at(&self, doubleentry::TreeHead) -> core::result::Result<alloc::vec::Vec<doubleentry::SealReceipt<P>>, doubleentry::Error>
 pub async fn doubleentry::Ledger<S, P>::set_class<A>(&self, A, core::option::Option<&str>, time::date::Date) -> core::result::Result<(), doubleentry::Error> where A: core::convert::TryInto<doubleentry::AccountRef>, <A as core::convert::TryInto>::Error: core::convert::Into<doubleentry::error::ValueError>
 pub async fn doubleentry::Ledger<S, P>::set_limit<A>(&self, A, doubleentry::BalanceLimit, time::date::Date) -> core::result::Result<(), doubleentry::Error> where A: core::convert::TryInto<doubleentry::AccountRef>, <A as core::convert::TryInto>::Error: core::convert::Into<doubleentry::error::ValueError>
 pub async fn doubleentry::Ledger<S, P>::set_policy(&self, doubleentry::LedgerPolicy, time::date::Date) -> core::result::Result<(), doubleentry::Error>
 pub async fn doubleentry::Ledger<S, P>::statement<A>(&self, A, doubleentry::Currency, &doubleentry::BalanceQuery) -> core::result::Result<doubleentry::report::Statement<P>, doubleentry::Error> where A: core::convert::TryInto<doubleentry::AccountRef> + core::fmt::Display, <A as core::convert::TryInto>::Error: core::convert::Into<doubleentry::error::ValueError>
 pub async fn doubleentry::Ledger<S, P>::to_journal(&self) -> core::result::Result<doubleentry::Journal<P>, doubleentry::Error>
 pub async fn doubleentry::Ledger<S, P>::trial_balance(&self, &doubleentry::BalanceQuery) -> core::result::Result<doubleentry::report::TrialBalance<P>, doubleentry::Error>
+pub async fn doubleentry::Ledger<S, P>::watermark(&self) -> core::result::Result<core::option::Option<time::date::Date>, doubleentry::Error>
+pub async fn doubleentry::Ledger<S, P>::watermark_at(&self, doubleentry::TreeHead) -> core::result::Result<core::option::Option<time::date::Date>, doubleentry::Error>
 pub async fn doubleentry::Ledger<S, P>::with_precision(S, doubleentry::LedgerId) -> core::result::Result<Self, doubleentry::Error>
 pub fn doubleentry::Ledger<S, P>::with_salt_source(self, impl core::ops::function::Fn() -> doubleentry::MemoSalt + core::marker::Send + core::marker::Sync + 'static) -> Self
 impl<S: doubleentry::store::Store<P>, const P: u8> doubleentry::Ledger<S, P>
@@ -7692,6 +7948,31 @@ impl<C> core::marker::Unpin for doubleentry::PageRead<C> where core::option::Opt
 impl<C> core::marker::UnsafeUnpin for doubleentry::PageRead<C> where core::option::Option<C>: core::marker::UnsafeUnpin
 impl<C> core::panic::unwind_safe::RefUnwindSafe for doubleentry::PageRead<C> where core::option::Option<C>: core::panic::unwind_safe::RefUnwindSafe
 impl<C> core::panic::unwind_safe::UnwindSafe for doubleentry::PageRead<C> where core::option::Option<C>: core::panic::unwind_safe::UnwindSafe
+#[non_exhaustive] pub struct doubleentry::Period<const P: u8>
+pub doubleentry::Period::end: time::date::Date
+pub doubleentry::Period::id: doubleentry::PeriodId
+pub doubleentry::Period::position: u64
+pub doubleentry::Period::seal: core::option::Option<doubleentry::SealReceipt<P>>
+pub doubleentry::Period::start: time::date::Date
+impl<const P: u8> doubleentry::Period<P>
+pub const fn doubleentry::Period<P>::is_sealed(&self) -> bool
+impl<const P: u8> core::clone::Clone for doubleentry::Period<P>
+pub fn doubleentry::Period<P>::clone(&self) -> Self
+impl<const P: u8> core::cmp::Eq for doubleentry::Period<P>
+impl<const P: u8> core::cmp::PartialEq for doubleentry::Period<P>
+pub fn doubleentry::Period<P>::eq(&self, &Self) -> bool
+impl<const P: u8> core::fmt::Debug for doubleentry::Period<P>
+pub fn doubleentry::Period<P>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl<const P: u8> core::fmt::Display for doubleentry::Period<P>
+pub fn doubleentry::Period<P>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl<const P: u8> core::marker::StructuralPartialEq for doubleentry::Period<P>
+impl<const P: u8> core::marker::Freeze for doubleentry::Period<P> where core::option::Option<doubleentry::SealReceipt<P>>: core::marker::Freeze
+impl<const P: u8> core::marker::Send for doubleentry::Period<P> where core::option::Option<doubleentry::SealReceipt<P>>: core::marker::Send
+impl<const P: u8> core::marker::Sync for doubleentry::Period<P> where core::option::Option<doubleentry::SealReceipt<P>>: core::marker::Sync
+impl<const P: u8> core::marker::Unpin for doubleentry::Period<P> where core::option::Option<doubleentry::SealReceipt<P>>: core::marker::Unpin
+impl<const P: u8> core::marker::UnsafeUnpin for doubleentry::Period<P> where core::option::Option<doubleentry::SealReceipt<P>>: core::marker::UnsafeUnpin
+impl<const P: u8> core::panic::unwind_safe::RefUnwindSafe for doubleentry::Period<P> where core::option::Option<doubleentry::SealReceipt<P>>: core::panic::unwind_safe::RefUnwindSafe
+impl<const P: u8> core::panic::unwind_safe::UnwindSafe for doubleentry::Period<P> where core::option::Option<doubleentry::SealReceipt<P>>: core::panic::unwind_safe::UnwindSafe
 pub struct doubleentry::Posting<const P: u8>
 impl<const P: u8> doubleentry::Posting<P>
 pub fn doubleentry::Posting<P>::account(&self) -> core::option::Option<&doubleentry::AccountRef>
@@ -7820,6 +8101,10 @@ impl core::panic::unwind_safe::UnwindSafe for doubleentry::Recorded
 pub doubleentry::SealReceipt::period: doubleentry::PeriodId
 pub doubleentry::SealReceipt::position: u64
 pub doubleentry::SealReceipt::seal: doubleentry::record::Seal<P>
+impl<const P: u8> doubleentry::SealReceipt<P>
+pub fn doubleentry::SealReceipt<P>::end(&self) -> time::date::Date
+pub fn doubleentry::SealReceipt<P>::start(&self) -> time::date::Date
+pub fn doubleentry::SealReceipt<P>::through(&self) -> u64
 impl<const P: u8> core::clone::Clone for doubleentry::SealReceipt<P>
 pub fn doubleentry::SealReceipt<P>::clone(&self) -> Self
 impl<const P: u8> core::cmp::Eq for doubleentry::SealReceipt<P>

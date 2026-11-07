@@ -84,12 +84,25 @@ impl SaltSource {
         Ok(entry.memo_salted(text, salt))
     }
 
-    /// Every draft salted, in order.
-    pub(crate) fn salted_all<const P: u8>(
+    /// Every item of a batch, its entry drafts salted, in order. More than
+    /// [`Op::MAX_BATCH`](core::Op::MAX_BATCH) items are passed on unsalted:
+    /// the core refuses the batch before reading anything (124), and no
+    /// randomness is drawn for it.
+    pub(crate) fn salted_items<const P: u8>(
         &self,
-        drafts: impl IntoIterator<Item = Entry<P>>,
-    ) -> Result<Vec<Entry<P>>, Error> {
-        drafts.into_iter().map(|entry| self.salted(entry)).collect()
+        items: impl IntoIterator<Item = core::BatchItem<P>>,
+    ) -> Result<Vec<core::BatchItem<P>>, Error> {
+        let items: Vec<_> = items.into_iter().collect();
+        if items.len() > core::Op::<P>::MAX_BATCH {
+            return Ok(items);
+        }
+        items
+            .into_iter()
+            .map(|item| match item {
+                core::BatchItem::Record(entry) => self.salted(entry).map(core::BatchItem::Record),
+                other => Ok(other),
+            })
+            .collect()
     }
 }
 
@@ -103,6 +116,24 @@ pub(crate) fn seal_first(error: &Error) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// The entry receipts of a batch of entries.
+pub(crate) fn recorded_all(
+    receipts: Vec<core::BatchReceipt>,
+) -> Result<Vec<core::Recorded>, Error> {
+    receipts
+        .into_iter()
+        .map(|receipt| receipt.as_recorded().copied().ok_or_else(unexpected))
+        .collect()
+}
+
+/// The clearing receipts of a batch of clearings.
+pub(crate) fn cleared_all(receipts: Vec<core::BatchReceipt>) -> Result<Vec<core::Cleared>, Error> {
+    receipts
+        .into_iter()
+        .map(|receipt| receipt.as_cleared().copied().ok_or_else(unexpected))
+        .collect()
 }
 
 /// The error for a receipt of the wrong kind: the core answered another
@@ -129,9 +160,9 @@ impl<const P: u8> Done<P> {
     }
 
     /// The receipts of a recorded batch, or its refusal.
-    pub(crate) fn into_batch(self) -> Result<Vec<core::Recorded>, Error> {
+    pub(crate) fn into_batch(self) -> Result<Vec<core::BatchReceipt>, Error> {
         match self {
-            Self::Batch(recorded) => Ok(recorded),
+            Self::Batch(receipts) => Ok(receipts),
             Self::BatchRejected { index, rejection } => {
                 Err(Error::BatchRejected { index, rejection })
             }
@@ -147,10 +178,10 @@ impl<const P: u8> Done<P> {
         }
     }
 
-    /// The position of a clearing record.
-    pub(crate) fn into_cleared(self) -> Result<u64, Error> {
+    /// The receipt of a clearing record.
+    pub(crate) fn into_cleared(self) -> Result<core::Cleared, Error> {
         match self {
-            Self::Cleared(position) => Ok(position),
+            Self::Cleared(cleared) => Ok(cleared),
             _ => Err(unexpected()),
         }
     }
@@ -255,6 +286,61 @@ impl Account {
                 Some(account)
             }
         }
+    }
+}
+
+/// A period of the calendar as the façades list it: its id, its first and
+/// last day, the position of its definition and, once sealed, its seal.
+///
+/// ```
+/// use doubleentry::{Journal, LedgerId, date};
+///
+/// let mut books = Journal::new(LedgerId::new("example.com/acme")?);
+/// books.define_period("FY2026-Q1", date!("2026-01-01"), date!("2026-03-31"))?;
+/// books.define_period("FY2026-Q2", date!("2026-04-01"), date!("2026-06-30"))?;
+/// books.seal_period("FY2026-Q1")?;
+///
+/// let periods = books.periods()?;
+/// assert_eq!(periods.len(), 2);
+/// assert!(periods[0].is_sealed() && !periods[1].is_sealed());
+/// assert_eq!(books.watermark()?, Some(date!("2026-03-31")));
+/// assert_eq!(books.seals()?[0].end(), date!("2026-03-31"));
+/// # Ok::<(), doubleentry::Error>(())
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Period<const P: u8 = 2> {
+    /// The period's id, as defined (`2026-03`, `FY2026-Q1`, …).
+    pub id: PeriodId,
+    /// Its first day.
+    pub start: Date,
+    /// Its last day.
+    pub end: Date,
+    /// The position of its definition record.
+    pub position: u64,
+    /// Its seal, once sealed.
+    pub seal: Option<core::SealReceipt<P>>,
+}
+
+impl<const P: u8> Period<P> {
+    /// Whether the period is sealed: no posting may be booked in it.
+    #[must_use]
+    pub const fn is_sealed(&self) -> bool {
+        self.seal.is_some()
+    }
+}
+
+/// One line, `2026-03 2026-03-01..=2026-03-31` (and `, sealed at position
+/// 40`), honouring width, fill and alignment.
+impl<const P: u8> std::fmt::Display for Period<P> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let sealed = self
+            .seal
+            .as_ref()
+            .map(|seal| format!(", sealed at position {}", seal.position))
+            .unwrap_or_default();
+        let text = format!("{} {}..={}{sealed}", self.id, self.start, self.end);
+        crate::model::pad(f, &text)
     }
 }
 
@@ -765,6 +851,86 @@ impl<'a, S: Store<P>, const P: u8> Reads<'a, S, P> {
                 None => return Ok(exponents),
             }
         }
+    }
+
+    /// The log size a calendar read sees: the pinned head's (checked
+    /// against the store's root), or the store's size now.
+    async fn calendar_bound(&self, head: Option<TreeHead>) -> Result<u64, Error> {
+        match head {
+            Some(head) => {
+                self.pinned(head).await?;
+                Ok(head.size)
+            }
+            None => Ok(self.source.size().await?),
+        }
+    }
+
+    /// Every period defined below the bound, in calendar order, each with
+    /// its seal when that was recorded below the bound.
+    pub(crate) async fn periods(&self, head: Option<TreeHead>) -> Result<Vec<Period<P>>, Error> {
+        let bound = self.calendar_bound(head).await?;
+        let mut seals = self.seal_map(bound).await?;
+        let mut periods = Vec::new();
+        let mut from = 0;
+        loop {
+            let page = self.records(from, bound, RecordKind::Period).await?;
+            for leaf in page.items {
+                if let Record::Period(period) = leaf.record::<P>()? {
+                    periods.push(Period {
+                        id: period.id().clone(),
+                        start: period.start(),
+                        end: period.end(),
+                        position: leaf.position,
+                        seal: seals.remove(period.id()),
+                    });
+                }
+            }
+            match page.next {
+                Some(next) => from = next,
+                None => return Ok(periods),
+            }
+        }
+    }
+
+    /// Every seal recorded below the bound, in order.
+    pub(crate) async fn seals(
+        &self,
+        head: Option<TreeHead>,
+    ) -> Result<Vec<core::SealReceipt<P>>, Error> {
+        let bound = self.calendar_bound(head).await?;
+        let mut seals: Vec<_> = self.seal_map(bound).await?.into_values().collect();
+        seals.sort_by_key(|seal| seal.position);
+        Ok(seals)
+    }
+
+    /// The last day of the last seal below the bound: nothing may be booked
+    /// on or before it (309, 301).
+    pub(crate) async fn watermark(&self, head: Option<TreeHead>) -> Result<Option<Date>, Error> {
+        Ok(self.seals(head).await?.last().map(core::SealReceipt::end))
+    }
+
+    /// The seals recorded below `bound`, by period.
+    async fn seal_map(
+        &self,
+        bound: u64,
+    ) -> Result<BTreeMap<PeriodId, core::SealReceipt<P>>, Error> {
+        self.source
+            .seals(Some(bound))
+            .await?
+            .into_iter()
+            .filter(|row| row.position < bound)
+            .map(|row| {
+                let seal = seal_record::<P>(&row.leaf.bytes, row.position)?;
+                Ok((
+                    row.period.clone(),
+                    core::SealReceipt {
+                        period: row.period,
+                        position: row.position,
+                        seal,
+                    },
+                ))
+            })
+            .collect()
     }
 
     /// The (first, last) day of period `id`, when it was defined below

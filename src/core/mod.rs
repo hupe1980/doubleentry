@@ -93,7 +93,7 @@ mod tests;
 mod writeset;
 
 pub use audit::{AuditFailure, AuditFailureKind, AuditReport, ReplayLeaf, Replayer};
-pub use check::{ChangeInput, Op, execute, validate};
+pub use check::{BatchItem, ChangeInput, Clearing, Op, execute, validate};
 pub use holds::{HoldEffect, HoldState, HoldStatus, HoldView, ResolutionKind};
 pub use master::AccountSpec;
 pub use snapshot::{Fact, Read, Snapshot, plan};
@@ -102,8 +102,8 @@ pub use state::{
     PeriodView, Slice, StateView, Terms, Versioned, Window,
 };
 pub use writeset::{
-    AccountTerm, BalanceDelta, Done, IndexRow, MemoPlain, Outcome, Outstanding, PostingRow,
-    Recorded, SealReceipt, WriteSet,
+    AccountTerm, BalanceDelta, BatchReceipt, Cleared, Done, IndexRow, MemoPlain, Outcome,
+    Outstanding, PostingRow, Recorded, SealReceipt, WriteSet,
 };
 
 pub(crate) use calendar::months;

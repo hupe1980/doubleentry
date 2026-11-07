@@ -94,8 +94,11 @@ assert!(books.record(draft("Rechnung 4711", true))?.replayed); // another salt a
 assert_eq!(books.record(draft("Rechnung 4712", true)).unwrap_err().code(), Some(200));
 ```
 
-`record_batch` applies the same rule to each draft in order: an identical batch
-sent again returns the original receipts, each `replayed`, and writes nothing.
+A batch (`batch`, `record_batch`, `clear_batch`) applies the same rule to each
+item in order — entries by their key, clearings and resets by theirs: an
+identical batch sent again returns the original receipts, each `replayed`, and
+writes nothing. `clear` and `reset_clearing` return a `Cleared` receipt with the
+same `replayed` flag.
 
 ## Erasing a memo ends replays
 
@@ -149,6 +152,12 @@ Never record before the business commit: the log is append-only, so an entry
 for a change that rolled back needs a reversal. Keep the draft's content in the
 row; one recomputed from changed state is `KeyConflict` (200). Concurrent
 workers are safe: the key serialises them.
+
+An outbox row may hold a whole batch — a payment and its assignment to open
+invoices — recorded with `batch`: it commits whole or not at all, a retry
+replays every item, and `Error::BatchRejected { index, rejection }` parks the
+row with the refused item's index and code. The business row can name the
+entry before the worker records it: `entry_id(key)` is its id.
 [`examples/outbox.rs`](https://github.com/hupe1980/doubleentry/blob/main/examples/outbox.rs)
 runs every case.
 

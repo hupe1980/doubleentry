@@ -34,7 +34,7 @@ Ed25519. The crate has no HTTP client and no witness: it builds
 
 ```toml
 [dependencies]
-doubleentry = { version = "0.8", features = ["postgres-tls"] }
+doubleentry = { version = "0.9", features = ["postgres-tls"] }
 ```
 
 Then ask for it in the URL:

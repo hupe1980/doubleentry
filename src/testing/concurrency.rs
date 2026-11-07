@@ -11,9 +11,10 @@ use super::model::Check;
 use crate::error::{Error, Rejection};
 use crate::model::{
     AccountKind, Amount, BalanceLimit, EUR, Entry, LedgerId, MemoSalt, PostAmount, Posting,
+    PostingRef,
 };
 use crate::store::Store;
-use crate::{AccountSpec, Ledger, Recorded};
+use crate::{AccountSpec, BatchItem, Clearing, Ledger, Recorded};
 
 /// How long a check may take before it counts as deadlocked.
 const DEADLINE: Duration = Duration::from_secs(120);
@@ -334,6 +335,90 @@ pub(crate) async fn parallel_batches<S: Store<P>, const P: u8>(
             .audit()
             .await
             .map_err(|error| format!("audit: {error}"))?;
+        Ok(())
+    })
+    .await
+}
+
+/// 028 US3: eight payment runs at once, each recording a payment of 30.00
+/// and assigning it to one invoice of 100.00 in the same batch: exactly
+/// three recorded, five refused at the assignment (414) with their payment
+/// not written, the invoice open at 10.00.
+pub(crate) async fn payment_runs_race<S: Store<P>, const P: u8>(
+    store: S,
+    ledger: &LedgerId,
+) -> Check {
+    within(async {
+        let books = books(store, ledger).await?;
+        let fail = |error: Error| error.to_string();
+        let on = day(10)?;
+        books
+            .record(sale("inv", eur::<P>(100)?, day(2)?))
+            .await
+            .map_err(fail)?;
+        let invoice = PostingRef::at(books.entry_id("inv").map_err(fail)?, 0);
+        let thirty = eur::<P>(30)?;
+        let tasks = (0..8)
+            .map(|n| {
+                let books = books.clone();
+                async move {
+                    let key = format!("pay-{n}");
+                    let paid = books.entry_id(&key).map(|id| PostingRef::at(id, 1));
+                    let run = paid.map(|paid| {
+                        vec![
+                            BatchItem::Record(
+                                Entry::new(key.as_str(), on)
+                                    .debit("Income:Sales", thirty, EUR)
+                                    .credit("Assets:Cash", thirty, EUR),
+                            ),
+                            BatchItem::Clear(Clearing::new(
+                                format!("{key}/inv"),
+                                invoice,
+                                paid,
+                                thirty,
+                                on,
+                            )),
+                        ]
+                    });
+                    match run {
+                        Ok(run) => (n, books.batch(run).await),
+                        Err(error) => (n, Err(error)),
+                    }
+                }
+            })
+            .collect();
+        let (mut recorded, mut refused) = (0u32, Vec::new());
+        for (n, result) in race(tasks).await? {
+            match result {
+                Ok(_) => recorded = recorded.saturating_add(1),
+                Err(Error::BatchRejected {
+                    index: 1,
+                    rejection: Rejection::OverApplied { .. },
+                }) => refused.push(n),
+                Err(error) => return Err(format!("a payment run failed: {error}")),
+            }
+        }
+        if (recorded, refused.len()) != (3, 5) {
+            return Err(format!(
+                "expected 3 runs and 5 refusals, got {recorded} and {}",
+                refused.len()
+            ));
+        }
+        for n in refused {
+            let key = format!("pay-{n}");
+            if books.entry_by_key(&key).await.map_err(fail)?.is_some() {
+                return Err(format!("{key} of a refused run was written"));
+            }
+        }
+        let open = books
+            .open_items("Assets:Cash", EUR, &crate::BalanceQuery::all())
+            .await
+            .map_err(fail)?;
+        let left: Vec<_> = open.iter().map(|item| item.residual).collect();
+        if left != [eur::<P>(10)?] {
+            return Err(format!("expected the invoice open at 10, got {left:?}"));
+        }
+        books.audit().await.map_err(fail)?;
         Ok(())
     })
     .await

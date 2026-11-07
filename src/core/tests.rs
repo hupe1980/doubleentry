@@ -7,15 +7,55 @@ use std::cell::Cell;
 use time::Date;
 
 use super::{
-    AccountSpec, AccountView, BalanceKey, ChangeInput, ClearingView, Done, EntryMeta, EntryView,
-    Fact, Header, HoldView, MemState, Movement, Op, Outcome, PeriodView, Slice, Snapshot,
-    StateView, Terms, Versioned, execute, plan,
+    AccountSpec, AccountView, BalanceKey, BatchItem, BatchReceipt, ChangeInput, Clearing,
+    ClearingView, Done, EntryMeta, EntryView, Fact, Header, HoldView, MemState, Movement, Op,
+    Outcome, PeriodView, Slice, Snapshot, StateView, Terms, Versioned, execute, plan,
 };
 use crate::model::{
     AccountHandle, AccountKind, AccountPath, AccountRef, Amount, Balance, BalanceLimit, Currency,
     EUR, Entry, EntryId, IdempotencyKey, LedgerId, LedgerPolicy, MemoSalt, PeriodId, PostAmount,
     PostingRef, USD,
 };
+
+/// The single write a batch item is equivalent to.
+fn op_of(item: &BatchItem<2>) -> Op<2> {
+    match item {
+        BatchItem::Record(draft) => Op::Record(Box::new(draft.clone())),
+        BatchItem::Clear(clearing) => Op::Clear {
+            key: clearing.key.clone(),
+            debit: clearing.debit,
+            credit: clearing.credit,
+            amount: clearing.amount,
+            date: clearing.on,
+        },
+        BatchItem::Reset { key, clearing, on } => Op::ResetClearing {
+            key: key.clone(),
+            clearing: *clearing,
+            date: *on,
+        },
+    }
+}
+
+/// A clearing or reset as a batch item.
+fn item_of(op: Op<2>) -> Option<BatchItem<2>> {
+    match op {
+        Op::Clear {
+            key,
+            debit,
+            credit,
+            amount,
+            date,
+        } => Some(BatchItem::Clear(Clearing::new(
+            key, debit, credit, amount, date,
+        ))),
+        Op::ResetClearing {
+            key,
+            clearing,
+            date,
+        } => Some(BatchItem::reset(key, clearing, date)),
+        _ => None,
+    }
+}
 
 const ACCOUNTS: [&str; 5] = [
     "Assets:Cash",
@@ -203,12 +243,17 @@ fn random_op(rng: &mut Lcg, memory: &mut Memory, step: usize) -> Op<2> {
             (0..rng.below(6))
                 .map(
                     |n| match random_op(rng, memory, step * 8 + n as usize + 1_000_000) {
-                        Op::Record(draft) => *draft,
+                        Op::Record(draft) => BatchItem::Record(*draft),
+                        op @ (Op::Clear { .. } | Op::ResetClearing { .. }) => {
+                            item_of(op).unwrap_or_else(|| unreachable!())
+                        }
                         // A draw on the limited wallet: refused unless funded
                         // (perhaps earlier in this batch).
-                        _ => Entry::new(format!("draw-{step}-{n}"), date)
-                            .debit("Liabilities:Wallet", amount, EUR)
-                            .credit("Assets:Cash", amount, EUR),
+                        _ => BatchItem::Record(
+                            Entry::new(format!("draw-{step}-{n}"), date)
+                                .debit("Liabilities:Wallet", amount, EUR)
+                                .credit("Assets:Cash", amount, EUR),
+                        ),
                     },
                 )
                 .collect(),
@@ -317,16 +362,20 @@ fn batch_decides_like_its_drafts_in_sequence() {
         let mut memory = Memory::default();
         for step in 0..6 {
             let op = random_op(&mut rng, &mut memory, sequence * 8 + step);
-            let Op::Batch(drafts) = &op else {
+            let Op::Batch(items) = &op else {
                 let _ = apply(&mut state, &op);
                 continue;
             };
             let mut sequential = state.clone();
             let mut receipts = Vec::new();
             let mut first_refusal = None;
-            for (index, draft) in drafts.iter().enumerate() {
-                match apply(&mut sequential, &Op::Record(Box::new(draft.clone()))) {
-                    Ok(outcome) => receipts.push(outcome.done().clone()),
+            for (index, item) in items.iter().enumerate() {
+                match apply(&mut sequential, &op_of(item)) {
+                    Ok(outcome) => receipts.push(match outcome.done() {
+                        Done::Entry(recorded) => BatchReceipt::Recorded(*recorded),
+                        Done::Cleared(cleared) => BatchReceipt::Cleared(*cleared),
+                        other => panic!("not an item receipt: {other:?}"),
+                    }),
                     Err(rejection) => {
                         first_refusal = Some((index, rejection));
                         break;
@@ -341,8 +390,7 @@ fn batch_decides_like_its_drafts_in_sequence() {
                     let Done::Batch(recorded) = decided.done() else {
                         panic!("sequence {sequence}: expected a batch, got {decided:?}");
                     };
-                    let recorded: Vec<Done<2>> = recorded.iter().map(|r| Done::Entry(*r)).collect();
-                    assert_eq!(recorded, receipts, "sequence {sequence}: {op:?}");
+                    assert_eq!(recorded, &receipts, "sequence {sequence}: {op:?}");
                     assert_eq!(state.head(), sequential.head(), "sequence {sequence}");
                 }
                 Some((index, rejection)) => {

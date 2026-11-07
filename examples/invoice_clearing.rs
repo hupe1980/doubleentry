@@ -1,4 +1,5 @@
-//! An invoice, a partial payment, and the open item that remains.
+//! An invoice, a partial payment cleared against it in the same commit, and
+//! the open item that remains.
 #![allow(clippy::indexing_slicing)] // an example asserts its outcomes; the library never panics
 use doubleentry::prelude::*;
 
@@ -22,17 +23,18 @@ fn main() -> Result<()> {
             .credit("Liabilities:VAT", amount!("190.00"), EUR),
     )?;
     let (paid, on) = (amount!("500.00"), date!("2026-03-10"));
-    let payment = books.record(
+    let debit = PostingRef::at(invoice.id, 0); // the invoice's receivable leg
+    let credit = PostingRef::at(books.entry_id("PAY-1")?, 1); // the payment's, before it exists
+    books.batch([
         Entry::new("PAY-1", on)
             .debit("Assets:Bank", paid, EUR)
-            .credit(AR, paid, EUR),
-    )?;
-    let debit = PostingRef::at(invoice.id, 0); // the invoice's receivable leg
-    let credit = PostingRef::at(payment.id, 1); // the payment's receivable leg
-    books.clear("CLR-1", debit, credit, paid, on)?;
+            .credit(AR, paid, EUR)
+            .into(),
+        Clearing::new("CLR-1", debit, credit, paid, on).into(),
+    ])?; // one commit: never a payment without its assignment
 
     let open = books.open_items(AR, EUR, &BalanceQuery::all())?;
     assert_eq!(open[0].residual, amount!("690.00"));
-    println!("{}", open[0]); // INV-1  2026-03-01  debit 1190.00  open 690.00
+    println!("{}", open[0]); // 2026-03-01 18/0 debit 1190.00, applied 500.00, open 690.00
     Ok(())
 }

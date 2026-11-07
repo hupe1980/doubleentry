@@ -409,6 +409,13 @@ impl Row {
         Label::new(self.text(index)?).map_err(|_| self.bad("a label is invalid"))
     }
 
+    /// A nullable label column.
+    pub(crate) fn opt_label(&self, index: usize) -> Result<Option<Label>, StoreError> {
+        self.opt_text(index)?
+            .map(|text| Label::new(text).map_err(|_| self.bad("a label is invalid")))
+            .transpose()
+    }
+
     /// A period id column.
     pub(crate) fn period(&self, index: usize) -> Result<PeriodId, StoreError> {
         self.label(index)

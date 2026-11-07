@@ -72,6 +72,13 @@ If a `Ledger` write fails with [`may_have_applied`](@/docs/start/errors.md),
 call `close_year` again with the same arguments: an empty result means the batch
 was recorded; otherwise record the same drafts again.
 
+A batch holds at most `MAX_BATCH` (1 000) drafts. A close of more (many
+accounts, currencies or dimension slices) is recorded in chunks —
+`for chunk in drafts.chunks(Journal::<2>::MAX_BATCH) { books.record_batch(chunk.to_vec())?; }`
+— each atomic. A failure between chunks leaves the close partly recorded:
+keep the drafts and record the same chunks again (the recorded ones replay,
+writing nothing), and seal only once every chunk has returned.
+
 `close_year` returns `Error::Rejected` with 100 when `{key}/N` is not a valid
 key (the suffix counts towards the 128-byte limit), 302 when the equity account
 is unknown, 303 when it is not a leaf, 429 (`ClosingEquityInScope`) when it is

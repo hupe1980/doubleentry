@@ -315,8 +315,38 @@ pub struct PostingRead {
     /// Only postings carrying every one of these (axis, value) pairs (at most
     /// eight).
     pub dimensions: Vec<(Label, Label)>,
+    /// Only postings of entries of these kinds.
+    pub kinds: KindFilter,
     /// The page.
     pub page: PageRead<PostingCursor>,
+}
+
+/// Which entry kinds a postings read keeps.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum KindFilter {
+    /// Every posting.
+    #[default]
+    Any,
+    /// Postings of entries of any of these kinds (at most eight).
+    OneOf(Vec<Label>),
+    /// Postings of entries recorded without a kind.
+    Without,
+}
+
+impl KindFilter {
+    /// The most kinds one filter holds.
+    pub const MAX_KINDS: usize = 8;
+
+    /// Whether an entry of `kind` passes.
+    #[must_use]
+    pub fn keeps(&self, kind: Option<&Label>) -> bool {
+        match self {
+            Self::Any => true,
+            Self::OneOf(kinds) => kind.is_some_and(|kind| kinds.contains(kind)),
+            Self::Without => kind.is_none(),
+        }
+    }
 }
 
 impl PostingRead {
@@ -358,6 +388,8 @@ pub struct PostingLine<const P: u8> {
     pub balance_after: Balance<P>,
     /// The amount cleared against this posting, net of resets.
     pub cleared: Amount<P>,
+    /// The entry's kind (`invoice`, `payment`, …), if it has one.
+    pub kind: Option<Label>,
 }
 
 impl<const P: u8> PostingLine<P> {

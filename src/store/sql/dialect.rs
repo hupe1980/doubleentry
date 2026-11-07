@@ -474,6 +474,11 @@ pub(crate) mod sealed {
         /// Whether the `meta` table exists, given `$1` = its qualified name.
         const META_PROBE: &str;
 
+        /// The base tables where the ledger lives, one text column; `$1`, if
+        /// the dialect has schemas, is the schema name. Without `$1` the
+        /// ledger is the whole database, which errors call `main`.
+        const TABLES_PROBE: &str;
+
         /// The DDL run before the tables; `{{q}}` is the quoted schema.
         const PRELUDE: &str;
 

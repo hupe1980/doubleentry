@@ -24,12 +24,12 @@ pub enum Error {
     /// The ledger refused the input. Final for this input: do not retry it
     /// unchanged.
     Rejected(Rejection),
-    /// The ledger refused draft `index` of an atomic batch
-    /// ([`Journal::record_batch`](crate::Journal::record_batch)); nothing of
+    /// The ledger refused item `index` of an atomic batch
+    /// ([`Journal::batch`](crate::Journal::batch)); nothing of
     /// the batch was recorded. Final for this batch: do not retry it
     /// unchanged.
     BatchRejected {
-        /// The refused draft's index in the batch.
+        /// The refused item's index in the batch.
         index: usize,
         /// Why it was refused.
         rejection: Rejection,
@@ -94,7 +94,7 @@ impl fmt::Display for Error {
         let text = match self {
             Self::Rejected(rejection) => format!("rejected: {rejection}"),
             Self::BatchRejected { index, rejection } => {
-                format!("rejected: draft {index} of the batch: {rejection}")
+                format!("rejected: item {index} of the batch: {rejection}")
             }
             Self::Value(error) => format!("invalid value: {error}"),
             Self::Amount(error) => format!("amount: {error}"),

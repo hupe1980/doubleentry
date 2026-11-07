@@ -192,12 +192,98 @@ async fn regress_f6_foreign_schema_is_refused() {
     )
     .await
     .unwrap();
+    // A 0.7 ledger is named, not run into.
+    let foreign = StoreErrorKind::ForeignSchema {
+        schema: String::from("main"),
+        tables: vec![String::from("ledger_meta")],
+    };
+    assert_eq!(store.open().await.unwrap_err().kind(), &foreign);
     assert_eq!(
-        store.open().await.unwrap_err().kind(),
-        &StoreErrorKind::NotCreated
+        store
+            .create(&Genesis { ledger: ledger() })
+            .await
+            .unwrap_err()
+            .kind(),
+        &foreign
     );
     let error = Error::from(store.open().await.unwrap_err());
-    assert!(matches!(error, Error::Backend(_)));
+    assert!(matches!(
+        &error,
+        Error::Config(ConfigError::ForeignSchema { .. })
+    ));
+    assert!(
+        error.to_string().contains("doubleentry 0.7 ledger"),
+        "{error}"
+    );
+}
+
+/// A database file holding another application's tables is refused by
+/// `open`, `create` and `Ledger::new`, naming the tables (sorted), and
+/// nothing is added to it; a view alone is not a table, and SQLite's own
+/// tables never count.
+#[tokio::test]
+async fn foreign_tables_are_named_and_left_alone() {
+    let (_dir, path, store) = fresh_file().await;
+    let mut connection = raw(&path).await;
+    execute(
+        &mut connection,
+        "CREATE TABLE invoices (id INTEGER PRIMARY KEY AUTOINCREMENT); \
+         CREATE TABLE accounts (id INTEGER PRIMARY KEY)",
+    )
+    .await
+    .unwrap();
+    let error = Ledger::new(store.clone(), ledger()).await.unwrap_err();
+    let Error::Config(config) = &error else {
+        panic!("{error:?}");
+    };
+    assert_eq!(
+        config,
+        &ConfigError::ForeignSchema {
+            schema: String::from("main"),
+            tables: vec![String::from("accounts"), String::from("invoices")],
+        }
+    );
+    assert!(!error.to_string().contains("0.7"), "{error}");
+    let tables: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' \
+         ORDER BY name",
+    )
+    .fetch_all(&mut connection)
+    .await
+    .unwrap();
+    assert_eq!(tables, ["accounts", "invoices"], "nothing was created");
+
+    // A view is not a table: the ledger is created beside it.
+    let (_dir, path, store) = fresh_file().await;
+    let mut connection = raw(&path).await;
+    execute(&mut connection, "CREATE VIEW now AS SELECT 1 AS one")
+        .await
+        .unwrap();
+    Ledger::new(store, ledger()).await.unwrap();
+}
+
+/// A database of the previous schema identifier (0.8's `doubleentry/1`) is
+/// another schema: refused, never migrated.
+#[tokio::test]
+async fn the_previous_schema_identifier_is_refused() {
+    let (_dir, path, store) = fresh_file().await;
+    let mut connection = raw(&path).await;
+    execute(
+        &mut connection,
+        "CREATE TABLE meta (singleton INTEGER PRIMARY KEY, schema_id TEXT, ledger_id TEXT, \
+         amount_scale INTEGER, genesis BLOB); \
+         INSERT INTO meta VALUES (1, 'doubleentry/1', 'example.com/acme', 2, zeroblob(32));",
+    )
+    .await
+    .unwrap();
+    let error = Ledger::new(store, ledger()).await.unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            Error::Config(ConfigError::SchemaMismatch { found }) if found == "doubleentry/1"
+        ),
+        "{error:?}"
+    );
 }
 
 /// `regress_dollar_placeholders_rebind_out_of_order` (PoC:
@@ -406,6 +492,7 @@ async fn strict_decode_refuses_out_of_domain_values() {
             booking: None,
             value: None,
             dimensions: Vec::new(),
+            kinds: doubleentry::store::KindFilter::Any,
             page: PageRead::first(10),
         })
         .await
@@ -1087,4 +1174,22 @@ async fn a3_s6_balances_at_an_early_position_page_correctly() {
         }
     }
     assert_eq!(keys, [0, 1]);
+}
+
+/// 028 US2: periods, seals and the watermark, also pinned.
+#[tokio::test]
+async fn calendar_reads() {
+    store_checks::calendar_reads(fresh_file().await.2).await;
+}
+
+/// 028 US5: totals per entry kind.
+#[tokio::test]
+async fn kind_queries() {
+    store_checks::kind_queries(fresh_file().await.2).await;
+}
+
+/// 028 US3: a payment and its assignment in one commit.
+#[tokio::test]
+async fn payment_run() {
+    store_checks::payment_run(fresh_file().await.2).await;
 }

@@ -18,14 +18,14 @@ with one [`Error`](https://docs.rs/doubleentry/latest/doubleentry/enum.Error.htm
 | Variant | Means |
 |---|---|
 | `Rejected(Rejection)` | the ledger refused the input — any write |
-| `BatchRejected { index, rejection }` | draft `index` of `record_batch` was refused; nothing of the batch was written |
+| `BatchRejected { index, rejection }` | item `index` of a batch (`batch`, `record_batch`, `clear_batch`) was refused; nothing of the batch was written |
 | `Value(ValueError)` | a value constructor (`LedgerId::new`, `Label::new`, …) refused its input |
 | `Amount(AmountError)` | money parsing or arithmetic failed |
 | `Query(QueryError)` | a read asked an impossible question: an unknown account, entry or period, a position past the head |
 | `Transparency(…)` | a checkpoint, cosignature, policy, proof or bundle was refused |
 | `Integrity(IntegrityError)` | the ledger's stored data fails verification |
 | `Backend(BackendError)` | the database failed, or the OS had no randomness for a memo salt |
-| `Config(ConfigError)` | the store holds another ledger, scale or schema |
+| `Config(ConfigError)` | the store holds another ledger, scale or schema, or tables that are no ledger (`ForeignSchema`); a schema or role name is not an identifier |
 
 `Value` and `Amount` never come from a ledger operation: draft builders cannot
 fail, so a malformed path or amount inside a draft is `Rejected` with a code.
@@ -64,7 +64,7 @@ rules always gets the same code, from `Journal`, `Ledger` and every store.
 
 | Codes | Stage | Checks |
 |---|---|---|
-| 100–123, 140–145 | structural | the input alone; the shape of a hold or resolution |
+| 100–124, 140–145 | structural | the input alone; the shape of a hold or resolution; a batch of more than 1 000 items (124) |
 | 200 | idempotency | a key already used for other content |
 | 300–311 | context | periods, accounts, currencies, policy, watermark on the booking date |
 | 400–431, 440–450 | references | reversal targets, cleared postings, master data, the hold a resolution names |
@@ -84,13 +84,13 @@ have committed although it failed) are only ever `true` for `Backend`.
 
 | Error | What the caller does |
 |---|---|
-| `Rejected`, `BatchRejected` | fix the input (or drop draft `index`); never retry unchanged |
+| `Rejected`, `BatchRejected` | fix the input (or drop item `index`); never retry unchanged |
 | `Value`, `Amount`, `Query` | fix the call |
 | `Transparency` | the artefact is forged, stale or foreign; never retry it unchanged |
 | `Integrity(e)` | stop writing; investigate `e.position()`; restore and `audit` |
 | `Backend`, transient or outcome unknown | retry with the **same** draft: it applies once or replays |
 | `Backend`, permanent | an operator problem: configuration, permissions |
-| `Config` | fix the URL, schema name, ledger id or `P`; the data is fine |
+| `Config` | fix the URL, schema name, ledger id or `P`; for `ForeignSchema`, give the ledger an empty schema (or file) of its own; the data is fine |
 
 ```rust
 use doubleentry::prelude::*;

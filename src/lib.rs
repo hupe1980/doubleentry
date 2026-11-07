@@ -91,8 +91,8 @@
 //!    draft is refused by [`record`](Journal::record) with a [`Rejection`]
 //!    and a stable code. The idempotency key is the entry's identity: a
 //!    retry of the same draft returns the original [`Recorded`] with
-//!    `replayed == true`. [`record_batch`](Journal::record_batch) records
-//!    many drafts atomically, in order, in one transaction.
+//!    `replayed == true`. [`batch`](Journal::batch) records entries,
+//!    clearings and resets atomically, in order, in one transaction.
 //! 3. **Read** — [`balance`](Journal::balance) and the reports take a
 //!    [`BalanceQuery`] (a log prefix, a date window by booking or value
 //!    date, a period, dimension filters); both façades answer them alike.
@@ -118,7 +118,7 @@
 //! | Error | [`is_transient`](Error::is_transient) | [`may_have_applied`](Error::may_have_applied) | What the caller does |
 //! |---|---|---|---|
 //! | [`Rejected(r)`](Error::Rejected) | false | false | show `r` and its code; fix the input; never retry unchanged |
-//! | [`BatchRejected { index, rejection }`](Error::BatchRejected) | false | false | nothing of the batch was written; fix draft `index` (or drop it) and record the batch again |
+//! | [`BatchRejected { index, rejection }`](Error::BatchRejected) | false | false | nothing of the batch was written; fix item `index` (or drop it) and record the batch again |
 //! | [`Value(e)`](Error::Value), [`Amount(e)`](Error::Amount) | false | false | fix the value or the arithmetic at the call site (never from a ledger operation) |
 //! | [`Query(e)`](Error::Query) | false | false | fix the question: the entry, period, window or position asked for |
 //! | [`Transparency(e)`](Error::Transparency) | false | false | the artefact is refused: a forged, stale or foreign checkpoint, bundle or reply; never retry it unchanged |
@@ -204,12 +204,12 @@ pub mod fuzz_api {
 }
 
 pub use crate::core::{
-    AccountSpec, AuditReport, HoldState, HoldStatus, Recorded, ResolutionKind, SealReceipt,
-    validate,
+    AccountSpec, AuditReport, BatchItem, BatchReceipt, Cleared, Clearing, HoldState, HoldStatus,
+    Recorded, ResolutionKind, SealReceipt, validate,
 };
 pub use error::rejection::Rejection;
 pub use error::top::{Error, Result};
-pub use facade::Account;
+pub use facade::{Account, Period};
 pub use journal::Journal;
 pub use ledger::Ledger;
 pub use log::proof::TreeHead;

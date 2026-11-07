@@ -103,18 +103,20 @@ assert!(!report.checks.is_empty());
 ## Schema identifier, no migrations
 
 A SQL store's `meta` table holds one row: the schema identifier
-`doubleentry/1` (`SCHEMA_ID`), the ledger id, the scale `P` and the genesis
+`doubleentry/2` (`SCHEMA_ID`), the ledger id, the scale `P` and the genesis
 leaf hash. `open` reads it before anything else:
 
 | Found | Result |
 |---|---|
-| no ledger | `NotCreated`; `Ledger::new` then creates it |
+| no table at all | `NotCreated`; `Ledger::new` then creates it |
+| tables, but no `meta` table (another application's, a doubleentry 0.7 ledger) | `Error::Config(ForeignSchema { schema, tables })`, naming the tables; `create` refuses too, before any DDL, so nothing is created there |
 | another schema identifier | `Error::Config(SchemaMismatch { found })`; nothing is read or changed |
 | another ledger id, or another scale `P` | `Error::Config(LedgerMismatch { .. })` |
 | a genesis record that does not hash to the `meta` row's | `Error::Integrity` (`GenesisMismatch`) |
 
 Every write re-checks the row. There are no migrations: a database of another
-schema is refused, never converted. Books move to a new schema by recording
+schema is refused, never converted. The schema identifier changes with the
+tables; the log's format tag (`doubleentry/1`) only with the records' encoding. Books move to a new schema by recording
 them from their source documents into a new ledger with the same idempotency
 keys; keep the old database, and the crate version that wrote it, for its
 retention period.
@@ -132,7 +134,7 @@ let other = Ledger::new(SqlStore::<Sqlite>::sqlite(&url).await?, LedgerId::new("
 assert!(matches!(other, Err(Error::Config(ConfigError::LedgerMismatch { .. }))));
 let finer = Ledger::<_, 4>::with_precision(SqlStore::<Sqlite, 4>::sqlite(&url).await?, LedgerId::new("example.com/acme")?).await;
 assert!(matches!(finer, Err(Error::Config(_))));
-assert_eq!(doubleentry::store::SCHEMA_ID, "doubleentry/1");
+assert_eq!(doubleentry::store::SCHEMA_ID, "doubleentry/2");
 ```
 
 ## Integrity

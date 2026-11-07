@@ -11,7 +11,7 @@ use time::Date;
 
 use super::calendar;
 use super::state::{BalanceKey, ClearingView, EntryView, StateView};
-use super::writeset::{Done, IndexRow, Outcome, WriteSet};
+use super::writeset::{Cleared, Done, IndexRow, Outcome, WriteSet};
 use crate::error::{Rejection, ScaledAmount};
 use crate::model::{
     Amount, ClearingAction, ClearingEvent, IdempotencyKey, Layer, PostingRecord, PostingRef,
@@ -30,9 +30,9 @@ fn replayed<const P: u8>(
     event: &ClearingEvent<P>,
 ) -> Result<Option<Outcome<P>>, Rejection> {
     match existing {
-        Some(existing) if existing.event == *event => {
-            Ok(Some(Outcome::Unchanged(Done::Cleared(existing.position))))
-        }
+        Some(existing) if existing.event == *event => Ok(Some(Outcome::Unchanged(Done::Cleared(
+            Cleared::new(existing.position, true),
+        )))),
         Some(existing) => Err(Rejection::KeyConflict {
             position: existing.position,
         }),
@@ -153,16 +153,20 @@ pub(crate) fn apply<const P: u8>(
     }
     let position = view.header().size;
     Ok(Outcome::from(
-        WriteSet::of(position, Record::Clearing(event), Done::Cleared(position))
-            .with(IndexRow::ClearingKey { key, position })
-            .with(IndexRow::Applied {
-                posting: debit,
-                delta: amount,
-            })
-            .with(IndexRow::Applied {
-                posting: credit,
-                delta: amount,
-            }),
+        WriteSet::of(
+            position,
+            Record::Clearing(event),
+            Done::Cleared(Cleared::new(position, false)),
+        )
+        .with(IndexRow::ClearingKey { key, position })
+        .with(IndexRow::Applied {
+            posting: debit,
+            delta: amount,
+        })
+        .with(IndexRow::Applied {
+            posting: credit,
+            delta: amount,
+        }),
     ))
 }
 
@@ -211,16 +215,20 @@ pub(crate) fn reset<const P: u8>(
     let position = view.header().size;
     let released = amount.negate();
     Ok(Outcome::from(
-        WriteSet::of(position, Record::Clearing(event), Done::Cleared(position))
-            .with(IndexRow::ClearingKey { key, position })
-            .with(IndexRow::Applied {
-                posting: debit,
-                delta: released,
-            })
-            .with(IndexRow::Applied {
-                posting: credit,
-                delta: released,
-            })
-            .with(IndexRow::ClearingReset { clearing, position }),
+        WriteSet::of(
+            position,
+            Record::Clearing(event),
+            Done::Cleared(Cleared::new(position, false)),
+        )
+        .with(IndexRow::ClearingKey { key, position })
+        .with(IndexRow::Applied {
+            posting: debit,
+            delta: released,
+        })
+        .with(IndexRow::Applied {
+            posting: credit,
+            delta: released,
+        })
+        .with(IndexRow::ClearingReset { clearing, position }),
     ))
 }

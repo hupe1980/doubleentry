@@ -22,14 +22,14 @@ pub enum Outcome<const P: u8> {
     /// identical re-declaration, an already sealed period): write nothing and
     /// return this.
     Unchanged(Done<P>),
-    /// Append these records, in order: the new entries of an atomic batch
-    /// ([`Op::Batch`](super::Op::Batch)), each decided against the state
-    /// the ones before it leave. Persist all of them in one transaction or
-    /// none.
+    /// Append these records, in order: the new records of an atomic batch
+    /// ([`Op::Batch`](super::Op::Batch)) — entries, clearings and resets —
+    /// each decided against the state the ones before it leave. Persist all
+    /// of them in one transaction or none.
     Batch {
-        /// One write set per new entry, by position.
+        /// One write set per new record, by position.
         writes: Vec<WriteSet<P>>,
-        /// [`Done::Batch`]: every draft's receipt, replays included.
+        /// [`Done::Batch`]: every item's receipt, replays included.
         done: Done<P>,
     },
 }
@@ -67,16 +67,16 @@ pub enum Done<const P: u8> {
     Period(PeriodId),
     /// A period is sealed.
     Sealed(SealReceipt<P>),
-    /// A clearing or its reset is recorded at this position.
-    Cleared(u64),
+    /// A clearing or its reset is recorded (or replayed).
+    Cleared(Cleared),
     /// The year-end closing drafts, to be recorded in order (nothing was
     /// written).
     Closing(Vec<Entry<P>>),
-    /// Every draft of a batch recorded (or replayed), in order.
-    Batch(Vec<Recorded>),
-    /// A batch refused at draft `index`; nothing of it was written.
+    /// Every item of a batch recorded (or replayed), in order.
+    Batch(Vec<BatchReceipt>),
+    /// A batch refused at item `index`; nothing of it was written.
     BatchRejected {
-        /// The refused draft's index in the batch.
+        /// The refused item's index in the batch.
         index: usize,
         /// Why it was refused.
         rejection: Rejection,
@@ -105,6 +105,115 @@ impl core::fmt::Display for Recorded {
         let replayed = if self.replayed { ", replayed" } else { "" };
         let text = format!("entry {} at position {}{replayed}", self.id, self.position);
         crate::model::pad(f, &text)
+    }
+}
+
+/// The receipt of a clearing apply or reset.
+///
+/// `replayed` is `true` exactly when the same clearing had been recorded
+/// under its key before: nothing was appended and `position` is the
+/// original's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct Cleared {
+    /// The clearing record's position in the log.
+    pub position: u64,
+    /// Whether this was a retry of a clearing already recorded.
+    pub replayed: bool,
+}
+
+impl Cleared {
+    pub(crate) const fn new(position: u64, replayed: bool) -> Self {
+        Self { position, replayed }
+    }
+}
+
+/// One line, `clearing at position 21` (and `, replayed` for a retry),
+/// honouring width, fill and alignment.
+impl core::fmt::Display for Cleared {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let replayed = if self.replayed { ", replayed" } else { "" };
+        let text = format!("clearing at position {}{replayed}", self.position);
+        crate::model::pad(f, &text)
+    }
+}
+
+/// The receipt of one item of a batch, in the batch's order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum BatchReceipt {
+    /// An entry was recorded (or replayed).
+    Recorded(Recorded),
+    /// A clearing or reset was recorded (or replayed).
+    Cleared(Cleared),
+}
+
+impl BatchReceipt {
+    /// The item's record position (the original's for a replay).
+    #[must_use]
+    pub const fn position(&self) -> u64 {
+        match self {
+            Self::Recorded(recorded) => recorded.position,
+            Self::Cleared(cleared) => cleared.position,
+        }
+    }
+
+    /// Whether the item had been recorded before.
+    #[must_use]
+    pub const fn replayed(&self) -> bool {
+        match self {
+            Self::Recorded(recorded) => recorded.replayed,
+            Self::Cleared(cleared) => cleared.replayed,
+        }
+    }
+
+    /// The entry receipt, for an entry item.
+    #[must_use]
+    pub const fn as_recorded(&self) -> Option<&Recorded> {
+        match self {
+            Self::Recorded(recorded) => Some(recorded),
+            Self::Cleared(_) => None,
+        }
+    }
+
+    /// The clearing receipt, for a clearing or reset item.
+    #[must_use]
+    pub const fn as_cleared(&self) -> Option<&Cleared> {
+        match self {
+            Self::Cleared(cleared) => Some(cleared),
+            Self::Recorded(_) => None,
+        }
+    }
+}
+
+/// The entry's receipt, or the clearing's, line by line as their own.
+impl core::fmt::Display for BatchReceipt {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Recorded(recorded) => recorded.fmt(f),
+            Self::Cleared(cleared) => cleared.fmt(f),
+        }
+    }
+}
+
+impl<const P: u8> SealReceipt<P> {
+    /// The sealed period's first day.
+    #[must_use]
+    pub fn start(&self) -> Date {
+        self.seal.parts().start
+    }
+
+    /// The sealed period's last day: no posting may be booked on or before
+    /// it once this is the last seal.
+    #[must_use]
+    pub fn end(&self) -> Date {
+        self.seal.parts().end
+    }
+
+    /// The position of the last record the seal covers.
+    #[must_use]
+    pub fn through(&self) -> u64 {
+        self.seal.parts().through
     }
 }
 

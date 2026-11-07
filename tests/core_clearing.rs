@@ -89,7 +89,8 @@ fn us7_s1_a_clearing_apply_is_recorded() {
             eur("500.00"),
             date!("2026-03-10"),
         )
-        .unwrap();
+        .unwrap()
+        .position;
     assert_eq!(position, before);
     assert_eq!(books.head().size, before + 1);
 }
@@ -179,7 +180,8 @@ fn us7_s4_reset_before_clearing_then_reset_then_reset_again() {
             eur("500.00"),
             date!("2026-03-10"),
         )
-        .unwrap();
+        .unwrap()
+        .position;
     assert_eq!(
         rejected(books.reset_clearing("rst-1", applied, date!("2026-03-09"))),
         Rejection::ResetBeforeClearing {
@@ -189,7 +191,8 @@ fn us7_s4_reset_before_clearing_then_reset_then_reset_again() {
     let before = books.head().size;
     let reset = books
         .reset_clearing("rst-1", applied, date!("2026-03-12"))
-        .unwrap();
+        .unwrap()
+        .position;
     assert_eq!(reset, before);
     assert_eq!(books.head().size, before + 1);
     // The amounts are open again: the full 500.00 clears once more.
@@ -276,7 +279,8 @@ fn a_clearing_key_reused_for_other_content_is_key_conflict() {
             eur("500.00"),
             date!("2026-03-10"),
         )
-        .unwrap();
+        .unwrap()
+        .position;
     assert_eq!(
         rejected(books.clear(
             "clr-1",
@@ -310,7 +314,8 @@ fn an_identical_apply_replays_its_position_even_after_the_seal() {
             eur("500.00"),
             date!("2026-03-10"),
         )
-        .unwrap();
+        .unwrap()
+        .position;
     let head = books.head();
     assert_eq!(
         books
@@ -321,8 +326,9 @@ fn an_identical_apply_replays_its_position_even_after_the_seal() {
                 eur("500.00"),
                 date!("2026-03-10")
             )
+            .map(|c| (c.position, c.replayed))
             .unwrap(),
-        applied
+        (applied, true)
     );
     assert_eq!(books.head(), head);
 
@@ -339,8 +345,9 @@ fn an_identical_apply_replays_its_position_even_after_the_seal() {
                 eur("500.00"),
                 date!("2026-03-10")
             )
+            .map(|c| (c.position, c.replayed))
             .unwrap(),
-        applied
+        (applied, true)
     );
     assert_eq!(books.head(), head);
 }
@@ -361,16 +368,19 @@ fn an_identical_reset_replays_its_position() {
             eur("500.00"),
             date!("2026-03-10"),
         )
-        .unwrap();
+        .unwrap()
+        .position;
     let reset = books
         .reset_clearing("rst-1", applied, date!("2026-03-12"))
-        .unwrap();
+        .unwrap()
+        .position;
     let head = books.head();
     assert_eq!(
         books
             .reset_clearing("rst-1", applied, date!("2026-03-12"))
+            .map(|c| (c.position, c.replayed))
             .unwrap(),
-        reset
+        (reset, true)
     );
     assert_eq!(books.head(), head);
 }
@@ -635,10 +645,12 @@ fn resetting_a_reset_is_clearing_unknown() {
             eur("500.00"),
             date!("2026-03-10"),
         )
-        .unwrap();
+        .unwrap()
+        .position;
     let reset = books
         .reset_clearing("rst-1", applied, date!("2026-03-12"))
-        .unwrap();
+        .unwrap()
+        .position;
     assert_eq!(
         rejected(books.reset_clearing("rst-2", reset, date!("2026-03-12"))),
         Rejection::ClearingUnknown { clearing: reset }

@@ -101,6 +101,10 @@ fn every_rejection() -> Vec<Rejection> {
             exponent: 3,
             max: 2,
         },
+        Rejection::BatchTooLarge {
+            items: 1_001,
+            max: 1_000,
+        },
         Rejection::KeyConflict { position: 1 },
         Rejection::NoPeriod { date: day },
         Rejection::PeriodSealed {
@@ -241,7 +245,7 @@ fn every_rejection() -> Vec<Rejection> {
 #[test]
 fn codes_are_unique_ranged_and_ordered() {
     let rejections = every_rejection();
-    assert_eq!(rejections.len(), 59, "every variant the core owns");
+    assert_eq!(rejections.len(), 60, "every variant the core owns");
     let mut codes: Vec<u16> = rejections.iter().map(Rejection::code).collect();
     for rejection in &rejections {
         let stage = match rejection.code() / 100 {
@@ -266,7 +270,7 @@ fn codes_are_unique_ranged_and_ordered() {
     let listed = codes.clone();
     codes.sort_unstable();
     codes.dedup();
-    assert_eq!(codes.len(), 59, "codes are unique");
+    assert_eq!(codes.len(), 60, "codes are unique");
     assert_eq!(listed, codes, "listed in precedence order");
     assert!(!codes.contains(&112), "112 is unassigned");
     assert!(Stage::Structural < Stage::Idempotency && Stage::References < Stage::Limits);

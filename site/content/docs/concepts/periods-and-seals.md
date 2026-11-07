@@ -11,6 +11,8 @@ calendar; `seal_period(id)` and `seal_through(id)` seal it, returning a
 [`SealReceipt`](https://docs.rs/doubleentry/latest/doubleentry/struct.SealReceipt.html) with the
 [`Seal`](https://docs.rs/doubleentry/latest/doubleentry/record/struct.Seal.html) record;
 `prove_balance` proves one sealed balance ([Proofs](@/docs/assurance/proofs.md)).
+`periods()`, `seals()` and `watermark()` read the calendar back — each also
+`_at(head)`, as it was at a checkpoint.
 
 ## A contiguous calendar
 
@@ -119,6 +121,34 @@ books.seal_period("2026-03")?;
 let back = books.set_limit("Liabilities:Wallet", BalanceLimit::NoDebitBalance, date!("2026-03-31"));
 assert_eq!(back.unwrap_err().code(), Some(309));
 books.set_limit("Liabilities:Wallet", BalanceLimit::NoDebitBalance, date!("2026-04-01"))?;
+```
+
+## Reading the calendar
+
+A service shows which periods are locked (festgeschrieben) and refuses
+back-dated input before it reaches the ledger. `watermark()` is the one
+"closed through" date; `periods()` lists every period with its dates and, once
+sealed, its `SealReceipt`; `seals()` is the sealed ones, each with its first
+and last day (`start()`, `end()`), its position and the last record it covers
+(`through()`). Ids are whatever the calendar was defined with — a quarter, a
+13th period — so nothing is parsed from them.
+
+```rust
+use doubleentry::prelude::*;
+
+let mut books = Journal::new(LedgerId::new("example.com/acme")?);
+books.define_period("FY2026-Q1", date!("2026-01-01"), date!("2026-03-31"))?;
+books.define_period("FY2026-Q2", date!("2026-04-01"), date!("2026-06-30"))?;
+assert_eq!(books.watermark()?, None);
+let before = books.head();
+books.seal_period("FY2026-Q1")?;
+
+assert_eq!(books.watermark()?, Some(date!("2026-03-31")));
+let locked: Vec<String> = books.periods()?.iter().filter(|p| p.is_sealed()).map(|p| p.id.to_string()).collect();
+assert_eq!(locked, ["FY2026-Q1"]);
+let seal = &books.seals()?[0];
+assert_eq!((seal.start(), seal.end()), (date!("2026-01-01"), date!("2026-03-31")));
+assert_eq!(books.watermark_at(before)?, None); // as an auditor's checkpoint saw it
 ```
 
 ## Why

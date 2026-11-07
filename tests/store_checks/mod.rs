@@ -289,6 +289,7 @@ pub async fn us4_postings_pages_with_filters<S: Store<2>>(store: S) {
                     booking: Some(date!("2026-03-02")..=date!("2026-03-31")),
                     value: None,
                     dimensions: filters.clone(),
+                    kinds: doubleentry::store::KindFilter::Any,
                     page: page.clone(),
                 })
                 .await
@@ -424,6 +425,7 @@ pub async fn us4_pages_pinned_to_through<S: Store<2>>(store: S) {
         booking: None,
         value: None,
         dimensions: Vec::new(),
+        kinds: doubleentry::store::KindFilter::Any,
         page,
     };
     let first = store.postings(&read(PageRead::first(2))).await.unwrap();
@@ -626,7 +628,8 @@ pub async fn populated<S: Store<2>>(store: S) -> (Ledger<S>, u64) {
             date!("2026-01-20"),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .position;
     books
         .reset_clearing("reset", cleared, date!("2026-01-21"))
         .await
@@ -776,4 +779,319 @@ pub async fn seal_through_and_exponents<S: Store<2>>(store: S) {
     assert!(!statement.to_string().contains("15000.00"), "{statement}");
     let rollup = books.rollup(jpy, &all).await.unwrap();
     assert!(rollup.to_string().contains("15000\n"), "{rollup}");
+}
+
+/// 028 US2: the calendar as a host reads it — periods of any id, their
+/// seals, the watermark, and each as it was at an earlier head — equal on
+/// the journal and the store.
+pub async fn calendar_reads<S: Store<2>>(store: S) {
+    let mut journal = Journal::new(ledger()).as_actor("setup");
+    let books = Ledger::new(store, ledger())
+        .await
+        .unwrap()
+        .as_actor("setup");
+    assert_eq!(books.watermark().await.unwrap(), None);
+    assert!(books.periods().await.unwrap().is_empty());
+    for (id, start, end) in [
+        ("2026-01", date!("2026-01-01"), date!("2026-01-31")),
+        ("2026-Q1-rest", date!("2026-02-01"), date!("2026-03-31")),
+        ("FY2026-13", date!("2026-04-01"), date!("2026-04-30")),
+    ] {
+        journal.define_period(id, start, end).unwrap();
+        books.define_period(id, start, end).await.unwrap();
+    }
+    journal.seal_period("2026-01").unwrap();
+    books.seal_period("2026-01").await.unwrap();
+    let before = books.head().await.unwrap();
+    journal.seal_period("2026-Q1-rest").unwrap();
+    books.seal_period("2026-Q1-rest").await.unwrap();
+
+    let periods = books.periods().await.unwrap();
+    assert_eq!(periods, journal.periods().unwrap());
+    let ids: Vec<String> = periods.iter().map(|p| p.id.to_string()).collect();
+    assert_eq!(ids, ["2026-01", "2026-Q1-rest", "FY2026-13"]);
+    let sealed: Vec<bool> = periods.iter().map(doubleentry::Period::is_sealed).collect();
+    assert_eq!(sealed, [true, true, false]);
+    assert_eq!(periods[1].start, date!("2026-02-01"));
+    assert_eq!(
+        periods[0].to_string(),
+        format!(
+            "2026-01 2026-01-01..=2026-01-31, sealed at position {}",
+            periods[0].seal.as_ref().unwrap().position
+        )
+    );
+
+    let seals = books.seals().await.unwrap();
+    assert_eq!(seals, journal.seals().unwrap());
+    assert_eq!(seals.len(), 2);
+    assert_eq!(
+        (seals[1].start(), seals[1].end()),
+        (date!("2026-02-01"), date!("2026-03-31"))
+    );
+    assert!(seals[0].through() < seals[0].position);
+    assert_eq!(books.watermark().await.unwrap(), Some(date!("2026-03-31")));
+    assert_eq!(journal.watermark().unwrap(), Some(date!("2026-03-31")));
+
+    // As it was before the second seal.
+    let pinned = books.seals_at(before).await.unwrap();
+    assert_eq!(pinned, journal.seals_at(before).unwrap());
+    assert_eq!(pinned.len(), 1);
+    assert_eq!(
+        books.watermark_at(before).await.unwrap(),
+        Some(date!("2026-01-31"))
+    );
+    let then = books.periods_at(before).await.unwrap();
+    assert_eq!(then.len(), 3);
+    assert!(!then[1].is_sealed());
+    // A head beyond the log is refused.
+    let mut beyond = books.head().await.unwrap();
+    beyond.size += 1;
+    assert!(matches!(
+        books.periods_at(beyond).await.unwrap_err(),
+        Error::Query(doubleentry::error::QueryError::PositionBeyondHead { .. })
+    ));
+}
+
+/// 028 US5: totals per entry kind — `of_kind` (any of), `without_kind`,
+/// both (nothing) — equal on the journal and the store, and equal to a
+/// direct fold over the recorded drafts, in every read taking a query.
+pub async fn kind_queries<S: Store<2>>(store: S) {
+    let (mut journal, books) = books(store).await;
+    let drafts = [
+        (
+            "inv-1",
+            Some("invoice"),
+            "Assets:Cash",
+            "Income:Sales",
+            "100.00",
+        ),
+        (
+            "inv-2",
+            Some("invoice"),
+            "Assets:Cash",
+            "Income:Sales",
+            "40.00",
+        ),
+        (
+            "cn-1",
+            Some("credit_note"),
+            "Income:Sales",
+            "Assets:Cash",
+            "15.00",
+        ),
+        (
+            "pay-1",
+            Some("payment"),
+            "Expenses:Rent",
+            "Assets:Cash",
+            "60.00",
+        ),
+        ("misc", None, "Assets:Cash", "Income:Sales", "7.00"),
+        (
+            "ümlaut",
+            Some("Gutschrift-für-Kündigung"),
+            "Income:Sales",
+            "Assets:Cash",
+            "1.00",
+        ),
+    ];
+    for (key, kind, debit, credit, amount) in drafts {
+        let mut draft = Entry::new(key, date!("2026-03-02"))
+            .debit(debit, eur(amount), EUR)
+            .credit(credit, eur(amount), EUR);
+        if let Some(kind) = kind {
+            draft = draft.kind(kind);
+        }
+        journal.record(draft.clone()).unwrap();
+        books.record(draft).await.unwrap();
+    }
+    let year = doubleentry::BalanceQuery::between(date!("2026-01-01"), date!("2026-12-31"));
+    // The expected cash totals, folded from the drafts by hand.
+    let folded = |keep: &dyn Fn(Option<&str>) -> bool| {
+        let (mut debit, mut credit) = (Amount::ZERO, Amount::ZERO);
+        for (_, kind, d, c, amount) in drafts {
+            if keep(kind) {
+                if d == "Assets:Cash" {
+                    debit = debit.checked_add(eur(amount)).unwrap();
+                }
+                if c == "Assets:Cash" {
+                    credit = credit.checked_add(eur(amount)).unwrap();
+                }
+            }
+        }
+        (debit, credit)
+    };
+    type Keep = Box<dyn Fn(Option<&str>) -> bool>;
+    let cases: Vec<(doubleentry::BalanceQuery, Keep)> = vec![
+        (
+            year.clone().of_kind("invoice"),
+            Box::new(|k| k == Some("invoice")),
+        ),
+        (
+            year.clone().of_kind("invoice").of_kind("credit_note"),
+            Box::new(|k| matches!(k, Some("invoice" | "credit_note"))),
+        ),
+        (year.clone().without_kind(), Box::new(|k| k.is_none())),
+        (
+            year.clone().of_kind("payment").without_kind(),
+            Box::new(|_| false),
+        ),
+        (
+            year.clone().of_kind("Gutschrift-für-Kündigung"),
+            Box::new(|k| k == Some("Gutschrift-für-Kündigung")),
+        ),
+    ];
+    for (query, keep) in &cases {
+        let balance = books.balance("Assets:Cash", EUR, query).await.unwrap();
+        assert_eq!(
+            balance,
+            journal.balance("Assets:Cash", EUR, query).unwrap(),
+            "{query:?}"
+        );
+        assert_eq!(
+            (balance.debit(), balance.credit()),
+            folded(keep.as_ref()),
+            "{query:?}"
+        );
+        assert_eq!(
+            books.trial_balance(query).await.unwrap(),
+            journal.trial_balance(query).unwrap()
+        );
+        assert_eq!(
+            books.statement("Assets:Cash", EUR, query).await.unwrap(),
+            journal.statement("Assets:Cash", EUR, query).unwrap()
+        );
+        assert_eq!(
+            books.rollup(EUR, query).await.unwrap(),
+            journal.rollup(EUR, query).unwrap()
+        );
+        assert_eq!(
+            books.open_items("Assets:Cash", EUR, query).await.unwrap(),
+            journal.open_items("Assets:Cash", EUR, query).unwrap()
+        );
+    }
+    let statement = books
+        .statement("Assets:Cash", EUR, &year.clone().of_kind("invoice"))
+        .await
+        .unwrap();
+    assert_eq!(statement.lines.len(), 2);
+    let invalid = books
+        .balance("Assets:Cash", EUR, &year.of_kind(" spaced "))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            invalid,
+            Error::Query(doubleentry::error::QueryError::InvalidLabel { .. })
+        ),
+        "{invalid:?}"
+    );
+}
+
+/// 028 US3: a payment recorded and assigned to two open invoices in one
+/// batch — refused whole when one assignment over-applies, recorded whole
+/// otherwise, replayed whole on a retry — equal on the journal and the store.
+pub async fn payment_run<S: Store<2>>(store: S) {
+    use doubleentry::{BatchItem, Clearing, PostingRef};
+    let (mut journal, books) = books(store).await;
+    let on = date!("2026-01-01");
+    journal
+        .open("Assets:Receivables", AccountKind::Asset, on)
+        .unwrap();
+    books
+        .open("Assets:Receivables", AccountKind::Asset, on)
+        .await
+        .unwrap();
+    for (key, amount) in [("inv-a", "100.00"), ("inv-b", "50.00")] {
+        let invoice = Entry::new(key, date!("2026-03-02"))
+            .kind("invoice")
+            .debit("Assets:Receivables", eur(amount), EUR)
+            .credit("Income:Sales", eur(amount), EUR);
+        journal.record(invoice.clone()).unwrap();
+        books.record(invoice).await.unwrap();
+    }
+    let invoice = |key: &str| PostingRef::at(books.entry_id(key).unwrap(), 0);
+    let paid = PostingRef::at(books.entry_id("pay-1").unwrap(), 1);
+    let assign = |key: &str, invoice: PostingRef, amount: &str| {
+        BatchItem::from(Clearing::new(
+            key,
+            invoice,
+            paid,
+            eur(amount),
+            date!("2026-03-20"),
+        ))
+    };
+    let payment = BatchItem::from(
+        Entry::new("pay-1", date!("2026-03-20"))
+            .kind("payment")
+            .debit("Assets:Cash", eur("150.00"), EUR)
+            .credit("Assets:Receivables", eur("150.00"), EUR),
+    );
+
+    // The second assignment asks for more than the payment has left.
+    let before = books.head().await.unwrap();
+    let over = vec![
+        payment.clone(),
+        assign("pay-1/inv-a", invoice("inv-a"), "100.00"),
+        assign("pay-1/inv-b", invoice("inv-b"), "50.01"),
+    ];
+    let refused = books.batch(over.clone()).await.unwrap_err();
+    assert!(
+        matches!(
+            refused,
+            Error::BatchRejected {
+                index: 2,
+                rejection: Rejection::OverApplied { .. }
+            }
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(
+        journal.batch(over).unwrap_err().to_string(),
+        refused.to_string()
+    );
+    assert_eq!(
+        books.head().await.unwrap(),
+        before,
+        "nothing of it was written"
+    );
+
+    let run = vec![
+        payment,
+        assign("pay-1/inv-a", invoice("inv-a"), "100.00"),
+        assign("pay-1/inv-b", invoice("inv-b"), "50.00"),
+    ];
+    let receipts = books.batch(run.clone()).await.unwrap();
+    assert_eq!(receipts, journal.batch(run.clone()).unwrap());
+    assert_eq!(receipts.len(), 3);
+    assert!(receipts[0].as_recorded().is_some() && receipts[1].as_cleared().is_some());
+    assert!(receipts.iter().all(|receipt| !receipt.replayed()));
+    assert_eq!(
+        receipts
+            .iter()
+            .map(doubleentry::BatchReceipt::position)
+            .collect::<Vec<_>>(),
+        [before.size, before.size + 1, before.size + 2]
+    );
+    let again = books.batch(run).await.unwrap();
+    assert!(again.iter().all(doubleentry::BatchReceipt::replayed));
+    assert_eq!(
+        again
+            .iter()
+            .map(doubleentry::BatchReceipt::position)
+            .collect::<Vec<_>>(),
+        receipts
+            .iter()
+            .map(doubleentry::BatchReceipt::position)
+            .collect::<Vec<_>>()
+    );
+    let open = books
+        .open_items("Assets:Receivables", EUR, &doubleentry::BalanceQuery::all())
+        .await
+        .unwrap();
+    assert!(open.is_empty(), "{open:?}");
+    // clear_batch: clearings only, the same rule.
+    assert!(books.clear_batch(Vec::new()).await.unwrap().is_empty());
+    assert_eq!(journal.head(), books.head().await.unwrap());
+    books.audit().await.unwrap();
 }

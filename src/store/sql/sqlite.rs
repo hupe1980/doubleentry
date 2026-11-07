@@ -75,6 +75,8 @@ impl Driver for Sqlite {
     const META_PROBE: &str =
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = $1";
     const PRELUDE: &str = "";
+    const TABLES_PROBE: &str = "SELECT name FROM sqlite_schema \
+        WHERE type = 'table' AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'";
 
     fn rows_source(kinds: &[Kind], rows: usize) -> String {
         let mut next = 0usize;

@@ -1,53 +1,59 @@
-//! Atomic batches: drafts decided in order, each against the state its
-//! predecessors leave, all or nothing.
+//! Atomic batches: entries, clearings and clearing resets decided in order,
+//! each against the state its predecessors leave, all or nothing.
 //!
-//! [`batch`] runs [`check`] for every draft over a [`Pending`] view — the
-//! ledger as the store has it plus the write sets of the drafts already
-//! decided — so a store persists nothing until the whole batch is decided,
-//! and a refusal of any draft leaves the ledger untouched. A draft whose key
-//! is already recorded (by an earlier write or an earlier draft of the same
-//! batch) replays exactly as a single `record` would, so recording an
+//! [`batch`] runs the single-write rule ([`check`], [`clearing::apply`],
+//! [`clearing::reset`]) for every item over a [`Pending`] view — the ledger
+//! as the store has it plus the write sets of the items already decided —
+//! so a store persists nothing until the whole batch is decided, and a
+//! refusal of any item leaves the ledger untouched. An item whose key is
+//! already recorded (by an earlier write or an earlier item of the same
+//! batch) replays exactly as a single write would, so recording an
 //! identical batch twice returns the original receipts.
 //!
-//! On a [`Snapshot`](super::Snapshot) still missing facts, a refused draft
-//! does not end the run: the run is a plan, and the later drafts' reads are
+//! A clearing may name a posting of an entry decided earlier in the batch,
+//! and its open amount accounts for the clearings and resets before it.
+//!
+//! On a [`Snapshot`](super::Snapshot) still missing facts, a refused item
+//! does not end the run: the run is a plan, and the later items' reads are
 //! discovered in the same round.
 
 use std::collections::BTreeMap;
 
 use time::Date;
 
-use super::check::check;
+use super::check::{BatchItem, check};
+use super::clearing;
 use super::holds::{HoldEffect, HoldView};
 use super::state::{
     AccountView, BalanceKey, ClearingView, EntryMeta, EntryView, Header, Movement, PeriodView,
     Slice, StateView, Terms, Versioned,
 };
-use super::writeset::{Done, IndexRow, Outcome, Outstanding, WriteSet};
+use super::writeset::{BatchReceipt, Done, IndexRow, Outcome, Outstanding, WriteSet};
+use crate::error::Rejection;
 use crate::model::{
-    AccountHandle, AccountPath, Amount, Balance, Currency, Entry, EntryId, IdempotencyKey,
-    LedgerPolicy, PeriodId, PostingRef, Record,
+    AccountHandle, AccountPath, Amount, Balance, Currency, EntryId, IdempotencyKey, LedgerPolicy,
+    PeriodId, PostingRef, Record,
 };
 
-/// Decides `drafts` in order against `view`: `Batch` with one write set per
-/// new entry and every receipt (replays included), or
-/// `Unchanged(Done::BatchRejected)` naming the first refused draft.
-pub(crate) fn batch<const P: u8>(view: &impl StateView<P>, drafts: &[Entry<P>]) -> Outcome<P> {
+/// Decides `items` in order against `view`: `Batch` with one write set per
+/// new record and every receipt (replays included), or
+/// `Unchanged(Done::BatchRejected)` naming the first refused item.
+pub(crate) fn batch<const P: u8>(view: &impl StateView<P>, items: &[BatchItem<P>]) -> Outcome<P> {
     let mut pending = Pending::new(view);
     let mut writes = Vec::new();
-    let mut recorded = Vec::with_capacity(drafts.len());
-    for (index, draft) in drafts.iter().enumerate() {
-        match check(&pending, draft) {
+    let mut receipts = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        match decide(&pending, item) {
             Ok(Outcome::Append(write)) => {
-                if let Done::Entry(receipt) = write.done {
-                    recorded.push(receipt);
+                if let Some(receipt) = receipt(&write.done) {
+                    receipts.push(receipt);
                 }
                 pending.absorb(&write);
                 writes.push(*write);
             }
             Ok(outcome) => {
-                if let Done::Entry(receipt) = outcome.done() {
-                    recorded.push(*receipt);
+                if let Some(receipt) = receipt(outcome.done()) {
+                    receipts.push(receipt);
                 }
             }
             // A plan: the refusal may stem from a fact not loaded yet.
@@ -57,11 +63,39 @@ pub(crate) fn batch<const P: u8>(view: &impl StateView<P>, drafts: &[Entry<P>]) 
             }
         }
     }
-    let done = Done::Batch(recorded);
+    let done = Done::Batch(receipts);
     if writes.is_empty() {
         Outcome::Unchanged(done)
     } else {
         Outcome::Batch { writes, done }
+    }
+}
+
+/// One item, decided by the rule a single write of it runs.
+fn decide<const P: u8>(
+    view: &impl StateView<P>,
+    item: &BatchItem<P>,
+) -> Result<Outcome<P>, Rejection> {
+    match item {
+        BatchItem::Record(draft) => check(view, draft),
+        BatchItem::Clear(clearing) => clearing::apply(
+            view,
+            &clearing.key,
+            clearing.debit,
+            clearing.credit,
+            clearing.amount,
+            clearing.on,
+        ),
+        BatchItem::Reset { key, clearing, on } => clearing::reset(view, key, *clearing, *on),
+    }
+}
+
+/// An item's receipt.
+const fn receipt<const P: u8>(done: &Done<P>) -> Option<BatchReceipt> {
+    match done {
+        Done::Entry(recorded) => Some(BatchReceipt::Recorded(*recorded)),
+        Done::Cleared(cleared) => Some(BatchReceipt::Cleared(*cleared)),
+        _ => None,
     }
 }
 
@@ -76,6 +110,9 @@ struct Pending<'a, V, const P: u8> {
     booked: BTreeMap<AccountHandle, Date>,
     holds: BTreeMap<EntryId, HoldView<P>>,
     outstanding: BTreeMap<(AccountHandle, Currency), Outstanding<P>>,
+    clearing_keys: BTreeMap<IdempotencyKey, u64>,
+    clearings: BTreeMap<u64, ClearingView<P>>,
+    applied: BTreeMap<PostingRef, Amount<P>>,
 }
 
 impl<'a, V: StateView<P>, const P: u8> Pending<'a, V, P> {
@@ -90,6 +127,9 @@ impl<'a, V: StateView<P>, const P: u8> Pending<'a, V, P> {
             booked: BTreeMap::new(),
             holds: BTreeMap::new(),
             outstanding: BTreeMap::new(),
+            clearing_keys: BTreeMap::new(),
+            clearings: BTreeMap::new(),
+            applied: BTreeMap::new(),
         }
     }
 
@@ -125,6 +165,32 @@ impl<'a, V: StateView<P>, const P: u8> Pending<'a, V, P> {
                 }
                 IndexRow::Reversal { target, by } => {
                     self.reversals.insert(*target, *by);
+                }
+                IndexRow::ClearingKey { key, position } => {
+                    self.clearing_keys.insert(key.clone(), *position);
+                    if let Record::Clearing(event) = &write.record {
+                        self.clearings.insert(
+                            *position,
+                            ClearingView {
+                                position: *position,
+                                event: event.clone(),
+                                reset_by: None,
+                            },
+                        );
+                    }
+                }
+                IndexRow::Applied { posting, delta } => {
+                    // The core checked the open amount when it decided.
+                    let applied = self.applied(*posting);
+                    if let Ok(sum) = applied.checked_add(*delta) {
+                        self.applied.insert(*posting, sum);
+                    }
+                }
+                IndexRow::ClearingReset { clearing, position } => {
+                    if let Some(mut view) = self.clearing_at(*clearing) {
+                        view.reset_by = Some(*position);
+                        self.clearings.insert(*clearing, view);
+                    }
                 }
                 _ => {}
             }
@@ -267,20 +333,30 @@ impl<V: StateView<P>, const P: u8> StateView<P> for Pending<'_, V, P> {
         }
     }
 
-    // A batch holds entries only: they record no clearing, and none of them
-    // reads what sealing and year-end closing read.
-
     fn clearing_by_key(&self, key: &IdempotencyKey) -> Option<ClearingView<P>> {
-        self.base.clearing_by_key(key)
+        match self.clearing_keys.get(key) {
+            Some(position) => self.clearing_at(*position),
+            None => self.base.clearing_by_key(key),
+        }
     }
 
     fn clearing_at(&self, position: u64) -> Option<ClearingView<P>> {
-        self.base.clearing_at(position)
+        // A clearing of this batch, or a committed one an item of it reset.
+        match self.clearings.get(&position) {
+            Some(view) => Some(view.clone()),
+            None => self.base.clearing_at(position),
+        }
     }
 
     fn applied(&self, posting: PostingRef) -> Amount<P> {
-        self.base.applied(posting)
+        match self.applied.get(&posting) {
+            Some(applied) => *applied,
+            None => self.base.applied(posting),
+        }
     }
+
+    // A batch holds entries and clearings: none of them reads what sealing
+    // and year-end closing read.
 
     fn all_balances(&self) -> Vec<(BalanceKey, Balance<P>)> {
         let mut all: BTreeMap<_, _> = self.base.all_balances().into_iter().collect();

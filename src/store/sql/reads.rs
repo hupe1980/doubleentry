@@ -12,10 +12,10 @@ use crate::model::{
     AccountHandle, AccountRef, Amount, Balance, Currency, EntryId, Layer, PeriodId,
 };
 use crate::store::{
-    AccountRow, BalanceRead, BalanceScope, Cell, EntryRef, HoldCursor, HoldRead, HoldRow, Leaf,
-    LeafRead, Memo, Page, PageRead, Position, PostingCursor, PostingLine, PostingOrder,
-    PostingRead, ProjectionPage, ProjectionRead, ProjectionRow, SealRow, StoreError, StoredEntry,
-    bound, checked_limit, paged,
+    AccountRow, BalanceRead, BalanceScope, Cell, EntryRef, HoldCursor, HoldRead, HoldRow,
+    KindFilter, Leaf, LeafRead, Memo, Page, PageRead, Position, PostingCursor, PostingLine,
+    PostingOrder, PostingRead, ProjectionPage, ProjectionRead, ProjectionRow, SealRow, StoreError,
+    StoredEntry, bound, checked_limit, paged,
 };
 
 /// A leaf from a (position, kind, bytes) row.
@@ -676,6 +676,12 @@ pub(crate) async fn postings<D: Dialect, const P: u8>(
             "more than eight dimension filters",
         ));
     }
+    if matches!(&read.kinds, KindFilter::OneOf(kinds) if kinds.len() > KindFilter::MAX_KINDS) {
+        return Err(StoreError::backend_message(
+            "postings",
+            "more than eight kind filters",
+        ));
+    }
     read!(store, "postings", |session, size| {
         let sql = session.sql;
         let through = bound(read.page.through, size);
@@ -702,6 +708,9 @@ pub(crate) async fn postings<D: Dialect, const P: u8>(
         if let Some(range) = &read.value {
             args.extend([codec::date(*range.start()), codec::date(*range.end())]);
         }
+        if let KindFilter::OneOf(kinds) = &read.kinds {
+            args.extend(kinds.iter().map(|kind| codec::text(kind.as_str())));
+        }
         for (axis, value) in &read.dimensions {
             args.extend([codec::text(axis.as_str()), codec::text(value.as_str())]);
         }
@@ -724,6 +733,7 @@ pub(crate) async fn postings<D: Dialect, const P: u8>(
                         Some(_) => row.amount(11)?,
                         None => Amount::ZERO,
                     },
+                    kind: row.opt_label(12)?,
                 };
                 let cursor = PostingCursor {
                     booking: (read.order == PostingOrder::Booking).then_some(line.booking),
